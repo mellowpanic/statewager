@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statewager"
+version = "0.1.0"
+description = "Standalone US state sports wagering regulatory fetcher and parser"
+readme = "statewager/README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+    "python-dateutil>=2.8",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.10",
+]
+
+[project.optional-dependencies]
+ocr = [
+    "pytesseract>=0.3",
+    "pdf2image>=1.16",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["statewager*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

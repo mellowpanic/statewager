@@ -1,0 +1,4 @@
+state,month,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url
+Missouri,2025-12,543039131.42,-20758443.11,-3.82,4157611.65,887331.73,21.34,538881519.77,-21645774.84,-4.02,https://www.mgc.dps.mo.gov/SportsWagering/sw_financials/FY26_SWFinReport/12_Dec/SW%20Monthly%20Financials%201225.pdf
+Missouri,2026-01,385138867.63,-6703555.44,-1.74,4726670.17,207460.42,4.39,380412197.46,-6911015.86,-1.82,https://www.mgc.dps.mo.gov/SportsWagering/sw_financials/FY26_SWFinReport/01_Jan/SW%20Monthly%20Financials%200126.pdf
+Missouri,2026-02,277005417.87,10301006.70,3.72,3720113.96,137346.24,3.69,273285303.91,10163660.46,3.72,https://www.mgc.dps.mo.gov/SportsWagering/sw_financials/FY26_SWFinReport/02_Feb/SW%20Monthly%20Financials%200226.pdf

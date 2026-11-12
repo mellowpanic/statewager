@@ -1,0 +1,13 @@
+state,month,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url
+Nevada,2025-03,859459459.46,22260000,2.59,246664183.87,6695000,2.71,612795275.59,15565000,2.54,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----march-2025.pdf
+Nevada,2025-04,618779069.77,42572000,6.88,135664077.05,9382000,6.92,483114992.72,33190000,6.87,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----april-2025.pdf
+Nevada,2025-05,576728395.06,46715000,8.10,154023146.07,15308000,9.94,422705248.99,31407000,7.43,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----may-2025.pdf
+Nevada,2025-06,496564344.75,42059000,8.47,136733019.44,12193000,8.92,359831325.30,29866000,8.30,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----june-2025.pdf
+Nevada,2025-07,419345898,37825000,9.02,102543390.17,7507000,7.32,316802507.84,30318000,9.57,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----july-2025.pdf
+Nevada,2025-08,455043290.04,42046000,9.24,118093748.76,12664000,10.72,336949541.28,29382000,8.72,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----august-2025.pdf
+Nevada,2025-09,791618075.80,54305000,6.86,259839935.51,21707000,8.35,531778140.29,32598000,6.13,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----september-2025.pdf
+Nevada,2025-10,798156123.82,59303000,7.43,241938507.24,16363000,6.76,556217616.58,42940000,7.72,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----october-2025.pdf
+Nevada,2025-11,908503740.65,72862000,8.02,253399138.14,25891000,10.22,655104602.51,46971000,7.17,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----november-2025.pdf
+Nevada,2025-12,746674033.15,67574000,9.05,205632101.76,24994000,12.15,541041931.39,42580000,7.87,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----december-2025.pdf
+Nevada,2026-01,795376078.91,64505000,8.11,233026508.71,25253000,10.84,562349570.20,39252000,6.98,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----january-2026.pdf
+Nevada,2026-02,579819672.13,35369000,6.10,167110174.92,5819000,3.48,412709497.21,29550000,7.16,https://gaming.nv.gov/siteassets/content/about/gaming-revenue/monthly-revenue-report----february-2026.pdf

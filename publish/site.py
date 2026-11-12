@@ -1,0 +1,709 @@
+"""Static HTML generator for the GitHub Pages regulatory data viewer."""
+from __future__ import annotations
+
+import os
+from typing import Sequence
+
+from statewager.states import ALL_STATES
+
+INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StateWager — U.S. State Sports Wagering Regulatory Data</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --text: #0f172a;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --accent: #1d4ed8;
+      --accent-soft: #dbeafe;
+      --pos: #15803d;
+      --neg: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 1.25rem 1.5rem;
+    }
+    .container {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 1.25rem 1.5rem 3rem;
+    }
+    header .inner {
+      max-width: 1220px;
+      margin: 0 auto;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: -0.01em;
+    }
+    .subtitle {
+      margin: 0.2rem 0 0;
+      font-size: 0.875rem;
+      color: var(--muted);
+    }
+    .downloads {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.45rem 0.8rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.82rem;
+      font-weight: 500;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+      align-items: end;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      min-width: 180px;
+    }
+    .field label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    select, input[type="month"] {
+      padding: 0.45rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.9rem;
+      background: #fff;
+      color: var(--text);
+    }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 0.85rem;
+      margin-bottom: 1rem;
+    }
+    .kpi {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.9rem 1rem;
+    }
+    .kpi .label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .kpi .value {
+      font-size: 1.35rem;
+      font-weight: 700;
+      margin-top: 0.25rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
+      gap: 0.5rem;
+    }
+    .card-title {
+      margin: 0;
+      font-size: 0.98rem;
+      font-weight: 600;
+    }
+    .chart-wrap {
+      position: relative;
+      width: 100%;
+      overflow-x: auto;
+    }
+    svg.chart {
+      width: 100%;
+      height: 290px;
+      display: block;
+    }
+    .tooltip {
+      position: fixed;
+      pointer-events: none;
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 0.45rem 0.65rem;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.22);
+      display: none;
+      z-index: 20;
+      white-space: nowrap;
+    }
+    .table-wrap {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      font-variant-numeric: tabular-nums;
+    }
+    th, td {
+      padding: 0.55rem 0.65rem;
+      border-bottom: 1px solid var(--border);
+      text-align: right;
+      white-space: nowrap;
+    }
+    th:nth-child(1), td:nth-child(1),
+    th:nth-child(2), td:nth-child(2),
+    th:last-child, td:last-child {
+      text-align: left;
+    }
+    th {
+      background: #f1f5f9;
+      font-weight: 600;
+      color: #334155;
+      cursor: pointer;
+      user-select: none;
+    }
+    tbody tr:hover { background: #f8fafc; }
+    .neg { color: var(--neg); }
+    .status {
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.88rem;
+      margin-bottom: 1rem;
+    }
+    .status.error {
+      background: #fee2e2;
+      color: var(--neg);
+    }
+    a.src-link {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    a.src-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="inner">
+      <div>
+        <h1>StateWager Regulatory Dataset</h1>
+        <p class="subtitle">Monthly handle, revenue, hold %, and retail vs. mobile splits from state gaming commissions</p>
+      </div>
+      <div class="downloads">
+        <a class="btn" href="data/all.csv" download>Download all.csv</a>
+        <a class="btn" id="stateCsvLink" href="data/all.csv" download style="display:none">Download State CSV</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="statusBanner" class="status">Loading CSV dataset…</div>
+
+    <section class="controls">
+      <div class="field">
+        <label for="stateSelect">Jurisdiction</label>
+        <select id="stateSelect">
+          <option value="__ALL__">All States (Combined)</option>
+__STATE_OPTIONS__
+        </select>
+      </div>
+      <div class="field">
+        <label for="metricSelect">Chart Metric</label>
+        <select id="metricSelect">
+          <option value="handle">Total Handle ($)</option>
+          <option value="revenue">Total Revenue ($)</option>
+          <option value="hold">Hold (%)</option>
+          <option value="mobile_handle">Mobile Handle ($)</option>
+          <option value="retail_handle">Retail Handle ($)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="fromMonth">From Month</label>
+        <input id="fromMonth" type="month">
+      </div>
+      <div class="field">
+        <label for="toMonth">To Month</label>
+        <input id="toMonth" type="month">
+      </div>
+    </section>
+
+    <section class="kpis">
+      <div class="kpi"><div class="label">Total Handle</div><div class="value" id="kpiHandle">—</div></div>
+      <div class="kpi"><div class="label">Total Revenue</div><div class="value" id="kpiRevenue">—</div></div>
+      <div class="kpi"><div class="label">Blended Hold</div><div class="value" id="kpiHold">—</div></div>
+      <div class="kpi"><div class="label">Mobile Handle Share</div><div class="value" id="kpiMobileShare">—</div></div>
+      <div class="kpi"><div class="label">State-Months</div><div class="value" id="kpiRows">—</div></div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2 class="card-title" id="chartTitle">Monthly Total Handle</h2>
+      </div>
+      <div class="chart-wrap">
+        <svg id="chartSvg" class="chart" viewBox="0 0 960 290" preserveAspectRatio="none"></svg>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2 class="card-title" id="tableTitle">Monthly Regulatory Records</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th data-col="state">State</th>
+              <th data-col="month">Month</th>
+              <th data-col="handle">Handle</th>
+              <th data-col="revenue">Revenue</th>
+              <th data-col="hold">Hold %</th>
+              <th data-col="retail_handle">Retail Handle</th>
+              <th data-col="retail_revenue">Retail Revenue</th>
+              <th data-col="retail_hold">Retail Hold %</th>
+              <th data-col="mobile_handle">Mobile Handle</th>
+              <th data-col="mobile_revenue">Mobile Revenue</th>
+              <th data-col="mobile_hold">Mobile Hold %</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="tooltip" class="tooltip"></div>
+
+  <script>
+    (function () {
+      const csvCache = new Map();
+      let activeRows = [];
+      let sortCol = "month";
+      let sortAsc = false;
+
+      const stateSelect = document.getElementById("stateSelect");
+      const metricSelect = document.getElementById("metricSelect");
+      const fromMonthInput = document.getElementById("fromMonth");
+      const toMonthInput = document.getElementById("toMonth");
+      const statusBanner = document.getElementById("statusBanner");
+      const stateCsvLink = document.getElementById("stateCsvLink");
+      const chartSvg = document.getElementById("chartSvg");
+      const tooltip = document.getElementById("tooltip");
+
+      function parseCsvLine(line) {
+        const out = [];
+        let cur = "";
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (inQuotes) {
+            if (ch === '"' && line[i + 1] === '"') {
+              cur += '"';
+              i++;
+            } else if (ch === '"') {
+              inQuotes = false;
+            } else {
+              cur += ch;
+            }
+          } else if (ch === '"') {
+            inQuotes = true;
+          } else if (ch === ",") {
+            out.push(cur);
+            cur = "";
+          } else {
+            cur += ch;
+          }
+        }
+        out.push(cur);
+        return out;
+      }
+
+      function toNum(val) {
+        if (val === undefined || val === null || val.trim() === "") return null;
+        const n = Number(val);
+        return Number.isFinite(n) ? n : null;
+      }
+
+      function parseCsv(text) {
+        const lines = text.replace(/\\r/g, "").split("\\n").filter((l) => l.trim().length > 0);
+        if (lines.length <= 1) return [];
+        const headers = parseCsvLine(lines[0]);
+        return lines.slice(1).map((line) => {
+          const cols = parseCsvLine(line);
+          const raw = {};
+          headers.forEach((h, idx) => { raw[h] = cols[idx] ?? ""; });
+          return {
+            state: raw.state,
+            month: raw.month,
+            handle: toNum(raw.handle),
+            revenue: toNum(raw.revenue),
+            hold: toNum(raw.hold),
+            retail_handle: toNum(raw.retail_handle),
+            retail_revenue: toNum(raw.retail_revenue),
+            retail_hold: toNum(raw.retail_hold),
+            mobile_handle: toNum(raw.mobile_handle),
+            mobile_revenue: toNum(raw.mobile_revenue),
+            mobile_hold: toNum(raw.mobile_hold),
+            source_url: raw.source_url || ""
+          };
+        });
+      }
+
+      async function fetchCsvRows(slug) {
+        const url = slug === "__ALL__" ? "data/all.csv" : `data/${slug}.csv`;
+        if (csvCache.has(url)) return csvCache.get(url);
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
+        const text = await resp.text();
+        const rows = parseCsv(text);
+        csvCache.set(url, rows);
+        return rows;
+      }
+
+      const moneyFmt = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        maximumFractionDigits: 0
+      });
+
+      function fmtMoney(v) {
+        return v === null ? "—" : moneyFmt.format(v);
+      }
+
+      function fmtCompactMoney(v) {
+        if (v === null) return "—";
+        const abs = Math.abs(v);
+        const sign = v < 0 ? "-" : "";
+        if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+        if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+        if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(0)}K`;
+        return moneyFmt.format(v);
+      }
+
+      function fmtPct(v) {
+        return v === null ? "—" : `${v.toFixed(2)}%`;
+      }
+
+      function filteredRows() {
+        const fromM = fromMonthInput.value;
+        const toM = toMonthInput.value;
+        return activeRows.filter((r) => {
+          if (fromM && r.month < fromM) return false;
+          if (toM && r.month > toM) return false;
+          return true;
+        });
+      }
+
+      function updateKpis(rows) {
+        let totalHandle = 0;
+        let totalRevenue = 0;
+        let mobileHandle = 0;
+        let splitHandleDenom = 0;
+        rows.forEach((r) => {
+          if (r.handle !== null) totalHandle += r.handle;
+          if (r.revenue !== null) totalRevenue += r.revenue;
+          if (r.mobile_handle !== null && r.handle !== null) {
+            mobileHandle += r.mobile_handle;
+            splitHandleDenom += r.handle;
+          }
+        });
+        const blendedHold = totalHandle > 0 ? (totalRevenue / totalHandle) * 100 : null;
+        const mobileShare = splitHandleDenom > 0 ? (mobileHandle / splitHandleDenom) * 100 : null;
+        document.getElementById("kpiHandle").textContent = rows.length ? fmtCompactMoney(totalHandle) : "—";
+        document.getElementById("kpiRevenue").textContent = rows.length ? fmtCompactMoney(totalRevenue) : "—";
+        document.getElementById("kpiHold").textContent = fmtPct(blendedHold);
+        document.getElementById("kpiMobileShare").textContent = fmtPct(mobileShare);
+        document.getElementById("kpiRows").textContent = String(rows.length);
+      }
+
+      function aggregateByMonth(rows, metric) {
+        const byMonth = new Map();
+        rows.forEach((r) => {
+          if (!byMonth.has(r.month)) {
+            byMonth.set(r.month, { handle: 0, revenue: 0, mobile_handle: 0, retail_handle: 0, count: 0 });
+          }
+          const agg = byMonth.get(r.month);
+          if (r.handle !== null) agg.handle += r.handle;
+          if (r.revenue !== null) agg.revenue += r.revenue;
+          if (r.mobile_handle !== null) agg.mobile_handle += r.mobile_handle;
+          if (r.retail_handle !== null) agg.retail_handle += r.retail_handle;
+          agg.count += 1;
+        });
+        return Array.from(byMonth.entries())
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([month, agg]) => {
+            let value = 0;
+            if (metric === "hold") {
+              value = agg.handle > 0 ? (agg.revenue / agg.handle) * 100 : 0;
+            } else {
+              value = agg[metric] || 0;
+            }
+            return { month, value };
+          });
+      }
+
+      function renderChart(rows) {
+        const metric = metricSelect.value;
+        const metricLabel = metricSelect.options[metricSelect.selectedIndex].text;
+        const stateLabel = stateSelect.options[stateSelect.selectedIndex].text;
+        document.getElementById("chartTitle").textContent = `${stateLabel} — ${metricLabel}`;
+
+        const series = aggregateByMonth(rows, metric);
+        chartSvg.innerHTML = "";
+        if (!series.length) return;
+
+        const W = 960, H = 290;
+        const pad = { top: 20, right: 24, bottom: 44, left: 76 };
+        const plotW = W - pad.left - pad.right;
+        const plotH = H - pad.top - pad.bottom;
+
+        const vals = series.map((d) => d.value);
+        const minVal = Math.min(0, ...vals);
+        const maxVal = Math.max(0, ...vals);
+        const span = maxVal - minVal || 1;
+
+        const yScale = (v) => pad.top + plotH - ((v - minVal) / span) * plotH;
+        const zeroY = yScale(0);
+
+        const ns = "http://www.w3.org/2000/svg";
+        const ticks = 4;
+        for (let i = 0; i <= ticks; i++) {
+          const tv = minVal + (span * i) / ticks;
+          const y = yScale(tv);
+          const line = document.createElementNS(ns, "line");
+          line.setAttribute("x1", String(pad.left));
+          line.setAttribute("x2", String(W - pad.right));
+          line.setAttribute("y1", String(y));
+          line.setAttribute("y2", String(y));
+          line.setAttribute("stroke", "#e2e8f0");
+          chartSvg.appendChild(line);
+
+          const label = document.createElementNS(ns, "text");
+          label.setAttribute("x", String(pad.left - 8));
+          label.setAttribute("y", String(y + 4));
+          label.setAttribute("text-anchor", "end");
+          label.setAttribute("fill", "#64748b");
+          label.setAttribute("font-size", "11");
+          label.textContent = metric === "hold" ? `${tv.toFixed(1)}%` : fmtCompactMoney(tv);
+          chartSvg.appendChild(label);
+        }
+
+        const step = plotW / series.length;
+        const barW = Math.max(4, Math.min(38, step * 0.68));
+        const labelEvery = Math.max(1, Math.ceil(series.length / 12));
+
+        series.forEach((pt, idx) => {
+          const x = pad.left + idx * step + (step - barW) / 2;
+          const yVal = yScale(pt.value);
+          const rectY = Math.min(yVal, zeroY);
+          const rectH = Math.max(2, Math.abs(zeroY - yVal));
+
+          const rect = document.createElementNS(ns, "rect");
+          rect.setAttribute("x", String(x));
+          rect.setAttribute("y", String(rectY));
+          rect.setAttribute("width", String(barW));
+          rect.setAttribute("height", String(rectH));
+          rect.setAttribute("rx", "3");
+          rect.setAttribute("fill", pt.value < 0 ? "#dc2626" : "#2563eb");
+
+          const formatted = metric === "hold" ? fmtPct(pt.value) : fmtMoney(pt.value);
+          rect.addEventListener("mousemove", (ev) => {
+            tooltip.style.display = "block";
+            tooltip.style.left = `${ev.clientX + 12}px`;
+            tooltip.style.top = `${ev.clientY - 28}px`;
+            tooltip.textContent = `${pt.month}: ${formatted}`;
+          });
+          rect.addEventListener("mouseleave", () => {
+            tooltip.style.display = "none";
+          });
+          chartSvg.appendChild(rect);
+
+          if (idx % labelEvery === 0 || idx === series.length - 1) {
+            const tx = document.createElementNS(ns, "text");
+            tx.setAttribute("x", String(x + barW / 2));
+            tx.setAttribute("y", String(H - 16));
+            tx.setAttribute("text-anchor", "middle");
+            tx.setAttribute("fill", "#64748b");
+            tx.setAttribute("font-size", "11");
+            tx.textContent = pt.month;
+            chartSvg.appendChild(tx);
+          }
+        });
+      }
+
+      function renderTable(rows) {
+        const sorted = [...rows].sort((a, b) => {
+          const av = a[sortCol];
+          const bv = b[sortCol];
+          if (av === bv) return a.state.localeCompare(b.state) || a.month.localeCompare(b.month);
+          if (av === null) return 1;
+          if (bv === null) return -1;
+          const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
+          return sortAsc ? cmp : -cmp;
+        });
+
+        const tbody = document.getElementById("tableBody");
+        tbody.innerHTML = "";
+        const frag = document.createDocumentFragment();
+        sorted.forEach((r) => {
+          const tr = document.createElement("tr");
+          const cells = [
+            [r.state, false],
+            [r.month, false],
+            [fmtMoney(r.handle), false],
+            [fmtMoney(r.revenue), r.revenue !== null && r.revenue < 0],
+            [fmtPct(r.hold), r.hold !== null && r.hold < 0],
+            [fmtMoney(r.retail_handle), false],
+            [fmtMoney(r.retail_revenue), r.retail_revenue !== null && r.retail_revenue < 0],
+            [fmtPct(r.retail_hold), r.retail_hold !== null && r.retail_hold < 0],
+            [fmtMoney(r.mobile_handle), false],
+            [fmtMoney(r.mobile_revenue), r.mobile_revenue !== null && r.mobile_revenue < 0],
+            [fmtPct(r.mobile_hold), r.mobile_hold !== null && r.mobile_hold < 0]
+          ];
+          cells.forEach(([text, isNeg]) => {
+            const td = document.createElement("td");
+            td.textContent = text;
+            if (isNeg) td.className = "neg";
+            tr.appendChild(td);
+          });
+          const srcTd = document.createElement("td");
+          if (r.source_url) {
+            const a = document.createElement("a");
+            a.className = "src-link";
+            a.href = r.source_url;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            a.textContent = "Source";
+            srcTd.appendChild(a);
+          } else {
+            srcTd.textContent = "—";
+          }
+          tr.appendChild(srcTd);
+          frag.appendChild(tr);
+        });
+        tbody.appendChild(frag);
+      }
+
+      function refreshView() {
+        const rows = filteredRows();
+        updateKpis(rows);
+        renderChart(rows);
+        renderTable(rows);
+      }
+
+      async function loadSelection() {
+        const slug = stateSelect.value;
+        try {
+          statusBanner.className = "status";
+          statusBanner.style.display = "block";
+          statusBanner.textContent = `Loading ${slug === "__ALL__" ? "data/all.csv" : "data/" + slug + ".csv"}…`;
+          activeRows = await fetchCsvRows(slug);
+          statusBanner.style.display = "none";
+          if (slug === "__ALL__") {
+            stateCsvLink.style.display = "none";
+          } else {
+            stateCsvLink.href = `data/${slug}.csv`;
+            stateCsvLink.textContent = `Download ${slug}.csv`;
+            stateCsvLink.style.display = "inline-flex";
+          }
+          if (!fromMonthInput.value && activeRows.length) {
+            const months = activeRows.map((r) => r.month).sort();
+            fromMonthInput.value = months[0];
+            toMonthInput.value = months[months.length - 1];
+          }
+          refreshView();
+        } catch (err) {
+          statusBanner.className = "status error";
+          statusBanner.style.display = "block";
+          statusBanner.textContent = `Could not load CSV data (${err.message}). Serve docs/ over HTTP (e.g. python3 -m http.server -d docs 8000).`;
+        }
+      }
+
+      document.querySelectorAll("th[data-col]").forEach((th) => {
+        th.addEventListener("click", () => {
+          const col = th.getAttribute("data-col");
+          if (sortCol === col) {
+            sortAsc = !sortAsc;
+          } else {
+            sortCol = col;
+            sortAsc = col === "state" || col === "month";
+          }
+          refreshView();
+        });
+      });
+
+      stateSelect.addEventListener("change", loadSelection);
+      metricSelect.addEventListener("change", refreshView);
+      fromMonthInput.addEventListener("change", refreshView);
+      toMonthInput.addEventListener("change", refreshView);
+
+      loadSelection();
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
+def render_index_html(states: Sequence[tuple[str, str]] | None = None) -> str:
+    """Render ``docs/index.html`` populated with the configured state options."""
+    if states is None:
+        states = [(slug, slug.replace("_", " ").title()) for slug in ALL_STATES]
+    options_html = "\n".join(
+        f'          <option value="{slug}">{display}</option>'
+        for slug, display in states
+    )
+    return INDEX_HTML_TEMPLATE.replace("__STATE_OPTIONS__", options_html)
+
+
+def write_index_html(docs_dir: str, states: Sequence[tuple[str, str]] | None = None) -> str:
+    """Write ``<docs_dir>/index.html`` and return its path."""
+    os.makedirs(docs_dir, exist_ok=True)
+    out_path = os.path.join(docs_dir, "index.html")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(render_index_html(states))
+    return out_path
