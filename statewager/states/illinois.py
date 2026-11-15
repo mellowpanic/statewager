@@ -369,6 +369,42 @@ def parse_csv_details(
     return details
 
 
+def parse_accrual_tax(
+    data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[float | None, dict[str, float]]:
+    """Extract State + Cook County + Sports Wager Tax from an Illinois accrual CSV."""
+    lines = data.decode("utf-8-sig", errors="replace").splitlines()
+    header_index = next((i for i, line in enumerate(lines) if "Location Type" in line and "State AGR" in line), None)
+    if header_index is None:
+        return None, {}
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
+    tax_cols = ("State Tax", "Cook County Tax", "Sports Wager Tax")
+    fieldnames = {name.strip() for name in (reader.fieldnames or []) if name}
+    if not any(col in fieldnames for col in tax_cols):
+        return None, {}
+    total_tax = 0.0
+    matched_rows = 0
+    by_licensee: dict[str, float] = {}
+    for row in reader:
+        location_type = classify_location_type(row.get("Location Type"))
+        if location_type is None:
+            continue
+        parsed_parts = [parse_dollar(row.get(col)) for col in tax_cols]
+        if all(val is None for val in parsed_parts):
+            continue
+        row_tax = sum(val for val in parsed_parts if val is not None)
+        total_tax += row_tax
+        matched_rows += 1
+        licensee = " ".join(str(row.get("Licensee") or "").split())
+        if licensee:
+            by_licensee[licensee] = by_licensee.get(licensee, 0.0) + row_tax
+    if matched_rows == 0:
+        log("WARN Illinois accrual CSV parse produced zero tax rows")
+        return None, {}
+    return round(total_tax, 2), {name: round(val, 2) for name, val in by_licensee.items()}
+
+
 def parse_local_file(
     local_dir: str,
     month_name: str,
@@ -650,14 +686,15 @@ def fetch(
                     log_skip(logger, label, "no parseable local export, legacy PDF, or CSV form result")
                     continue
                 handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue = parsed_tuple
-                operator_details = (
-                    build_operator_results(
-                        iso_month,
-                        parse_csv_details(raw_csv_pair[0], raw_csv_pair[1], log=logger),
-                    )
-                    if raw_csv_pair is not None
-                    else []
-                )
+                state_tax: float | None = None
+                operator_details = []
+                if raw_csv_pair is not None:
+                    state_tax, op_taxes = parse_accrual_tax(raw_csv_pair[1], log=logger)
+                    detail_tuples = [
+                        (*op_tuple, None, None, op_taxes.get(op_tuple[0]))
+                        for op_tuple in parse_csv_details(raw_csv_pair[0], raw_csv_pair[1], log=logger)
+                    ]
+                    operator_details = build_operator_results(iso_month, detail_tuples)
                 item = finalize_state_month(
                     state=STATE_NAME,
                     iso_month=iso_month,
@@ -667,6 +704,7 @@ def fetch(
                     retail_revenue=retail_revenue,
                     mobile_handle=mobile_handle,
                     mobile_revenue=mobile_revenue,
+                    tax=state_tax,
                     source_url=source_url,
                     details=operator_details,
                     log=logger,

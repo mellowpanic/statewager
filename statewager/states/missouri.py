@@ -324,19 +324,114 @@ def parse_report_details(
     return output
 
 
-def parse_pdf(
+def _extract_all_dollar_amounts(line: str) -> list[float]:
+    return [
+        amount
+        for token in _DOLLAR_TOKEN_RE.findall(line)
+        if (amount := parse_dollar(token)) is not None
+    ]
+
+
+def parse_page_texts_fiscal(
+    page_texts: list[str],
+    year: int,
+    month: int,
+) -> tuple[float | None, float | None, dict[str, float]]:
+    """Extract ``(state_gross_revenue, state_tax, {detail_operator_key: tax})`` from MGC page texts."""
+    month_token = date(year, month, 1).strftime("%b-%y")
+    stat_taxes: dict[str, float] = {}
+    detail_gross: dict[str, float] = {}
+    op_taxes: dict[str, float] = {}
+
+    mode: str | None = None  # "stat_retail", "stat_mobile", "detail_retail", "detail_mobile"
+    current_operator: str | None = None
+    in_summary = False
+
+    for text in page_texts:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            upper = line.upper()
+            if "STATISTICAL REPORT SUMMARY" in upper:
+                mode = None
+                current_operator = None
+                in_summary = True
+                continue
+            if "SPORTS WAGERING RETAIL STATISTICAL REPORT" in upper:
+                mode = "stat_retail"
+                current_operator = None
+                in_summary = False
+                continue
+            if "SPORTS WAGERING MOBILE STATISTICAL REPORT" in upper:
+                mode = "stat_mobile"
+                current_operator = None
+                in_summary = False
+                continue
+            if "RETAIL DETAIL REPORT" in upper:
+                mode = "detail_retail"
+                current_operator = None
+                in_summary = False
+                continue
+            if "MOBILE DETAIL REPORT" in upper:
+                mode = "detail_mobile"
+                current_operator = None
+                in_summary = False
+                continue
+            if "DETAIL REPORT" in upper:
+                mode = None
+                current_operator = None
+                in_summary = False
+                continue
+            if in_summary or mode is None:
+                continue
+
+            if line.startswith("STATE TOTALS MTD:") or line.startswith("STATE TOTALS:"):
+                amounts = _extract_all_dollar_amounts(line)
+                if mode in ("stat_retail", "stat_mobile") and len(amounts) >= 4:
+                    stat_taxes.setdefault(mode, amounts[3])
+                elif mode in ("detail_retail", "detail_mobile") and len(amounts) >= 3:
+                    detail_gross.setdefault(mode, amounts[2])
+                continue
+
+            if "STATE TOTALS" in upper or "TOTALS:" in upper:
+                continue
+
+            if mode in ("stat_retail", "stat_mobile"):
+                month_match = ROW_MONTH_RE.search(line)
+                if month_match and _CHANNEL_SUFFIX_RE.search(line[:month_match.start()]):
+                    current_operator = clean_operator_name(line[:month_match.start()])
+                if month_token in line:
+                    prefix, _, _ = line.partition(month_token)
+                    op_name = clean_operator_name(prefix) or current_operator
+                    if op_name:
+                        current_operator = op_name
+                        amounts = _extract_all_dollar_amounts(line)
+                        if len(amounts) >= 4:
+                            k = detail_operator_key(op_name)
+                            op_taxes[k] = op_taxes.get(k, 0.0) + amounts[3]
+
+    state_gross_rev = sum(detail_gross.values()) if detail_gross else None
+    state_tax = sum(stat_taxes.values()) if stat_taxes else None
+    return state_gross_rev, state_tax, op_taxes
+
+
+def _parse_pdf_with_fiscal(
     data: bytes,
     year: int,
     month: int,
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> tuple[
-    float,
-    float,
+    tuple[
+        float,
+        float,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+    ],
     float | None,
     float | None,
-    float | None,
-    float | None,
-    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+    dict[str, float],
 ] | None:
     if pdfplumber is None:
         raise RuntimeError("pdfplumber is required to parse Missouri PDFs")
@@ -348,7 +443,8 @@ def parse_pdf(
             mobile = parse_report_state_totals(page_texts, "SPORTS WAGERING MOBILE STATISTICAL REPORT")
             if retail is not None and mobile is not None:
                 details = parse_report_details(page_texts, year, month)
-                return (
+                state_gross_rev, state_tax, op_taxes = parse_page_texts_fiscal(page_texts, year, month)
+                core = (
                     retail[0] + mobile[0],
                     retail[1] + mobile[1],
                     retail[0],
@@ -357,6 +453,7 @@ def parse_pdf(
                     mobile[1],
                     details,
                 )
+                return core, state_gross_rev, state_tax, op_taxes
             text = "\n".join(page_texts)
     except Exception as exc:
         log(f"WARN could not parse Missouri PDF: {exc}")
@@ -382,7 +479,7 @@ def parse_pdf(
     if retail is None or mobile is None:
         return None
     total = (retail[0] + mobile[0], retail[1] + mobile[1])
-    return (
+    core = (
         total[0],
         total[1],
         retail[0],
@@ -391,6 +488,43 @@ def parse_pdf(
         mobile[1],
         [],
     )
+    return core, None, None, {}
+
+
+def parse_pdf(
+    data: bytes,
+    year: int,
+    month: int,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[
+    float,
+    float,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+] | None:
+    parsed = _parse_pdf_with_fiscal(data, year, month, log=log)
+    return parsed[0] if parsed is not None else None
+
+
+def _parse_local_file_with_fiscal(
+    local_dir: str,
+    year: int,
+    month: int,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+):
+    month_token = f"{month:02d}{year % 100:02d}"
+    month_name = date(year, month, 1).strftime("%b").lower()
+    for entry in sorted(os.listdir(local_dir)):
+        if not entry.lower().endswith(".pdf"):
+            continue
+        lower = entry.lower()
+        if month_token in lower or (month_name in lower and str(year) in lower):
+            with open(os.path.join(local_dir, entry), "rb") as file_handle:
+                return _parse_pdf_with_fiscal(file_handle.read(), year, month, log=log)
+    return None
 
 
 def parse_local_file(
@@ -407,16 +541,8 @@ def parse_local_file(
     float | None,
     list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
 ] | None:
-    month_token = f"{month:02d}{year % 100:02d}"
-    month_name = date(year, month, 1).strftime("%b").lower()
-    for entry in sorted(os.listdir(local_dir)):
-        if not entry.lower().endswith(".pdf"):
-            continue
-        lower = entry.lower()
-        if month_token in lower or (month_name in lower and str(year) in lower):
-            with open(os.path.join(local_dir, entry), "rb") as file_handle:
-                return parse_pdf(file_handle.read(), year, month, log=log)
-    return None
+    parsed = _parse_local_file_with_fiscal(local_dir, year, month, log=log)
+    return parsed[0] if parsed is not None else None
 
 
 def fetch(
@@ -443,12 +569,12 @@ def fetch(
         iso_month = format_iso_month(year, month)
         try:
             logger(f"INFO processing {label}")
-            parsed = parse_local_file(local_dir, year, month, log=logger) if local_dir else None
+            parsed_fiscal = _parse_local_file_with_fiscal(local_dir, year, month, log=logger) if local_dir else None
             chosen_url: str | None = None
-            if parsed:
+            if parsed_fiscal:
                 logger(f"INFO parsed local PDF for {label}")
                 chosen_url = build_pdf_url(year, month)
-            if parsed is None:
+            if parsed_fiscal is None:
                 path = cache_path(cache_dir, f"missouri_{year}_{month:02d}.pdf")
                 cached = bool(path and os.path.isfile(path))
                 url: str | None = None
@@ -492,13 +618,18 @@ def fetch(
                         reason="downloaded" if data else "fetch-failed",
                     )
                 if data:
-                    parsed = parse_pdf(data, year, month, log=logger)
+                    parsed_fiscal = _parse_pdf_with_fiscal(data, year, month, log=logger)
                     chosen_url = url
-            if parsed is None:
+            if parsed_fiscal is None:
                 log_skip(logger, label, "no parseable MGC PDF")
                 continue
-            handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details = parsed
-            operator_details = build_operator_results(iso_month, details)
+            core, state_gross_rev, state_tax, op_taxes = parsed_fiscal
+            handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details = core
+            enriched_details = [
+                (*op_tuple, None, None, op_taxes.get(detail_operator_key(op_tuple[0])))
+                for op_tuple in details
+            ]
+            operator_details = build_operator_results(iso_month, enriched_details)
             item = finalize_state_month(
                 state=STATE_NAME,
                 iso_month=iso_month,
@@ -510,6 +641,8 @@ def fetch(
                 mobile_revenue=mobile_revenue,
                 source_url=chosen_url,
                 details=operator_details,
+                gross_revenue=state_gross_rev,
+                tax=state_tax,
                 log=logger,
                 label=label,
             )

@@ -556,6 +556,178 @@ def parse_detail_operators(
     return output
 
 
+def _ks_fiscal_key(casino: str, provider: str) -> str:
+    clean_c = _WS_RE.sub(" ", casino).strip().lower()
+    clean_p = _BET365_SPACE_RE.sub("BET365", _WS_RE.sub(" ", provider).strip()).lower()
+    return f"{clean_c} - {clean_p}"
+
+
+def parse_summary_fiscal(
+    data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[float | None, dict[str, float]]:
+    """Extract Monthly Summary ``(statewide_tax, {canonical_op_key: tax})`` from Kansas summary PDFs."""
+    state_tax: float | None = None
+    op_taxes: dict[str, float] = {}
+
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                if pdf.pages:
+                    tables = pdf.pages[0].extract_tables()
+                    if tables:
+                        for row in tables[0]:
+                            c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
+                            if not c0 or "casino" in c0:
+                                continue
+                            if "fiscal year" in c0:
+                                break
+                            tax_val = parse_dollar(row[4]) if len(row) > 4 else None
+                            if tax_val is None:
+                                continue
+                            if c0 == "totals":
+                                state_tax = tax_val
+                                break
+                            if "subtotal -" in c0:
+                                continue
+                            casino = _WS_RE.sub(" ", str(row[0] or "").strip())
+                            provider = _WS_RE.sub(" ", str(row[1] if len(row) > 1 else "").strip())
+                            if casino and provider:
+                                k = _ks_fiscal_key(casino, provider)
+                                op_taxes[k] = op_taxes.get(k, 0.0) + tax_val
+        except Exception as exc:
+            log(f"WARN could not parse Kansas summary tax table for fiscal extraction: {exc}")
+
+    if state_tax is None:
+        fallback_text = _extract_pdftotext_raw(data)
+        if fallback_text:
+            for raw_line in fallback_text.splitlines():
+                collapsed = _BET365_SPACE_RE.sub("BET365", _WS_RE.sub(" ", raw_line).strip())
+                low = collapsed.lower()
+                if "fiscal year" in low:
+                    break
+                if low.startswith("totals"):
+                    tokens = AMOUNT_TOKEN_RE.findall(collapsed)
+                    if len(tokens) >= 3:
+                        state_tax = _parse_ks_cell_amount(tokens[2])
+                    break
+                if "subtotal -" in low:
+                    continue
+                casino = next((p for p in _CASINO_PREFIXES if collapsed.startswith(p + " ")), None)
+                if casino:
+                    rest = collapsed[len(casino):].strip()
+                    prov_match = _PROVIDER_SPLIT_RE.match(rest)
+                    if prov_match:
+                        provider = prov_match.group(1).strip()
+                        tokens = AMOUNT_TOKEN_RE.findall(rest[prov_match.end():])
+                        if len(tokens) >= 3:
+                            k = _ks_fiscal_key(casino, provider)
+                            op_taxes[k] = op_taxes.get(k, 0.0) + _parse_ks_cell_amount(tokens[2])
+    return state_tax, op_taxes
+
+
+def _add_ks_fiscal(
+    bucket_map: dict[str, list[float]],
+    key: str,
+    gross_rev: float,
+    promo: float,
+    tax: float,
+) -> None:
+    cur = bucket_map.setdefault(key, [0.0, 0.0, 0.0])
+    cur[0] += gross_rev
+    cur[1] += promo
+    cur[2] += tax
+
+
+def parse_detail_fiscal(
+    data: bytes,
+    month_label: str,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[
+    tuple[float | None, float | None, float | None],
+    dict[str, tuple[float | None, float | None, float | None]],
+]:
+    """Extract ``((gross_rev, promo, tax), {canonical_op_key: (gross_rev, promo, tax)})`` from Kansas detail PDFs."""
+    state_fiscal: tuple[float | None, float | None, float | None] = (None, None, None)
+    op_buckets: dict[str, list[float]] = {}
+
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                if pdf.pages:
+                    tables = pdf.pages[0].extract_tables()
+                    rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
+                    w_col, p_col, pr_col, tx_col = 2, 3, 4, 9
+                    for row in rows:
+                        if len(row) >= 10 and "casino" in normalize_pdf_label(row[0] or ""):
+                            for idx, cell in enumerate(row):
+                                htxt = normalize_pdf_label(cell or "")
+                                if "settled" in htxt and "wager" in htxt:
+                                    w_col = idx
+                                elif "prizes" in htxt:
+                                    p_col = idx
+                                elif "promotional" in htxt:
+                                    pr_col = idx
+                                elif "state share" in htxt:
+                                    tx_col = idx
+                            continue
+                        if len(row) <= max(w_col, p_col, pr_col, tx_col):
+                            continue
+                        c0 = normalize_pdf_label(row[0] or "")
+                        if "subtotal -" in c0:
+                            continue
+                        wagers = _parse_ks_cell_amount(row[w_col])
+                        prizes = _parse_ks_cell_amount(row[p_col])
+                        gross_rev = wagers - abs(prizes)
+                        promo = abs(_parse_ks_cell_amount(row[pr_col]))
+                        tax = _parse_ks_cell_amount(row[tx_col])
+                        if c0 == "totals":
+                            state_fiscal = (gross_rev, promo, tax)
+                            break
+                        casino = _WS_RE.sub(" ", str(row[0] or "").strip())
+                        provider = _WS_RE.sub(" ", str(row[1] or "").strip())
+                        if casino and provider:
+                            _add_ks_fiscal(op_buckets, _ks_fiscal_key(casino, provider), gross_rev, promo, tax)
+        except Exception as exc:
+            log(f"WARN could not parse Kansas detail fiscal table for {month_label}: {exc}")
+
+    if state_fiscal == (None, None, None):
+        fallback_text = _extract_pdftotext_raw(data)
+        if fallback_text:
+            for raw_line in fallback_text.splitlines():
+                collapsed = _BET365_SPACE_RE.sub("BET365", _WS_RE.sub(" ", raw_line).strip())
+                low = collapsed.lower()
+                if "subtotal -" in low:
+                    continue
+                if low.startswith("totals"):
+                    tokens = AMOUNT_TOKEN_RE.findall(collapsed)
+                    if len(tokens) >= 7:
+                        wagers = _parse_ks_cell_amount(tokens[0])
+                        prizes = _parse_ks_cell_amount(tokens[1])
+                        promo = abs(_parse_ks_cell_amount(tokens[2]))
+                        tax = _parse_ks_cell_amount(tokens[-1])
+                        state_fiscal = (wagers - abs(prizes), promo, tax)
+                    break
+                casino = next((p for p in _CASINO_PREFIXES if collapsed.startswith(p + " ")), None)
+                if casino:
+                    rest = collapsed[len(casino):].strip()
+                    prov_match = _PROVIDER_SPLIT_RE.match(rest)
+                    if prov_match:
+                        provider = prov_match.group(1).strip()
+                        tokens = AMOUNT_TOKEN_RE.findall(rest[prov_match.end():])
+                        if len(tokens) >= 7:
+                            wagers = _parse_ks_cell_amount(tokens[0])
+                            prizes = _parse_ks_cell_amount(tokens[1])
+                            promo = abs(_parse_ks_cell_amount(tokens[2]))
+                            tax = _parse_ks_cell_amount(tokens[-1])
+                            _add_ks_fiscal(
+                                op_buckets, _ks_fiscal_key(casino, provider), wagers - abs(prizes), promo, tax,
+                            )
+
+    op_fiscal = {k: (v[0], v[1], v[2]) for k, v in op_buckets.items()}
+    return state_fiscal, op_fiscal
+
+
 def parse_local_file(
     local_dir: str,
     month: int,
@@ -608,6 +780,7 @@ def fetch(
             detail_parsed = None
             chosen_url: str | None = None
 
+            summary_data_bytes: bytes | None = None
             if local_dir:
                 summary_parsed = parse_local_file(local_dir, month, year, log=logger)
                 if summary_parsed:
@@ -678,6 +851,7 @@ def fetch(
                     )
                 )
                 if summary_data:
+                    summary_data_bytes = summary_data
                     summary_parsed = parse_summary_pdf(summary_data, log=logger)
                     chosen_url = url or KS_SUMMARY_PAGE
                     if summary_parsed is None:
@@ -750,6 +924,14 @@ def fetch(
                 )
             )
 
+            summary_tax: float | None = None
+            summary_op_tax: dict[str, float] = {}
+            if summary_data_bytes:
+                summary_tax, summary_op_tax = parse_summary_fiscal(summary_data_bytes, log=logger)
+
+            state_gross_rev: float | None = None
+            state_promo: float | None = None
+            state_tax: float | None = summary_tax
             operator_details = []
             if detail_data:
                 detail_parsed = parse_detail_pdf(detail_data, label, log=logger)
@@ -766,10 +948,28 @@ def fetch(
                     summary_strategy = f"detail_{detail_strategy}"
                     chosen_url = detail_url or chosen_url or KS_DETAIL_PAGE
                     logger(f"INFO {label}: parsed detail splits via {detail_strategy}")
-                    operator_details = build_operator_results(
-                        iso_month,
-                        parse_detail_operators(detail_data, label, log=logger),
-                    )
+                    detail_state_fiscal, detail_op_fiscal = parse_detail_fiscal(detail_data, label, log=logger)
+                    d_gross, d_promo, d_tax = detail_state_fiscal
+                    if d_gross is not None:
+                        state_gross_rev = d_gross
+                    if d_promo is not None:
+                        state_promo = d_promo
+                    if d_tax is not None:
+                        state_tax = d_tax
+                    raw_ops = parse_detail_operators(detail_data, label, log=logger)
+                    enriched_ops = []
+                    for op_tuple in raw_ops:
+                        op_key = op_tuple[0]
+                        if " - " in op_key:
+                            c_part, p_part = op_key.split(" - ", 1)
+                            canon_key = _ks_fiscal_key(c_part, p_part)
+                        else:
+                            canon_key = op_key.lower()
+                        op_gross, op_promo, op_tax = detail_op_fiscal.get(canon_key, (None, None, None))
+                        if op_tax is None:
+                            op_tax = summary_op_tax.get(canon_key)
+                        enriched_ops.append((*op_tuple, op_gross, op_promo, op_tax))
+                    operator_details = build_operator_results(iso_month, enriched_ops)
                 else:
                     logger(f"WARN {label}: detail PDF parse returned no split rows")
 
@@ -785,6 +985,9 @@ def fetch(
                 source_url=chosen_url,
                 reconcile_splits=False,
                 details=operator_details,
+                gross_revenue=state_gross_rev,
+                promo_deductions=state_promo,
+                tax=state_tax,
                 log=logger,
                 label=label,
             )

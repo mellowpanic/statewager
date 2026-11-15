@@ -74,6 +74,9 @@ class OperatorMonthResult:
     retail_revenue: float | None = None
     mobile_handle: float | None = None
     mobile_revenue: float | None = None
+    gross_revenue: float | None = None
+    promo_deductions: float | None = None
+    tax: float | None = None
 
 
 @dataclass
@@ -95,6 +98,9 @@ class StateMonthResult:
     extra: dict[str, float | None] = field(default_factory=dict)
     details: list[OperatorMonthResult] = field(default_factory=list)
     publish_details: list[OperatorMonthResult] = field(default_factory=list)
+    gross_revenue: float | None = None
+    promo_deductions: float | None = None
+    tax: float | None = None
 
 
 def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
@@ -407,11 +413,15 @@ def build_operator_results(
             retail_revenue = entry.get("retail_revenue")
             mobile_handle = entry.get("mobile_handle")
             mobile_revenue = entry.get("mobile_revenue")
+            gross_revenue = entry.get("gross_revenue")
+            promo_deductions = entry.get("promo_deductions")
+            tax = entry.get("tax")
         else:
             seq = tuple(entry)
             if len(seq) == 3:
                 op_raw, handle, revenue = seq
                 retail_handle = retail_revenue = mobile_handle = mobile_revenue = None
+                gross_revenue = promo_deductions = tax = None
             elif len(seq) == 7:
                 (
                     op_raw,
@@ -422,8 +432,22 @@ def build_operator_results(
                     mobile_handle,
                     mobile_revenue,
                 ) = seq
+                gross_revenue = promo_deductions = tax = None
+            elif len(seq) == 10:
+                (
+                    op_raw,
+                    handle,
+                    revenue,
+                    retail_handle,
+                    retail_revenue,
+                    mobile_handle,
+                    mobile_revenue,
+                    gross_revenue,
+                    promo_deductions,
+                    tax,
+                ) = seq
             else:
-                raise ValueError(f"Expected 3- or 7-item operator entry, got {len(seq)}")
+                raise ValueError(f"Expected 3-, 7-, or 10-item operator entry, got {len(seq)}")
             operator = str(op_raw)
         h_val = safe_float(handle)
         r_val = safe_float(revenue)
@@ -438,6 +462,9 @@ def build_operator_results(
                 retail_revenue=safe_float(retail_revenue),
                 mobile_handle=safe_float(mobile_handle),
                 mobile_revenue=safe_float(mobile_revenue),
+                gross_revenue=safe_float(gross_revenue),
+                promo_deductions=safe_float(promo_deductions),
+                tax=safe_float(tax),
             )
         )
     return results
@@ -460,6 +487,9 @@ def finalize_state_month(
     extra: dict[str, float | None] | None = None,
     details: list[OperatorMonthResult] | None = None,
     publish_details: list[OperatorMonthResult] | None = None,
+    gross_revenue: float | None = None,
+    promo_deductions: float | None = None,
+    tax: float | None = None,
     log: Callable[[str], None] | None = None,
     label: str | None = None,
 ) -> StateMonthResult | None:
@@ -517,6 +547,9 @@ def finalize_state_month(
         extra=extra if extra is not None else {},
         details=details if details is not None else [],
         publish_details=publish_details if publish_details is not None else [],
+        gross_revenue=safe_float(gross_revenue),
+        promo_deductions=safe_float(promo_deductions),
+        tax=safe_float(tax),
     )
 
 

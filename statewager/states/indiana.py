@@ -76,7 +76,7 @@ def parse_summary_totals(workbook) -> tuple[float, float] | None:
     return None
 
 
-def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
+def _find_tax_summary_sheet(workbook):
     def is_location_totals_sheet(sheet) -> bool:
         normalized_title = normalize_sheet_title(sheet.title.strip())
         if "sw tax summary" in sheet.title.strip().lower() or normalized_title in {"sheet7", "7 sw tax summary"}:
@@ -87,7 +87,11 @@ def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
                     return True
         return False
 
-    sheet = next((ws for ws in workbook.worksheets if is_location_totals_sheet(ws)), None)
+    return next((ws for ws in workbook.worksheets if is_location_totals_sheet(ws)), None)
+
+
+def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
+    sheet = _find_tax_summary_sheet(workbook)
     if sheet is None:
         return {}
     rows: dict[str, tuple[float, float]] = {}
@@ -130,6 +134,47 @@ def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
             saw_location_rows = True
             rows[label] = (float(handle), float(revenue))
     return rows
+
+
+def parse_tax_summary(workbook) -> tuple[float | None, dict[str, float]]:
+    """Extract ``(total_tax, {location_name: tax})`` from Indiana Sheet7 (7 SW Tax Summary)."""
+    sheet = _find_tax_summary_sheet(workbook)
+    if sheet is None:
+        return None, {}
+    loc_taxes: dict[str, float] = {}
+    total_tax: float | None = None
+    saw_rows = False
+    tax_col: int | None = None
+    for row in sheet.iter_rows(values_only=True):
+        if tax_col is None:
+            h_idx: int | None = None
+            t_idx: int | None = None
+            for index, cell in enumerate(row):
+                if index == 0:
+                    continue
+                text = str(cell or "").strip().lower()
+                if h_idx is None and text == "handle":
+                    h_idx = index
+                if t_idx is None and "tax" in text and "taxable" not in text:
+                    t_idx = index
+            if h_idx is not None and t_idx is not None:
+                tax_col = t_idx
+                continue
+        label = str(row[0] if row else "").strip()
+        if not label or label.startswith("*"):
+            continue
+        if label.upper() == "TOTAL":
+            if saw_rows:
+                if tax_col is not None and tax_col < len(row) and is_number(row[tax_col]):
+                    total_tax = float(row[tax_col])
+                break
+            continue
+        if tax_col is not None and tax_col < len(row) and is_number(row[tax_col]):
+            saw_rows = True
+            loc_taxes[label] = float(row[tax_col])
+    if total_tax is None and loc_taxes:
+        total_tax = sum(loc_taxes.values())
+    return total_tax, loc_taxes
 
 
 def is_retail_detail_label(label: str) -> bool:
@@ -257,34 +302,66 @@ def _allocate_component_adjustments(raw_revenues: list[float], adjustments: floa
     return allocated
 
 
-def _build_publish_detail_rows(
+def _allocate_component_tax(adj_revenues: list[float], total_tax: float | None) -> list[float | None]:
+    if total_tax is None or not adj_revenues:
+        return [None] * len(adj_revenues)
+    weights = [max(0.0, rev) for rev in adj_revenues]
+    total_w = sum(weights)
+    if total_w <= 0:
+        return [None] * len(adj_revenues)
+    last_pos = max(idx for idx, w in enumerate(weights) if w > 0)
+    allocated: list[float | None] = []
+    used = 0.0
+    for idx, w in enumerate(weights):
+        if w <= 0:
+            allocated.append(0.0)
+        elif idx == last_pos:
+            allocated.append(round(total_tax - used, 2))
+        else:
+            share = round(total_tax * (w / total_w), 2)
+            used += share
+            allocated.append(share)
+    return allocated
+
+
+def _build_publish_detail_rows_with_fiscal(
     locations: dict[str, tuple[float, float]],
     blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]],
-) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
-    publish_rows: list[tuple[str, float, float, float | None, float | None, float | None, float | None]] = []
+    loc_taxes: dict[str, float],
+) -> list[tuple[object, ...]]:
+    publish_rows: list[tuple[object, ...]] = []
     for location_name, (loc_h, loc_r) in locations.items():
+        loc_tax = loc_taxes.get(location_name)
         block = blocks.get(location_name)
         if block is None:
-            publish_rows.append((location_name, loc_h, loc_r, None, None, None, None))
+            publish_rows.append((location_name, loc_h, loc_r, None, None, None, None, None, None, loc_tax))
             continue
         ret_h, ret_raw_r, skins, adjustments = block
+        loc_gross = ret_raw_r + sum(sr for _, _, sr in skins)
         active_skins = [(lbl, sh, sr) for lbl, sh, sr in skins if sh != 0 or sr != 0]
         if len(active_skins) < 2:
             mob_h = sum(sh for _, sh, _ in skins)
             mob_raw_r = sum(sr for _, _, sr in skins)
             adj_ret_r, adj_mob_r = allocate_adjustments(ret_raw_r, mob_raw_r, adjustments)
-            publish_rows.append((location_name, loc_h, loc_r, ret_h, adj_ret_r, mob_h, adj_mob_r))
+            publish_rows.append(
+                (location_name, loc_h, loc_r, ret_h, adj_ret_r, mob_h, adj_mob_r, loc_gross, None, loc_tax)
+            )
             continue
         has_retail = ret_h != 0 or ret_raw_r != 0
         raw_revs: list[float] = ([ret_raw_r] if has_retail else []) + [sr for _, _, sr in active_skins]
         adj_revs = _allocate_component_adjustments(raw_revs, adjustments)
+        comp_taxes = _allocate_component_tax(adj_revs, loc_tax)
         pos = 0
         if has_retail:
             adj_ret_r = adj_revs[pos]
+            ret_tax = comp_taxes[pos]
             pos += 1
-            publish_rows.append((f"{location_name} (Retail)", ret_h, adj_ret_r, ret_h, adj_ret_r, None, None))
-        for skin_label, skin_h, _skin_raw_r in active_skins:
+            publish_rows.append(
+                (f"{location_name} (Retail)", ret_h, adj_ret_r, ret_h, adj_ret_r, None, None, ret_raw_r, None, ret_tax)
+            )
+        for skin_label, skin_h, skin_raw_r in active_skins:
             adj_skin_r = adj_revs[pos]
+            skin_tax = comp_taxes[pos]
             pos += 1
             publish_rows.append(
                 (
@@ -295,24 +372,30 @@ def _build_publish_detail_rows(
                     None,
                     skin_h,
                     adj_skin_r,
+                    skin_raw_r,
+                    None,
+                    skin_tax,
                 )
             )
     return publish_rows
 
 
+def _build_publish_detail_rows(
+    locations: dict[str, tuple[float, float]],
+    blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]],
+) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
+    return [
+        row[:7]  # type: ignore[misc]
+        for row in _build_publish_detail_rows_with_fiscal(locations, blocks, {})
+    ]
+
+
 def _parse_workbook_with_skins(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
-    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
-] | None:
+    *,
+    include_fiscal: bool = False,
+):
     if openpyxl is None:
         raise RuntimeError("openpyxl is required to parse Indiana workbooks")
     try:
@@ -330,11 +413,17 @@ def _parse_workbook_with_skins(
             log("WARN Indiana workbook missing operator retail/mobile breakdown")
             return None
         locations = parse_location_totals(workbook)
+        total_tax, loc_taxes = parse_tax_summary(workbook)
         handle, revenue = totals
         breakdown = {
             loc: (ret_h, *allocate_adjustments(ret_raw_r, sum(sr for _, _, sr in skins), adj)[:1], sum(sh for _, sh, _ in skins), allocate_adjustments(ret_raw_r, sum(sr for _, _, sr in skins), adj)[1])
             for loc, (ret_h, ret_raw_r, skins, adj) in blocks.items()
         }
+        loc_gross = {
+            loc: ret_raw_r + sum(sr for _, _, sr in skins)
+            for loc, (_ret_h, ret_raw_r, skins, _adj) in blocks.items()
+        }
+        state_gross_revenue = sum(loc_gross.values()) if loc_gross else None
         retail_handle = sum(values[0] for values in breakdown.values())
         retail_revenue = sum(values[1] for values in breakdown.values())
         mobile_handle = handle - retail_handle
@@ -355,6 +444,22 @@ def _parse_workbook_with_skins(
                     split[2],
                     split[3],
                 )
+            )
+        if include_fiscal:
+            publish_rows = _build_publish_detail_rows_with_fiscal(locations, blocks, loc_taxes)
+            return (
+                handle,
+                revenue,
+                retail_handle,
+                retail_revenue,
+                mobile_handle,
+                mobile_revenue,
+                detail_rows,
+                publish_rows,
+                state_gross_revenue,
+                total_tax,
+                loc_gross,
+                loc_taxes,
             )
         publish_rows = _build_publish_detail_rows(locations, blocks)
         return handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, detail_rows, publish_rows
@@ -443,7 +548,7 @@ def fetch(
             if data is None:
                 log_skip(logger, label, "workbook unavailable")
                 continue
-            parsed = _parse_workbook_with_skins(data, log=logger)
+            parsed = _parse_workbook_with_skins(data, log=logger, include_fiscal=True)
             if parsed is None:
                 log_skip(logger, label, "could not parse statewide totals")
                 continue
@@ -456,6 +561,10 @@ def fetch(
                 mobile_revenue,
                 locations,
                 publish_rows,
+                state_gross_revenue,
+                state_tax,
+                loc_gross,
+                loc_taxes,
             ) = parsed
             valid_locations: list[tuple[object, ...]] = []
             for (
@@ -486,6 +595,9 @@ def fetch(
                         location_retail_revenue,
                         location_mobile_handle,
                         location_mobile_revenue,
+                        loc_gross.get(location_name),
+                        None,
+                        loc_taxes.get(location_name),
                     )
                 )
             operator_details = build_operator_results(iso_month, valid_locations)
@@ -506,6 +618,8 @@ def fetch(
                 source_url=source_url,
                 details=operator_details,
                 publish_details=publish_operator_details,
+                gross_revenue=state_gross_revenue,
+                tax=state_tax,
                 log=logger,
                 label=label,
             )

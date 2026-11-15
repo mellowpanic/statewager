@@ -71,6 +71,7 @@ class ParsedIowaMetrics:
     metrics: IowaMetrics
     layout: str
     details: tuple[IowaDetailRow, ...] = ()
+    tax: float | None = None
 
 
 TOTALS_LABELS = [
@@ -306,6 +307,7 @@ def _parse_labeled_totals_block(block: str) -> ParsedIowaMetrics | None:
             _extract_row_total(block, INTERNET_REVENUE_LABEL),
         ),
         layout="labeled-totals",
+        tax=_extract_row_total(block, "STATE TAX"),
     )
 
 
@@ -321,9 +323,11 @@ def _parse_compact_totals_block(block: str) -> ParsedIowaMetrics | None:
     ]
     if len(parsed) < 8:
         return None
+    tax = parsed[9] if len(parsed) >= 10 and "STATE TAX" in block.upper() else None
     return ParsedIowaMetrics(
         metrics=(parsed[1], parsed[0], parsed[4], parsed[3], parsed[7], parsed[6]),
         layout="compact-totals",
+        tax=tax,
     )
 
 
@@ -513,7 +517,12 @@ def parse_iowa_pdf(
         matched_details = tuple(next(iter(detail_map.values())))
     parsed = parse_totals_block(text)
     if parsed is not None:
-        return ParsedIowaMetrics(metrics=parsed.metrics, layout=parsed.layout, details=matched_details)
+        return ParsedIowaMetrics(
+            metrics=parsed.metrics,
+            layout=parsed.layout,
+            details=matched_details,
+            tax=parsed.tax,
+        )
     totals = parse_text_blob(text)
     if totals is None:
         return None
@@ -639,6 +648,7 @@ def build_archive_lookup(
                         metrics=parsed.metrics,
                         layout=parsed.layout,
                         details=tuple(detail_lookup.get(label, ())),
+                        tax=parsed.tax,
                     )
                 else:
                     log(f"WARN Iowa FY archive did not yield totals for {label}")
@@ -734,6 +744,8 @@ def fetch(
                 source_url=source_url,
                 details=operator_details,
                 strict_split_pct=0.01,
+                gross_revenue=total_revenue,
+                tax=parsed_result.tax,
                 log=logger,
                 label=label,
             )

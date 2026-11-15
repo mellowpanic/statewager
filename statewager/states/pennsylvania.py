@@ -458,22 +458,117 @@ def aggregate_detail_totals(
     return retail_metrics, mobile_metrics
 
 
-def parse_fy_xlsx(
+def _extract_fiscal_block(
+    rows: list[tuple[object, ...]],
+    start_index: int,
+    col_to_label: dict[int, str],
+) -> dict[str, tuple[float | None, float | None, float | None]]:
+    """Extract ``{month_label: (gross_revenue, promo_deductions, tax)}`` from a PA summary/operator block."""
+    rev_row = None
+    promo_row = None
+    state_tax_row = None
+    lsa_row = None
+    for row in rows[start_index + 1:start_index + 10]:
+        label = normalize_label(row[0] if row else "")
+        if not label:
+            continue
+        if label in ("retail sports wagering", "online sports wagering"):
+            break
+        if rev_row is None and label == "revenue":
+            rev_row = row
+        elif promo_row is None and label.startswith("promotional credit"):
+            promo_row = row
+        elif state_tax_row is None and label.startswith("state tax due"):
+            state_tax_row = row
+        elif lsa_row is None and label.startswith("local share assessment"):
+            lsa_row = row
+
+    if rev_row is None and promo_row is None and state_tax_row is None and lsa_row is None:
+        return {}
+
+    out: dict[str, tuple[float | None, float | None, float | None]] = {}
+    for column, month_label in col_to_label.items():
+        gross_rev = _to_float(rev_row[column]) if rev_row and column < len(rev_row) else None
+        promo = _to_float(promo_row[column]) if promo_row and column < len(promo_row) else None
+        st = _to_float(state_tax_row[column]) if state_tax_row and column < len(state_tax_row) else None
+        lsa = _to_float(lsa_row[column]) if lsa_row and column < len(lsa_row) else None
+        tax = (st or 0.0) + (lsa or 0.0) if (st is not None or lsa is not None) else None
+        if gross_rev is not None or promo is not None or tax is not None:
+            out[month_label] = (gross_rev, promo, tax)
+    return out
+
+
+def parse_sheet_fiscal(
+    rows: list[tuple[object, ...]],
+    col_to_label: dict[int, str],
+) -> dict[str, tuple[float | None, float | None, float | None]]:
+    """Extract statewide ``{month_label: (gross_revenue, promo_deductions, tax)}`` from PGCB rows."""
+    if not col_to_label:
+        return {}
+    for index, row in enumerate(rows):
+        if normalize_label(row[0] if row else "") == "grand total":
+            fiscal = _extract_fiscal_block(rows, index, col_to_label)
+            if fiscal:
+                return fiscal
+    return {}
+
+
+def parse_detail_fiscal(
+    rows: list[tuple[object, ...]],
+    col_to_label: dict[int, str],
+) -> dict[tuple[str, str], tuple[float | None, float | None, float | None]]:
+    """Extract per-(month_label, operator) fiscal metrics ``(gross_revenue, promo_deductions, tax)``."""
+    if not col_to_label:
+        return {}
+    fiscal_by_op: dict[tuple[str, str], tuple[float | None, float | None, float | None]] = {}
+    index = 0
+    while index < len(rows):
+        label = str(rows[index][0] if rows[index] else "").strip()
+        upper = label.upper()
+        if not label or upper in {
+            "GRAND TOTAL",
+            "TOTAL SPORTS WAGERING",
+            "RETAIL SPORTS WAGERING",
+            "ONLINE SPORTS WAGERING",
+        }:
+            index += 1
+            continue
+        if index + 15 >= len(rows):
+            break
+        if (
+            normalize_label(rows[index + 1][0] if rows[index + 1] else "") != "total sports wagering"
+            or normalize_label(rows[index + 2][0] if rows[index + 2] else "") != "handle*"
+            or normalize_label(rows[index + 3][0] if rows[index + 3] else "") != "revenue"
+        ):
+            index += 1
+            continue
+        block_fiscal = _extract_fiscal_block(rows, index, col_to_label)
+        for month_label, vals in block_fiscal.items():
+            fiscal_by_op[(month_label, label)] = vals
+        index += 16
+    return fiscal_by_op
+
+
+def _parse_fy_xlsx_core(
     data: bytes,
     fy_start: int,
     fy_end: int,
     log: Callable[[str], None] = _DEFAULT_LOG,
-) -> dict[
-    str,
-    tuple[
-        float,
-        float,
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+) -> tuple[
+    dict[
+        str,
+        tuple[
+            float,
+            float,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+        ],
     ],
+    dict[str, tuple[float | None, float | None, float | None]],
+    dict[tuple[str, str], tuple[float | None, float | None, float | None]],
 ]:
     if openpyxl is None:
         raise RuntimeError("openpyxl is required to parse Pennsylvania workbooks")
@@ -481,7 +576,7 @@ def parse_fy_xlsx(
         workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     except Exception as exc:
         log(f"WARN could not open workbook FY{fy_start % 100:02d}-{fy_end % 100:02d}: {exc}")
-        return {}
+        return {}, {}, {}
     try:
         first_sheet_rows = [tuple(row) for row in workbook[workbook.sheetnames[0]].iter_rows(values_only=True)]
         col_to_label = parse_month_columns(first_sheet_rows, fy_start, fy_end)
@@ -522,6 +617,8 @@ def parse_fy_xlsx(
             retail_metrics = detail_retail_metrics
         if detail_mobile_metrics:
             mobile_metrics = detail_mobile_metrics
+        sheet_fiscal = parse_sheet_fiscal(first_sheet_rows, col_to_label)
+        detail_fiscal = parse_detail_fiscal(first_sheet_rows, col_to_label)
         results: dict[
             str,
             tuple[
@@ -546,9 +643,30 @@ def parse_fy_xlsx(
                 mobile[1] if mobile else None,
                 detail_metrics.get(label, []),
             )
-        return results
+        return results, sheet_fiscal, detail_fiscal
     finally:
         workbook.close()
+
+
+def parse_fy_xlsx(
+    data: bytes,
+    fy_start: int,
+    fy_end: int,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> dict[
+    str,
+    tuple[
+        float,
+        float,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+        list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+    ],
+]:
+    results, _, _ = _parse_fy_xlsx_core(data, fy_start, fy_end, log=log)
+    return results
 
 
 def parse_local_file(local_dir: str, fy_start: int, fy_end: int) -> bytes | None:
@@ -588,6 +706,8 @@ def fetch(
             list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
         ],
     ] = {}
+    all_sheet_fiscal: dict[str, tuple[float | None, float | None, float | None]] = {}
+    all_detail_fiscal: dict[tuple[str, str], tuple[float | None, float | None, float | None]] = {}
     anchors: list[dict[str, str]] | None = None
 
     needed_fys = sorted({get_fy(month, year) for month, year, _ in months})
@@ -631,7 +751,9 @@ def fetch(
             if data is None:
                 logger(f"WARN could not find FY workbook for {fy_start}-{fy_end}")
                 continue
-            fy_parsed = parse_fy_xlsx(data, fy_start, fy_end, log=logger)
+            fy_parsed, fy_sheet_fiscal, fy_detail_fiscal = _parse_fy_xlsx_core(
+                data, fy_start, fy_end, log=logger,
+            )
             fy_labels = [label for month, year, label in months if get_fy(month, year) == (fy_start, fy_end)]
             if (
                 was_cached
@@ -650,8 +772,12 @@ def fetch(
                     log=logger,
                 )
                 if refreshed is not None:
-                    fy_parsed = parse_fy_xlsx(refreshed, fy_start, fy_end, log=logger)
+                    fy_parsed, fy_sheet_fiscal, fy_detail_fiscal = _parse_fy_xlsx_core(
+                        refreshed, fy_start, fy_end, log=logger,
+                    )
             all_data.update(fy_parsed)
+            all_sheet_fiscal.update(fy_sheet_fiscal)
+            all_detail_fiscal.update(fy_detail_fiscal)
         except Exception as exc:
             logger(f"WARN failed Pennsylvania FY workbook processing for {fy_start}-{fy_end}: {exc}")
 
@@ -662,7 +788,15 @@ def fetch(
             log_skip(logger, label, "no parsed value")
             continue
         handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details = all_data[label]
-        operator_details = build_operator_results(iso_month, details)
+        enriched_details = [
+            (
+                *op_tuple,
+                *all_detail_fiscal.get((label, op_tuple[0]), (None, None, None)),
+            )
+            for op_tuple in details
+        ]
+        operator_details = build_operator_results(iso_month, enriched_details)
+        s_gross, s_promo, s_tax = all_sheet_fiscal.get(label, (None, None, None))
         item = finalize_state_month(
             state=STATE_NAME,
             iso_month=iso_month,
@@ -674,6 +808,9 @@ def fetch(
             mobile_revenue=mobile_revenue,
             source_url=REVENUE_PAGE,
             details=operator_details,
+            gross_revenue=s_gross,
+            promo_deductions=s_promo,
+            tax=s_tax,
             log=logger,
             label=label,
         )

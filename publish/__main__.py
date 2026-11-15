@@ -117,15 +117,24 @@ def publish_all(
 
     silent_log = (lambda _msg: None) if quiet else None
 
-    def _fetch_one(item: tuple[str, object]) -> list[StateMonthResult]:
-        _slug, mod = item
-        return mod.fetch(
-            month_start,
-            month_end,
-            cache_dir=cache_dir,
-            offline=offline,
-            log=silent_log,
-        )
+    def _fetch_one(item: tuple[str, object]) -> tuple[list[StateMonthResult], Exception | None]:
+        slug, mod = item
+        try:
+            return (
+                mod.fetch(
+                    month_start,
+                    month_end,
+                    cache_dir=cache_dir,
+                    offline=offline,
+                    log=silent_log,
+                ),
+                None,
+            )
+        except Exception as exc:
+            if not merge_existing:
+                raise
+            print(f"WARN {slug}: refresh failed ({exc!r}); keeping existing rows", file=sys.stderr)
+            return ([], exc)
 
     worker_count = min(max(1, jobs), len(modules)) if modules else 1
     if worker_count > 1:
@@ -134,8 +143,20 @@ def publish_all(
     else:
         fetched_lists = [_fetch_one(item) for item in modules]
 
-    for (slug, mod), results in zip(modules, fetched_lists):
+    if modules and all(exc is not None for _res, exc in fetched_lists):
+        first_exc = fetched_lists[0][1]
+        raise RuntimeError(f"All {len(modules)} state refreshes failed") from first_exc
+
+    for (slug, mod), (results, exc) in zip(modules, fetched_lists):
         csv_path = os.path.join(data_dir, f"{slug}.csv")
+        if exc is not None:
+            existing_rows = read_state_csv(csv_path)
+            by_state[slug] = existing_rows
+            if getattr(mod, "HAS_DETAILS", False):
+                detail_csv_path = os.path.join(details_dir, f"{slug}.csv")
+                details_by_state[slug] = read_detail_csv(detail_csv_path)
+            continue
+
         if merge_existing:
             merged = merge_state_results(read_state_csv(csv_path), results)
         else:

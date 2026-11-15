@@ -100,19 +100,20 @@ def discover_remote_links(
     return per_month, cumulative_sorted
 
 
-def parse_workbook_all_months(
+def _parse_workbook_all_months_core(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
-) -> dict[str, tuple[float, float]]:
-    """Return ``{ "Mon YYYY": (handle, revenue) }`` for every populated row."""
+) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float | None, float | None]]]:
+    """Return ``({label: (handle, revenue)}, {label: (promo_deductions, tax)})``."""
     if openpyxl is None:
         raise RuntimeError("openpyxl is required to parse Louisiana workbooks")
     try:
         workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     except Exception as exc:
         log(f"WARN could not open Louisiana workbook: {exc}")
-        return {}
+        return {}, {}
     results: dict[str, tuple[float, float]] = {}
+    fiscal_results: dict[str, tuple[float | None, float | None]] = {}
     try:
         ordered_sheets = sorted(
             workbook.worksheets,
@@ -130,10 +131,32 @@ def parse_workbook_all_months(
                 if handle == 0 or handle == -1:
                     continue
                 label = month_cell.strftime("%b %Y")
-                results.setdefault(label, (float(handle), float(revenue)))
+                if label not in results:
+                    results[label] = (float(handle), float(revenue))
+                    promo = abs(float(row[3])) if len(row) > 3 and is_number(row[3]) else None
+                    tax = float(row[5]) if len(row) > 5 and is_number(row[5]) else None
+                    fiscal_results[label] = (promo, tax)
     finally:
         workbook.close()
+    return results, fiscal_results
+
+
+def parse_workbook_all_months(
+    data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> dict[str, tuple[float, float]]:
+    """Return ``{ "Mon YYYY": (handle, revenue) }`` for every populated row."""
+    results, _ = _parse_workbook_all_months_core(data, log=log)
     return results
+
+
+def parse_workbook_fiscal_all_months(
+    data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> dict[str, tuple[float | None, float | None]]:
+    """Return ``{ "Mon YYYY": (promo_deductions, tax) }`` for every populated row."""
+    _, fiscal_results = _parse_workbook_all_months_core(data, log=log)
+    return fiscal_results
 
 
 def _load_one(
@@ -257,7 +280,7 @@ def _scan_cache_dir(
     return per_month, cumulative
 
 
-def resolve_month_data(
+def _resolve_month_data_with_fiscal(
     target_labels: set[str],
     local_dir: str | None,
     cache_dir: str | None,
@@ -265,8 +288,11 @@ def resolve_month_data(
     offline: bool = False,
     report: DiscoveryReport | None = None,
     log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[tuple[str, str], str]]:
-    """Return ``({(label, channel): (handle, revenue)}, {(label, channel): source})``."""
+) -> tuple[
+    dict[tuple[str, str], tuple[float, float]],
+    dict[tuple[str, str], str],
+    dict[tuple[str, str], tuple[float | None, float | None]],
+]:
     local_per_month: dict[str, dict[str, list[str]]] = {}
     local_cumulative: dict[str, list[str]] = {}
     if local_dir:
@@ -289,18 +315,21 @@ def resolve_month_data(
 
     resolved: dict[tuple[str, str], tuple[float, float]] = {}
     resolved_sources: dict[tuple[str, str], str] = {}
-    workbook_cache: dict[str, dict[str, tuple[float, float]]] = {}
+    resolved_fiscal: dict[tuple[str, str], tuple[float | None, float | None]] = {}
+    workbook_cache: dict[str, tuple[dict[str, tuple[float, float]], dict[str, tuple[float | None, float | None]]]] = {}
 
-    def load_and_parse(source: str, label_hint: str) -> dict[str, tuple[float, float]]:
+    def load_and_parse(
+        source: str, label_hint: str,
+    ) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float | None, float | None]]]:
         if source in workbook_cache:
             return workbook_cache[source]
         data = _load_one(source, cache_dir, label_hint, offline=offline, log=log)
         if data is None:
-            workbook_cache[source] = {}
-            return {}
-        parsed = parse_workbook_all_months(data, log=log)
-        workbook_cache[source] = parsed
-        return parsed
+            workbook_cache[source] = ({}, {})
+            return {}, {}
+        parsed, fiscal = _parse_workbook_all_months_core(data, log=log)
+        workbook_cache[source] = (parsed, fiscal)
+        return parsed, fiscal
 
     for label in sorted(target_labels):
         for channel in ("mobile", "retail"):
@@ -323,10 +352,12 @@ def resolve_month_data(
                     report.add_probe(f"{label}:{channel}", "(none)", reason="no-candidate-source")
                 continue
             for source in ordered_sources:
-                parsed = load_and_parse(source, f"{label}-{channel}")
+                parsed, fiscal = load_and_parse(source, f"{label}-{channel}")
                 if label in parsed:
                     resolved[(label, channel)] = parsed[label]
                     resolved_sources[(label, channel)] = source
+                    if label in fiscal:
+                        resolved_fiscal[(label, channel)] = fiscal[label]
                     log(
                         f"INFO {label} {channel}: handle={parsed[label][0]:,.0f} "
                         f"revenue={parsed[label][1]:,.0f} via "
@@ -345,6 +376,22 @@ def resolve_month_data(
                     for src in ordered_sources
                 )
                 log(f"WARN {label} {channel}: data not present in candidate workbooks ({tried})")
+    return resolved, resolved_sources, resolved_fiscal
+
+
+def resolve_month_data(
+    target_labels: set[str],
+    local_dir: str | None,
+    cache_dir: str | None,
+    *,
+    offline: bool = False,
+    report: DiscoveryReport | None = None,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[tuple[str, str], str]]:
+    """Return ``({(label, channel): (handle, revenue)}, {(label, channel): source})``."""
+    resolved, resolved_sources, _ = _resolve_month_data_with_fiscal(
+        target_labels, local_dir, cache_dir, offline=offline, report=report, log=log,
+    )
     return resolved, resolved_sources
 
 
@@ -365,7 +412,7 @@ def fetch(
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
     months = [(mdate.month, mdate.year, mdate.strftime("%b %Y")) for mdate in target_dates]
     target_labels = {label for _, _, label in months}
-    resolved, resolved_sources = resolve_month_data(
+    resolved, resolved_sources, resolved_fiscal = _resolve_month_data_with_fiscal(
         target_labels, local_dir, cache_dir, offline=offline, report=report, log=logger,
     )
     results: list[StateMonthResult] = []
@@ -381,6 +428,19 @@ def fetch(
             retail_handle, retail_revenue = retail_values
             total_handle = mobile_handle + retail_handle
             total_revenue = mobile_revenue + retail_revenue
+            m_promo, m_tax = resolved_fiscal.get((label, "mobile"), (None, None))
+            r_promo, r_tax = resolved_fiscal.get((label, "retail"), (None, None))
+            total_promo = (
+                (m_promo or 0.0) + (r_promo or 0.0)
+                if (m_promo is not None or r_promo is not None)
+                else None
+            )
+            total_gross = (total_revenue + total_promo) if total_promo is not None else None
+            total_tax = (
+                (m_tax or 0.0) + (r_tax or 0.0)
+                if (m_tax is not None or r_tax is not None)
+                else None
+            )
             m_src = resolved_sources.get((label, "mobile"), "")
             source_url = m_src if m_src.startswith("http") else REPORTS_URL
             item = finalize_state_month(
@@ -394,6 +454,9 @@ def fetch(
                 mobile_revenue=mobile_revenue,
                 source_url=source_url,
                 reconcile_splits=False,
+                gross_revenue=total_gross,
+                promo_deductions=total_promo,
+                tax=total_tax,
                 log=logger,
                 label=label,
             )

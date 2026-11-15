@@ -719,3 +719,338 @@ def test_indiana_spacer_columns_and_missouri_hyphen_spacing_regressions() -> Non
     assert round(mo_details[0][2], 2) == 265918.64
 
 
+def test_fiscal_csv_roundtrip_and_legacy_compatibility(tmp_path: pathlib.Path) -> None:
+    from publish.csv_writer import (
+        CSV_HEADERS,
+        DETAIL_CSV_HEADERS,
+        extract_published_details,
+        read_detail_csv,
+        read_state_csv,
+        write_state_csv,
+        write_state_detail_csv,
+    )
+    from statewager.model import CORE_RESULT_FIELDS, OperatorMonthResult, finalize_state_month
+
+    assert len(CORE_RESULT_FIELDS) == 12
+    assert len(CSV_HEADERS) == 15
+    assert CSV_HEADERS[-3:] == ["gross_revenue", "promo_deductions", "tax"]
+    assert len(DETAIL_CSV_HEADERS) == 17
+    assert DETAIL_CSV_HEADERS[-3:] == ["gross_revenue", "promo_deductions", "tax"]
+
+    state_res = finalize_state_month(
+        state="Ohio",
+        iso_month="2025-03",
+        handle=1000.0,
+        revenue=100.0,
+        gross_revenue=100.0,
+        promo_deductions=25.0,
+        tax=20.0,
+        source_url="https://example.com/oh.xlsx",
+        details=[
+            OperatorMonthResult(
+                "2025-03",
+                "BELTERRA PARK - FANDUEL",
+                600.0,
+                60.0,
+                10.0,
+                mobile_handle=600.0,
+                mobile_revenue=60.0,
+                gross_revenue=60.0,
+                promo_deductions=15.0,
+                tax=12.0,
+            ),
+            OperatorMonthResult(
+                "2025-03",
+                "Belterra Park - FanDuel",
+                400.0,
+                40.0,
+                10.0,
+                retail_handle=400.0,
+                retail_revenue=40.0,
+                gross_revenue=40.0,
+                promo_deductions=10.0,
+                tax=8.0,
+            ),
+        ],
+    )
+    assert state_res is not None
+    state_csv = write_state_csv(str(tmp_path), "ohio", [state_res])
+    loaded_state = read_state_csv(state_csv)
+    assert loaded_state[0].gross_revenue == 100.0
+    assert loaded_state[0].promo_deductions == 25.0
+    assert loaded_state[0].tax == 20.0
+
+    details = extract_published_details([state_res])
+    assert len(details) == 1
+    assert details[0].gross_revenue == 100.0
+    assert details[0].promo_deductions == 25.0
+    assert details[0].tax == 20.0
+    detail_csv = write_state_detail_csv(str(tmp_path / "details"), "ohio", details)
+    loaded_detail = read_detail_csv(detail_csv)
+    assert loaded_detail[0].gross_revenue == 100.0
+    assert loaded_detail[0].promo_deductions == 25.0
+    assert loaded_detail[0].tax == 20.0
+
+    # Legacy 12-col state & 14-col detail CSVs still load cleanly with None fiscal fields.
+    legacy_state = tmp_path / "legacy_state.csv"
+    legacy_state.write_text(
+        "state,month,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url\n"
+        "Nevada,2025-03,500,50,10,100,10,10,400,40,10,https://example.com\n",
+        encoding="utf-8",
+    )
+    r_leg = read_state_csv(str(legacy_state))[0]
+    assert r_leg.gross_revenue is None and r_leg.promo_deductions is None and r_leg.tax is None
+
+    legacy_detail = tmp_path / "legacy_detail.csv"
+    legacy_detail.write_text(
+        "state,month,operator,brand,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url\n"
+        "Ohio,2025-03,Jack Cleveland - BetJack,BetJack,500,50,10,,,,,,,https://example.com\n",
+        encoding="utf-8",
+    )
+    d_leg = read_detail_csv(str(legacy_detail))[0]
+    assert d_leg.gross_revenue is None and d_leg.promo_deductions is None and d_leg.tax is None
+
+
+def test_state_fiscal_extractors(monkeypatch) -> None:
+    import io
+    import pytest
+    openpyxl = pytest.importorskip("openpyxl")
+    from statewager.states import illinois, indiana, iowa, kansas, louisiana, missouri, ohio, pennsylvania
+
+    # 1. Pennsylvania summary + operator fiscal block
+    pa_rows = [
+        ("GRAND TOTAL", None),
+        ("Total Sports Wagering", None),
+        ("Handle*", 1000.0),
+        ("Revenue", 120.0),
+        ("Promotional Credits", 30.0),
+        ("Gross Revenue (Taxable)", 90.0),
+        ("State Tax Due (34%)", 30.6),
+        ("Local Share Assessment (2%)", 1.8),
+        ("Valley Forge Casino", None),
+        ("Total Sports Wagering", None),
+        ("Handle*", 700.0),
+        ("Revenue", 80.0),
+        ("Promotional Credits", 20.0),
+        ("Gross Revenue (Taxable)", 60.0),
+        ("State Tax Due (34%)", 20.4),
+        ("Local Share Assessment (2%)", 1.2),
+    ] + [("", None)] * 15
+    col_map = {1: "Mar 2026"}
+    assert pennsylvania.parse_sheet_fiscal(pa_rows, col_map)["Mar 2026"] == (120.0, 30.0, pytest.approx(32.4))
+    op_pa = pennsylvania.parse_detail_fiscal(pa_rows, col_map)[("Mar 2026", "Valley Forge Casino")]
+    assert op_pa == (80.0, 20.0, pytest.approx(21.6))
+
+    # 2. Ohio monthly fiscal extraction
+    wb_oh = openpyxl.Workbook()
+    ws_oh = wb_oh.active
+    ws_oh.append(["Type A Proprietors - Online Sports Gaming"])
+    ws_oh.append(["Online Proprietor / Services Provider", "Handle", "Prizes", "Void", "Promotional", "Revenue"])
+    ws_oh.append(["Belterra Park - FanDuel", 600.0, 520.0, 0.0, 15.0, 80.0])
+    ws_oh.append(["Subtotal Type A Online", 600.0, 520.0, 0.0, 15.0, 80.0])
+    ws_oh.append(["Type B Proprietors - Retail Sports Gaming"])
+    ws_oh.append(["Belterra Park - FanDuel", 100.0, 90.0, 0.0, 2.0, 10.0])
+    ws_oh.append(["Subtotal Type B Retail", 100.0, 90.0, 0.0, 2.0, 10.0])
+    ws_oh.append(["Total Online and Retail", 700.0, 610.0, 0.0, 17.0, 90.0])
+    parsed_oh = ohio._parse_month_sheet_with_fiscal(ws_oh)
+    assert parsed_oh is not None
+    _core, oh_gross, oh_promo, oh_det_f = parsed_oh
+    assert oh_gross == 90.0 and oh_promo == 17.0
+    assert oh_det_f[0][7:10] == (80.0, 15.0, None)
+    wb_oh.close()
+
+    # 3. Kansas summary (breaks at Fiscal Year table) + 7-token collapsed pdftotext detail
+    monkeypatch.setattr(kansas, "pdfplumber", None)
+    monkeypatch.setattr(
+        kansas,
+        "_extract_pdftotext_raw",
+        lambda _d: "\n".join([
+            "Kansas Crossing BetMGM $1,000,000 $90,000 $9,000",
+            "TOTALS $1,000,000 $90,000 $9,000",
+            "Fiscal Year Summary $99,999,999 $9,999,999 $999,999",
+        ]),
+    )
+    ks_st_tax, ks_op_taxes = kansas.parse_summary_fiscal(b"%PDF")
+    assert ks_st_tax == 9000.0
+    assert ks_op_taxes["kansas crossing - betmgm"] == 9000.0
+
+    monkeypatch.setattr(
+        kansas,
+        "_extract_pdftotext_raw",
+        lambda _d: "\n".join([
+            "Kansas Crossing BetMGM $1,000,000 $900,000 $20,000 $80,000 $0 $80,000 $8,000",
+            "TOTALS $1,000,000 $900,000 $20,000 $80,000 $0 $80,000 $8,000",
+        ]),
+    )
+    ks_det_st, ks_det_op = kansas.parse_detail_fiscal(b"%PDF", "Mar 2026")
+    assert ks_det_st == (100000.0, 20000.0, 8000.0)
+    assert ks_det_op["kansas crossing - betmgm"] == (100000.0, 20000.0, 8000.0)
+
+    # 4. Louisiana workbook promo deduction & tax
+    import datetime
+    wb_la = openpyxl.Workbook()
+    ws_la = wb_la.active
+    ws_la.append(["Month", None, "Handle", "Promo Deduct.", "Net Proceeds", "Taxes Paid 1"])
+    ws_la.append([datetime.date(2026, 3, 1), None, 1000.0, -30.0, 90.0, 13.5])
+    buf_la = io.BytesIO()
+    wb_la.save(buf_la)
+    wb_la.close()
+    assert louisiana.parse_workbook_fiscal_all_months(buf_la.getvalue())["Mar 2026"] == (30.0, 13.5)
+
+    # 5. Indiana tax summary with spacer column + component tax allocation
+    wb_in = openpyxl.Workbook()
+    ws_in = wb_in.active
+    ws_in.title = "7 SW Tax Summary"
+    ws_in.append(["SPORTS WAGERING TAX", "Handle", None, "Taxable AGR", None, "Sports Wagering Tax"])
+    ws_in.append(["Ameristar Casino", 1000.0, None, 100.0, None, 9.5])
+    ws_in.append(["TOTAL", 1000.0, None, 100.0, None, 9.5])
+    tot_in_tax, loc_in_taxes = indiana.parse_tax_summary(wb_in)
+    assert tot_in_tax == 9.5 and loc_in_taxes["Ameristar Casino"] == 9.5
+    alloc = indiana._allocate_component_tax([75.0, 25.0], 10.0)
+    assert alloc == [pytest.approx(7.5), pytest.approx(2.5)]
+    wb_in.close()
+
+    # 6. Missouri detail gross revenue + statistical tax (ignoring summary section)
+    mo_pages = [
+        "SPORTS WAGERING STATISTICAL REPORT SUMMARY\nSTATE TOTALS: 10 $999.00 $888.00 $111.00 $99.00",
+        "SPORTS WAGERING MOBILE STATISTICAL REPORT\n"
+        "BETMGM - MOBILE Mar-26 100 $1,000.00 $900.00 $100.00 $10.00\n"
+        "STATE TOTALS MTD: 100 $1,000.00 $900.00 $100.00 $10.00",
+        "SPORTS WAGERING MOBILE DETAIL REPORT\n"
+        "STATE TOTALS MTD: 100 $1,000.00 $880.00 $120.00 $20.00 $100.00",
+    ]
+    mo_gross, mo_tax, mo_ops = missouri.parse_page_texts_fiscal(mo_pages, 2026, 3)
+    assert mo_gross == 120.0 and mo_tax == 10.0
+    assert mo_ops[missouri.detail_operator_key("BETMGM")] == 10.0
+
+    # 7. Iowa labeled totals STATE TAX extraction
+    ia_block = (
+        "TOTALS\n"
+        "SPORTS WAGERING NET RECEIPTS $100,000\n"
+        "SPORTS WAGERING HANDLE $1,000,000\n"
+        "STATE TAX $6,750\n"
+    )
+    ia_parsed = iowa.parse_totals_block(ia_block)
+    assert ia_parsed is not None and ia_parsed.tax == 6750.0
+
+    # 8. Illinois accrual tax extraction
+    il_csv = (
+        "Location Type,Licensee,State AGR,State Tax,Cook County Tax,Sports Wager Tax\n"
+        "Online Wagering,Book A,100.00,20.00,0.00,5.00\n"
+        "In-Person Wagering,Casino B,50.00,10.00,1.00,\n"
+    ).encode("utf-8")
+    il_st, il_ops = illinois.parse_accrual_tax(il_csv)
+    assert il_st == 36.0 and il_ops == {"Book A": 25.0, "Casino B": 11.0}
+    assert illinois.parse_accrual_tax(b"Location Type,Licensee,State AGR\nOnline Wagering,A,10\n") == (None, {})
+
+
+def test_publish_all_partial_outage_resilience(tmp_path: pathlib.Path, monkeypatch) -> None:
+    import pytest
+    from publish.__main__ import publish_all
+    from publish.csv_writer import (
+        PublishedDetailRow,
+        read_detail_csv,
+        read_state_csv,
+        write_state_csv,
+        write_state_detail_csv,
+    )
+    from statewager.model import StateMonthResult
+    from statewager.states import nevada, ohio
+
+    docs_dir = tmp_path / "docs"
+    data_dir = docs_dir / "data"
+    details_dir = data_dir / "details"
+    existing_oh = StateMonthResult(
+        "Ohio", "2026-02", 500.0, 50.0, 10.0, None, None, None, None, None, None, "u0", 50.0, 5.0, None,
+    )
+    write_state_csv(str(data_dir), "ohio", [existing_oh])
+    write_state_detail_csv(
+        str(details_dir),
+        "ohio",
+        [PublishedDetailRow("Ohio", "2026-02", "Belterra Park - FanDuel", "FanDuel", 500.0, 50.0, 10.0)],
+    )
+
+    monkeypatch.setattr(ohio, "fetch", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("OH outage")))
+    monkeypatch.setattr(
+        nevada,
+        "fetch",
+        lambda *_a, **_kw: [
+            StateMonthResult(
+                "Nevada", "2026-03", 800.0, 60.0, 7.5, None, None, None, None, None, None, "https://nv.gov",
+            )
+        ],
+    )
+
+    by_state = publish_all(
+        month_start="2026-03",
+        month_end="2026-03",
+        states=["ohio", "nevada"],
+        cache_dir=str(tmp_path / "cache"),
+        docs_dir=str(docs_dir),
+        merge_existing=True,
+        quiet=True,
+        jobs=2,
+    )
+    assert [r.month for r in by_state["ohio"]] == ["2026-02"]
+    assert [r.month for r in by_state["nevada"]] == ["2026-03"]
+    assert [r.month for r in read_state_csv(str(data_dir / "ohio.csv"))] == ["2026-02"]
+    assert len(read_detail_csv(str(details_dir / "ohio.csv"))) == 1
+    combined = read_state_csv(str(data_dir / "all.csv"))
+    assert {(r.state, r.month) for r in combined} == {("Ohio", "2026-02"), ("Nevada", "2026-03")}
+
+    with pytest.raises(RuntimeError):
+        publish_all(
+            month_start="2026-03",
+            month_end="2026-03",
+            states=["ohio"],
+            cache_dir=str(tmp_path / "cache"),
+            docs_dir=str(docs_dir),
+            merge_existing=False,
+            quiet=True,
+        )
+
+    monkeypatch.setattr(nevada, "fetch", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("NV outage")))
+    with pytest.raises(RuntimeError, match="All 2 state refreshes failed"):
+        publish_all(
+            month_start="2026-03",
+            month_end="2026-03",
+            states=["ohio", "nevada"],
+            cache_dir=str(tmp_path / "cache"),
+            docs_dir=str(docs_dir),
+            merge_existing=True,
+            quiet=True,
+        )
+
+
+def test_viewer_html_features_and_workflow_file() -> None:
+    from publish.site import render_index_html
+
+    html = render_index_html()
+    for marker in (
+        'id="freshnessBar"',
+        'id="windowSelect"',
+        'id="compareBtn"',
+        'value="handle_share"',
+        'value="revenue_share"',
+        'value="yoy_handle"',
+        'value="yoy_revenue"',
+        'value="yoy_hold_bps"',
+        'data-col="gross_hold"',
+        'data-col="promo_deductions"',
+        'id="exportViewBtn"',
+        'id="copyLinkBtn"',
+        "URLSearchParams",
+        "buildWindowedRows",
+        "computeSameStoreYoY",
+    ):
+        assert marker in html
+
+    workflow_path = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows" / "refresh-data.yml"
+    if workflow_path.exists():
+        wf = workflow_path.read_text(encoding="utf-8")
+        assert "17 13 */2 * *" in wf
+        assert "workflow_dispatch" in wf
+        assert "python -m publish" in wf
+
+
+

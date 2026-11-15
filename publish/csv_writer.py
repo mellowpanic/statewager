@@ -11,7 +11,12 @@ from typing import Callable, Iterable, Sequence, TextIO
 from statewager.model import CORE_RESULT_FIELDS, StateMonthResult, hold_pct, safe_float
 from statewager.operators import classify_operator_brand, normalize_operator_name
 
-CSV_HEADERS: list[str] = list(CORE_RESULT_FIELDS)
+CSV_HEADERS: list[str] = [
+    *CORE_RESULT_FIELDS,
+    "gross_revenue",
+    "promo_deductions",
+    "tax",
+]
 DETAIL_CSV_HEADERS: list[str] = [
     "state",
     "month",
@@ -27,6 +32,9 @@ DETAIL_CSV_HEADERS: list[str] = [
     "mobile_revenue",
     "mobile_hold",
     "source_url",
+    "gross_revenue",
+    "promo_deductions",
+    "tax",
 ]
 
 
@@ -48,6 +56,9 @@ class PublishedDetailRow:
     mobile_revenue: float | None = None
     mobile_hold: float | None = None
     source_url: str | None = None
+    gross_revenue: float | None = None
+    promo_deductions: float | None = None
+    tax: float | None = None
 
 
 def _format_amount(value: float | None) -> str:
@@ -104,6 +115,9 @@ def read_state_csv(csv_path: str) -> list[StateMonthResult]:
                     mobile_revenue=_parse_opt_float(raw.get("mobile_revenue")),
                     mobile_hold=_parse_opt_float(raw.get("mobile_hold")),
                     source_url=(raw.get("source_url") or "").strip() or None,
+                    gross_revenue=_parse_opt_float(raw.get("gross_revenue")),
+                    promo_deductions=_parse_opt_float(raw.get("promo_deductions")),
+                    tax=_parse_opt_float(raw.get("tax")),
                 )
             )
     return rows
@@ -123,7 +137,7 @@ def merge_state_results(
 
 
 def result_to_csv_row(item: StateMonthResult) -> list[str]:
-    """Serialize a ``StateMonthResult`` into the 12-column CSV row schema."""
+    """Serialize a ``StateMonthResult`` into the 15-column CSV row schema."""
     return [
         item.state,
         item.month,
@@ -137,6 +151,9 @@ def result_to_csv_row(item: StateMonthResult) -> list[str]:
         _format_amount(item.mobile_revenue),
         _format_pct(item.mobile_hold),
         item.source_url or "",
+        _format_amount(item.gross_revenue),
+        _format_amount(item.promo_deductions),
+        _format_amount(item.tax),
     ]
 
 
@@ -196,6 +213,9 @@ def _make_detail_row(
     mobile_handle: float | None,
     mobile_revenue: float | None,
     source_url: str | None,
+    gross_revenue: float | None = None,
+    promo_deductions: float | None = None,
+    tax: float | None = None,
 ) -> PublishedDetailRow:
     return PublishedDetailRow(
         state=state,
@@ -212,6 +232,9 @@ def _make_detail_row(
         mobile_revenue=mobile_revenue,
         mobile_hold=hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None,
         source_url=source_url,
+        gross_revenue=gross_revenue,
+        promo_deductions=promo_deductions,
+        tax=tax,
     )
 
 
@@ -237,6 +260,9 @@ def extract_published_details(results: Iterable[StateMonthResult]) -> list[Publi
                     "mobile_handle": safe_float(op.mobile_handle),
                     "mobile_revenue": safe_float(op.mobile_revenue),
                     "source_url": item.source_url,
+                    "gross_revenue": safe_float(op.gross_revenue),
+                    "promo_deductions": safe_float(op.promo_deductions),
+                    "tax": safe_float(op.tax),
                 }
             else:
                 if bucket["brand"] == "Other / Retail Venue" and brand != "Other / Retail Venue":
@@ -247,6 +273,9 @@ def extract_published_details(results: Iterable[StateMonthResult]) -> list[Publi
                 bucket["retail_revenue"] = _sum_opt(bucket["retail_revenue"], safe_float(op.retail_revenue))  # type: ignore[arg-type]
                 bucket["mobile_handle"] = _sum_opt(bucket["mobile_handle"], safe_float(op.mobile_handle))  # type: ignore[arg-type]
                 bucket["mobile_revenue"] = _sum_opt(bucket["mobile_revenue"], safe_float(op.mobile_revenue))  # type: ignore[arg-type]
+                bucket["gross_revenue"] = _sum_opt(bucket["gross_revenue"], safe_float(op.gross_revenue))  # type: ignore[arg-type]
+                bucket["promo_deductions"] = _sum_opt(bucket["promo_deductions"], safe_float(op.promo_deductions))  # type: ignore[arg-type]
+                bucket["tax"] = _sum_opt(bucket["tax"], safe_float(op.tax))  # type: ignore[arg-type]
 
     rows = [
         _make_detail_row(
@@ -261,6 +290,9 @@ def extract_published_details(results: Iterable[StateMonthResult]) -> list[Publi
             mobile_handle=bucket["mobile_handle"],  # type: ignore[arg-type]
             mobile_revenue=bucket["mobile_revenue"],  # type: ignore[arg-type]
             source_url=bucket["source_url"],  # type: ignore[arg-type]
+            gross_revenue=bucket["gross_revenue"],  # type: ignore[arg-type]
+            promo_deductions=bucket["promo_deductions"],  # type: ignore[arg-type]
+            tax=bucket["tax"],  # type: ignore[arg-type]
         )
         for (state, month, operator), bucket in grouped.items()
     ]
@@ -297,6 +329,9 @@ def read_detail_csv(csv_path: str) -> list[PublishedDetailRow]:
                     mobile_revenue=_parse_opt_float(raw.get("mobile_revenue")),
                     mobile_hold=_parse_opt_float(raw.get("mobile_hold")),
                     source_url=(raw.get("source_url") or "").strip() or None,
+                    gross_revenue=_parse_opt_float(raw.get("gross_revenue")),
+                    promo_deductions=_parse_opt_float(raw.get("promo_deductions")),
+                    tax=_parse_opt_float(raw.get("tax")),
                 )
             )
     return rows
@@ -314,7 +349,7 @@ def merge_detail_results(
 
 
 def detail_to_csv_row(item: PublishedDetailRow) -> list[str]:
-    """Serialize a ``PublishedDetailRow`` into the 14-column detail CSV row schema."""
+    """Serialize a ``PublishedDetailRow`` into the 17-column detail CSV row schema."""
     return [
         item.state,
         item.month,
@@ -330,6 +365,9 @@ def detail_to_csv_row(item: PublishedDetailRow) -> list[str]:
         _format_amount(item.mobile_revenue),
         _format_pct(item.mobile_hold),
         item.source_url or "",
+        _format_amount(item.gross_revenue),
+        _format_amount(item.promo_deductions),
+        _format_amount(item.tax),
     ]
 
 
