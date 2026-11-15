@@ -13,37 +13,13 @@ from urllib.parse import urlparse
 import requests
 
 from .http import fetch_text
+from .model import MONTH_NAME_TO_NUM
 
-MONTH_NAMES: dict[str, int] = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "sept": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
+MONTH_NAMES: dict[str, int] = MONTH_NAME_TO_NUM
 
 MONTH_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
-        r"(?P<year>20\d{2})[\W_]{0,2}(?P<month>0[1-9]|1[0-2])"
+        r"(?<!\d)(?P<year>20\d{2})[\W_]{0,2}(?P<month>0[1-9]|1[0-2])(?!\d)"
         r"(?:[\W_]{0,2}(?P<name>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
         r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
         r"dec(?:ember)?))?"
@@ -64,10 +40,23 @@ MONTH_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
+TEXT_MONTH_RE: re.Pattern[str] = re.compile(
+    r"\b("
+    + "|".join(sorted(MONTH_NAMES.keys(), key=len, reverse=True))
+    + r")\b(?:\s+report)?(?:\s*\(pdf\))?[\s,\-]+(20\d{2})",
+    re.IGNORECASE,
+)
+
 DEFAULT_CHANNEL_KEYWORDS: dict[str, list[str]] = {
     "retail": ["retail"],
     "mobile": ["mobile", "online"],
 }
+_DEFAULT_CHANNEL_ORDER: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        ((word, channel) for channel, words in DEFAULT_CHANNEL_KEYWORDS.items() for word in words if word),
+        key=lambda item: (-len(item[0]), item[1]),
+    )
+)
 
 _SPORTSBOOK_HINT_RE = re.compile(
     r"(sportsbook|sports[\s_-]?book|sports[\s_-]?wagering|"
@@ -81,7 +70,7 @@ def normalize_filename(value: str) -> str:
     """Lowercase, HTML-unescape, collapse whitespace."""
     if not value:
         return ""
-    return re.sub(r"\s+", " ", unescape(str(value)).lower()).strip()
+    return " ".join(unescape(str(value)).lower().split())
 
 
 def extract_month_label(name: str) -> str | None:
@@ -120,9 +109,13 @@ def extract_month_label(name: str) -> str | None:
 
 
 def _resolve_channel(combined: str, channel_keywords: dict[str, list[str]] | None) -> str | None:
-    keywords = channel_keywords or DEFAULT_CHANNEL_KEYWORDS
+    if channel_keywords is None:
+        for word, channel in _DEFAULT_CHANNEL_ORDER:
+            if word in combined:
+                return channel
+        return None
     matches: list[tuple[int, str]] = []
-    for channel, words in keywords.items():
+    for channel, words in channel_keywords.items():
         for word in words:
             if word and word in combined:
                 matches.append((len(word), channel))
@@ -159,6 +152,11 @@ def classify_sportsbook_filename(
     return label, channel
 
 
+_YEAR_RANGE_RE = re.compile(r"(?<!\d)(?P<a>20\d{2})[_\- ](?P<b>20\d{2})(?!\d)")
+_FY_RANGE_RE = re.compile(r"fy[_\- ]?(?P<a>\d{2})[_\- ](?P<b>\d{2})(?!\d)")
+_FY_SOLO_RE = re.compile(r"fy[_\- ]?(?P<fy>\d{2})(?!\d)")
+
+
 def classify_cumulative_filename(
     href: str,
     *,
@@ -184,9 +182,9 @@ def classify_cumulative_filename(
         return None
 
     cleaned = _TIMESTAMP_RE.sub(" ", combined)
-    range_match = re.search(r"(?<!\d)(?P<a>20\d{2})[_\- ](?P<b>20\d{2})(?!\d)", cleaned)
-    fy_range_match = re.search(r"fy[_\- ]?(?P<a>\d{2})[_\- ](?P<b>\d{2})(?!\d)", cleaned)
-    fy_solo_match = re.search(r"fy[_\- ]?(?P<fy>\d{2})(?!\d)", cleaned)
+    range_match = _YEAR_RANGE_RE.search(cleaned)
+    fy_range_match = _FY_RANGE_RE.search(cleaned)
+    fy_solo_match = _FY_SOLO_RE.search(cleaned)
     if range_match:
         a = int(range_match.group("a"))
         b = int(range_match.group("b"))
@@ -318,7 +316,7 @@ class DiscoveryReport:
     def add_probe(self, key: str, url: str, *, status: object = "", reason: str = "") -> None:
         """Record a URL we tried (success or failure) per target."""
         self.probes.setdefault(key, []).append((url, str(status), reason))
-        if isinstance(status, int):
+        if isinstance(status, int) and not isinstance(status, bool):
             self.http_status[status] += 1
 
     def add_status(self, status: int) -> None:
@@ -343,22 +341,22 @@ class DiscoveryReport:
         )
         if self.classified:
             lines.append("Classified anchors:")
-            for key in sorted(self.classified):
-                hrefs = self.classified[key]
-                lines.append(f"  {key}: {len(hrefs)}")
+            for c_key in sorted(self.classified):
+                hrefs = self.classified[c_key]
+                lines.append(f"  {c_key}: {len(hrefs)}")
                 for href in hrefs[:3]:
                     lines.append(f"    -> {href}")
                 if len(hrefs) > 3:
                     lines.append(f"    ... and {len(hrefs) - 3} more")
         if self.matches:
             lines.append("Chosen URL per target:")
-            for key in sorted(self.matches):
-                lines.append(f"  {key}: {self.matches[key]}")
+            for m_key in sorted(self.matches):
+                lines.append(f"  {m_key}: {self.matches[m_key]}")
         if self.probes:
             lines.append("Probes:")
-            for key in sorted(self.probes):
-                lines.append(f"  {key}:")
-                for url, status, reason in self.probes[key]:
+            for p_key in sorted(self.probes):
+                lines.append(f"  {p_key}:")
+                for url, status, reason in self.probes[p_key]:
                     bits = [url]
                     if status:
                         bits.append(f"status={status}")

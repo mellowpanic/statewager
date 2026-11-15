@@ -15,13 +15,12 @@ from ..cache import cache_path, load_cached_or_fetch
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
-    OperatorMonthResult,
     StateMonthResult,
+    build_operator_results,
     build_state_logger,
+    finalize_state_month,
     format_iso_month,
-    hold_pct,
     log_skip,
-    reconcile_components,
     resolve_fetch_months,
     validate_result,
 )
@@ -32,7 +31,6 @@ LAUNCH_DATE: date | None = None
 EXTRA_HEADERS: list[str] = []
 HAS_DETAILS = True
 
-USER_AGENT = "Mozilla/5.0"
 URL_VARIANT_TEMPLATES = [
     "https://www.in.gov/igc/files/reports/{yyyy}/{yyyy}-{mm}-Revenue.xlsx",
     "https://www.in.gov/igc/files/reports/{yyyy}/{yyyy}_{mm}_Revenue.xlsx",
@@ -41,23 +39,6 @@ URL_VARIANT_TEMPLATES = [
     "https://www.in.gov/igc/files/reports/{yyyy}/{yyyy}{mm}_Revenue.xlsx",
 ]
 _DEFAULT_LOG = build_state_logger("IN")
-
-
-def download_xlsx(
-    yyyy: str,
-    mm: str,
-    report: DiscoveryReport | None = None,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> bytes | None:
-    return probe_url_variants(
-        URL_VARIANT_TEMPLATES,
-        {"yyyy": yyyy, "mm": mm},
-        signature_check=b"PK",
-        wayback_timestamp=f"{yyyy}{mm}",
-        log=log,
-        report=report,
-        report_key=f"{yyyy}-{mm}",
-    )
 
 
 def normalize_sheet_title(title: str) -> str:
@@ -73,12 +54,10 @@ def parse_summary_totals(workbook) -> tuple[float, float] | None:
     for sheet in candidate_sheets:
         handle_col = None
         agr_col = None
-        data_rows: list[tuple[object, ...]] = []
         for row in sheet.iter_rows(values_only=True):
             row = tuple(row)
             if not any(cell is not None for cell in row):
                 continue
-            data_rows.append(row)
             if handle_col is None or agr_col is None:
                 for index, cell in enumerate(row):
                     text = str(cell or "").strip().lower()
@@ -86,9 +65,7 @@ def parse_summary_totals(workbook) -> tuple[float, float] | None:
                         handle_col = index
                     if agr_col is None and "taxable agr" in text:
                         agr_col = index
-        if handle_col is None or agr_col is None:
-            continue
-        for row in data_rows:
+                continue
             label = str(row[0] if row else "").strip().lower()
             if label != "total":
                 continue
@@ -182,21 +159,18 @@ def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, flo
             if not header or metric != "handle" or revenue_header != "gross receipts":
                 continue
             location_name = header
-            retail_handle = 0.0
-            retail_revenue = 0.0
-            mobile_handle = 0.0
-            mobile_revenue = 0.0
             block_retail_handle = 0.0
             block_retail_revenue = 0.0
             block_mobile_handle = 0.0
             block_mobile_revenue = 0.0
             block_adjustments = 0.0
             for detail_row in rows[row_index + 1:]:
-                label = str(detail_row[offset] if offset < len(detail_row) else "" or "").strip()
+                label = str((detail_row[offset] if offset < len(detail_row) else "") or "").strip()
                 if not label:
                     break
                 lower = label.lower()
-                if str(detail_row[offset + 1] if offset + 1 < len(detail_row) else "" or "").strip().lower() == "handle":
+                next_metric = str((detail_row[offset + 1] if offset + 1 < len(detail_row) else "") or "").strip().lower()
+                if next_metric == "handle":
                     break
                 handle = detail_row[offset + 1] if offset + 1 < len(detail_row) else None
                 revenue = detail_row[offset + 3] if offset + 3 < len(detail_row) else None
@@ -210,15 +184,11 @@ def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, flo
                         block_mobile_revenue,
                         block_adjustments,
                     )
-                    retail_handle += block_retail_handle
-                    retail_revenue += block_retail_revenue
-                    mobile_handle += block_mobile_handle
-                    mobile_revenue += block_mobile_revenue
                     breakdowns[location_name] = (
-                        retail_handle,
-                        retail_revenue,
-                        mobile_handle,
-                        mobile_revenue,
+                        block_retail_handle,
+                        block_retail_revenue,
+                        block_mobile_handle,
+                        block_mobile_revenue,
                     )
                     break
                 if is_retail_detail_label(label):
@@ -255,14 +225,14 @@ def parse_state_totals(
         return None
     try:
         totals = parse_summary_totals(workbook)
-        breakdown = parse_detail_breakdown(workbook)
-        locations = parse_location_totals(workbook)
         if totals is None:
             log("WARN Indiana workbook missing statewide summary totals")
             return None
-        if breakdown is None:
+        breakdown = parse_detail_breakdown(workbook)
+        if not breakdown:
             log("WARN Indiana workbook missing operator retail/mobile breakdown")
             return None
+        locations = parse_location_totals(workbook)
         handle, revenue = totals
         retail_handle = sum(values[0] for values in breakdown.values())
         retail_revenue = sum(values[1] for values in breakdown.values())
@@ -322,6 +292,7 @@ def fetch(
         label = mdate.strftime("%b %Y")
         iso_month = format_iso_month(mdate.year, mdate.month)
         source_url = URL_VARIANT_TEMPLATES[0].format(yyyy=yyyy, mm=mm)
+        matched: list[str] = []
         try:
             logger(f"INFO processing {label}")
             data = parse_local_file(local_dir, yyyy, mm) if local_dir else None
@@ -331,13 +302,24 @@ def fetch(
                 path = cache_path(cache_dir, f"indiana_{yyyy}_{mm}.xlsx")
                 data = load_cached_or_fetch(
                     cache_file=path,
-                    fetcher=lambda y=yyyy, m=mm: download_xlsx(y, m, report=report, log=logger),
+                    fetcher=lambda y=yyyy, m=mm: probe_url_variants(
+                        URL_VARIANT_TEMPLATES,
+                        {"yyyy": y, "mm": m},
+                        signature_check=b"PK",
+                        wayback_timestamp=f"{y}{m}",
+                        log=logger,
+                        report=report,
+                        report_key=f"{y}-{m}",
+                        matched_url=matched,
+                    ),
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {label}",
                     fetch_error_message=f"could not download Indiana workbook for {label}",
                     cache_ttl_seconds=7 * 86400 if int(yyyy) >= current_year else None,
                     offline=offline,
                 )
+            if matched:
+                source_url = matched[0]
             if data is None:
                 log_skip(logger, label, "workbook unavailable")
                 continue
@@ -346,23 +328,7 @@ def fetch(
                 log_skip(logger, label, "could not parse statewide totals")
                 continue
             handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, locations = parsed
-            retail_handle, retail_revenue, mobile_handle, mobile_revenue = reconcile_components(
-                label,
-                handle,
-                revenue,
-                retail_handle,
-                retail_revenue,
-                mobile_handle,
-                mobile_revenue,
-            )
-            validated = validate_result(label, handle, revenue)
-            if validated is None:
-                continue
-            handle, revenue = validated
-            hold = hold_pct(handle, revenue)
-            retail_hold = hold_pct(retail_handle, retail_revenue) if retail_handle else None
-            mobile_hold = hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None
-            operator_details: list[OperatorMonthResult] = []
+            valid_locations: list[tuple[object, ...]] = []
             for (
                 location_name,
                 location_handle,
@@ -372,45 +338,49 @@ def fetch(
                 location_mobile_handle,
                 location_mobile_revenue,
             ) in locations:
-                location_validated = validate_result(f"{label} {location_name}", location_handle, location_revenue)
+                location_validated = validate_result(
+                    f"{label} {location_name}",
+                    location_handle,
+                    location_revenue,
+                    log=logger,
+                )
                 if location_validated is None:
                     logger(f"WARN skipped detail row for {label} {location_name}; invalid handle/revenue")
                     continue
-                location_handle, location_revenue = location_validated
-                location_hold = hold_pct(location_handle, location_revenue)
-                operator_details.append(
-                    OperatorMonthResult(
-                        month=iso_month,
-                        operator=location_name,
-                        handle=location_handle,
-                        revenue=location_revenue,
-                        hold=location_hold,
-                        retail_handle=location_retail_handle,
-                        retail_revenue=location_retail_revenue,
-                        mobile_handle=location_mobile_handle,
-                        mobile_revenue=location_mobile_revenue,
+                valid_h, valid_r = location_validated
+                valid_locations.append(
+                    (
+                        location_name,
+                        valid_h,
+                        valid_r,
+                        location_retail_handle,
+                        location_retail_revenue,
+                        location_mobile_handle,
+                        location_mobile_revenue,
                     )
                 )
-            results.append(
-                StateMonthResult(
-                    state=STATE_NAME,
-                    month=iso_month,
-                    handle=handle,
-                    revenue=revenue,
-                    hold=hold,
-                    retail_handle=retail_handle,
-                    retail_revenue=retail_revenue,
-                    retail_hold=retail_hold,
-                    mobile_handle=mobile_handle,
-                    mobile_revenue=mobile_revenue,
-                    mobile_hold=mobile_hold,
-                    source_url=source_url,
-                    details=operator_details,
-                )
+            operator_details = build_operator_results(iso_month, valid_locations)
+            item = finalize_state_month(
+                state=STATE_NAME,
+                iso_month=iso_month,
+                handle=handle,
+                revenue=revenue,
+                retail_handle=retail_handle,
+                retail_revenue=retail_revenue,
+                mobile_handle=mobile_handle,
+                mobile_revenue=mobile_revenue,
+                source_url=source_url,
+                details=operator_details,
+                log=logger,
+                label=label,
             )
+            if item is None:
+                continue
+            results.append(item)
             logger(
-                f"INFO {label}: handle={handle:,.0f} revenue={revenue:,.0f} "
-                f"retail_handle={retail_handle:,.0f} mobile_handle={mobile_handle:,.0f} hold={hold:.1f}%"
+                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
+                f"retail_handle={item.retail_handle:,.0f} mobile_handle={item.mobile_handle:,.0f} "
+                f"hold={item.hold:.1f}%"
             )
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")

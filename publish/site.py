@@ -1,10 +1,13 @@
 """Static HTML generator for the GitHub Pages regulatory data viewer."""
 from __future__ import annotations
 
+from html import escape
 import os
 from typing import Sequence
 
 from statewager.states import ALL_STATES
+
+from .csv_writer import atomic_write_file
 
 INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -352,7 +355,8 @@ __STATE_OPTIONS__
       let activeRows = [];
       let allStatesCount = 10;
       let hasMissouri = true;
-      let userChangedDates = false;
+      let userChangedFrom = false;
+      let userChangedTo = false;
       let sortCol = "month";
       let sortAsc = false;
 
@@ -475,17 +479,23 @@ __STATE_OPTIONS__
       function updateKpis(rows) {
         let totalHandle = 0;
         let totalRevenue = 0;
+        let holdHandle = 0;
+        let holdRevenue = 0;
         let mobileHandle = 0;
         let splitHandleDenom = 0;
         rows.forEach((r) => {
           if (r.handle !== null) totalHandle += r.handle;
           if (r.revenue !== null) totalRevenue += r.revenue;
+          if (r.handle !== null && r.revenue !== null) {
+            holdHandle += r.handle;
+            holdRevenue += r.revenue;
+          }
           if (r.mobile_handle !== null && r.handle !== null) {
             mobileHandle += r.mobile_handle;
             splitHandleDenom += r.handle;
           }
         });
-        const blendedHold = totalHandle > 0 ? (totalRevenue / totalHandle) * 100 : null;
+        const blendedHold = holdHandle > 0 ? (holdRevenue / holdHandle) * 100 : null;
         const mobileShare = splitHandleDenom > 0 ? (mobileHandle / splitHandleDenom) * 100 : null;
         document.getElementById("kpiHandle").textContent = rows.length ? fmtCompactMoney(totalHandle) : "—";
         document.getElementById("kpiRevenue").textContent = rows.length ? fmtCompactMoney(totalRevenue) : "—";
@@ -497,6 +507,19 @@ __STATE_OPTIONS__
       function expectedStatesForMonth(month) {
         if (stateSelect.value !== "__ALL__") return 1;
         return Math.max(1, allStatesCount - (hasMissouri && month < "2025-12" ? 1 : 0));
+      }
+
+      function isMonthComplete(month, count) {
+        return count >= Math.max(1, expectedStatesForMonth(month) - 1);
+      }
+
+      function svgEl(tag, attrs, text) {
+        const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+        if (attrs) {
+          Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, String(v)));
+        }
+        if (text !== undefined) el.textContent = String(text);
+        return el;
       }
 
       function aggregateByMonth(rows, metric) {
@@ -523,7 +546,7 @@ __STATE_OPTIONS__
             }
             const count = agg.states.size;
             const expected = expectedStatesForMonth(month);
-            const complete = count >= Math.max(1, expected - 1);
+            const complete = isMonthComplete(month, count);
             const partial = count < expected;
             return { month, value, count, expected, complete, partial };
           });
@@ -577,27 +600,24 @@ __STATE_OPTIONS__
         const yScale = (v) => pad.top + plotH - ((v - minVal) / span) * plotH;
         const zeroY = yScale(0);
 
-        const ns = "http://www.w3.org/2000/svg";
         const ticks = 4;
         for (let i = 0; i <= ticks; i++) {
           const tv = minVal + (span * i) / ticks;
           const y = yScale(tv);
-          const line = document.createElementNS(ns, "line");
-          line.setAttribute("x1", String(pad.left));
-          line.setAttribute("x2", String(W - pad.right));
-          line.setAttribute("y1", String(y));
-          line.setAttribute("y2", String(y));
-          line.setAttribute("stroke", "#e2e8f0");
-          chartSvg.appendChild(line);
-
-          const label = document.createElementNS(ns, "text");
-          label.setAttribute("x", String(pad.left - 8));
-          label.setAttribute("y", String(y + 4));
-          label.setAttribute("text-anchor", "end");
-          label.setAttribute("fill", "#64748b");
-          label.setAttribute("font-size", "11");
-          label.textContent = metric === "hold" ? `${tv.toFixed(1)}%` : fmtCompactMoney(tv);
-          chartSvg.appendChild(label);
+          chartSvg.appendChild(svgEl("line", {
+            x1: pad.left,
+            x2: W - pad.right,
+            y1: y,
+            y2: y,
+            stroke: "#e2e8f0"
+          }));
+          chartSvg.appendChild(svgEl("text", {
+            x: pad.left - 8,
+            y: y + 4,
+            "text-anchor": "end",
+            fill: "#64748b",
+            "font-size": 11
+          }, metric === "hold" ? `${tv.toFixed(1)}%` : fmtCompactMoney(tv)));
         }
 
         const step = plotW / series.length;
@@ -609,22 +629,17 @@ __STATE_OPTIONS__
           const yVal = yScale(pt.value);
           const rectY = Math.min(yVal, zeroY);
           const rectH = Math.max(2, Math.abs(zeroY - yVal));
-
-          const rect = document.createElementNS(ns, "rect");
-          rect.setAttribute("x", String(x));
-          rect.setAttribute("y", String(rectY));
-          rect.setAttribute("width", String(barW));
-          rect.setAttribute("height", String(rectH));
-          rect.setAttribute("rx", "3");
           const isNeg = pt.value < 0;
+          const attrs = { x, y: rectY, width: barW, height: rectH, rx: 3 };
           if (pt.partial && isAll) {
-            rect.setAttribute("fill", isNeg ? "#fca5a5" : "#93c5fd");
-            rect.setAttribute("stroke", isNeg ? "#dc2626" : "#2563eb");
-            rect.setAttribute("stroke-width", "1.5");
-            rect.setAttribute("stroke-dasharray", "4 2");
+            attrs.fill = isNeg ? "#fca5a5" : "#93c5fd";
+            attrs.stroke = isNeg ? "#dc2626" : "#2563eb";
+            attrs["stroke-width"] = 1.5;
+            attrs["stroke-dasharray"] = "4 2";
           } else {
-            rect.setAttribute("fill", isNeg ? "#dc2626" : "#2563eb");
+            attrs.fill = isNeg ? "#dc2626" : "#2563eb";
           }
+          const rect = svgEl("rect", attrs);
 
           const formatted = metric === "hold" ? fmtPct(pt.value) : fmtMoney(pt.value);
           const countInfo = isAll
@@ -642,34 +657,44 @@ __STATE_OPTIONS__
           chartSvg.appendChild(rect);
 
           if (pt.partial && isAll && barW >= 14) {
-            const ptxt = document.createElementNS(ns, "text");
-            ptxt.setAttribute("x", String(x + barW / 2));
-            ptxt.setAttribute("y", String(Math.max(12, rectY - 4)));
-            ptxt.setAttribute("text-anchor", "middle");
-            ptxt.setAttribute("fill", "#64748b");
-            ptxt.setAttribute("font-size", "9");
-            ptxt.textContent = `${pt.count}/${pt.expected}`;
-            chartSvg.appendChild(ptxt);
+            const badgeY = isNeg
+              ? Math.min(H - 28, rectY + rectH + 11)
+              : Math.max(12, rectY - 4);
+            chartSvg.appendChild(svgEl("text", {
+              x: x + barW / 2,
+              y: badgeY,
+              "text-anchor": "middle",
+              fill: "#64748b",
+              "font-size": 9
+            }, `${pt.count}/${pt.expected}`));
           }
 
           if (idx % labelEvery === 0 || idx === series.length - 1) {
-            const tx = document.createElementNS(ns, "text");
-            tx.setAttribute("x", String(x + barW / 2));
-            tx.setAttribute("y", String(H - 16));
-            tx.setAttribute("text-anchor", "middle");
-            tx.setAttribute("fill", "#64748b");
-            tx.setAttribute("font-size", "11");
-            tx.textContent = pt.month;
-            chartSvg.appendChild(tx);
+            chartSvg.appendChild(svgEl("text", {
+              x: x + barW / 2,
+              y: H - 16,
+              "text-anchor": "middle",
+              fill: "#64748b",
+              "font-size": 11
+            }, pt.month));
           }
         });
+      }
+
+      function safeHttpUrl(raw) {
+        try {
+          const u = new URL(String(raw).trim());
+          return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+        } catch (_e) {
+          return null;
+        }
       }
 
       function renderTable(rows) {
         const sorted = [...rows].sort((a, b) => {
           const av = a[sortCol];
           const bv = b[sortCol];
-          if (av === bv) return a.state.localeCompare(b.state) || b.month.localeCompare(a.month);
+          if (av === bv) return b.month.localeCompare(a.month) || a.state.localeCompare(b.state);
           if (av === null) return 1;
           if (bv === null) return -1;
           const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
@@ -701,10 +726,11 @@ __STATE_OPTIONS__
             tr.appendChild(td);
           });
           const srcTd = document.createElement("td");
-          if (r.source_url) {
+          const safeUrl = r.source_url ? safeHttpUrl(r.source_url) : null;
+          if (safeUrl) {
             const a = document.createElement("a");
             a.className = "src-link";
-            a.href = r.source_url;
+            a.href = safeUrl;
             a.target = "_blank";
             a.rel = "noopener noreferrer";
             a.textContent = "Source";
@@ -725,20 +751,35 @@ __STATE_OPTIONS__
         renderTable(rows);
       }
 
-      function applyDefaultDateBounds() {
-        if ((userChangedDates && fromMonthInput.value) || !activeRows.length) return;
+      function completeMonthsList(rows) {
+        const statesByMonth = new Map();
+        rows.forEach((r) => {
+          let set = statesByMonth.get(r.month);
+          if (!set) {
+            set = new Set();
+            statesByMonth.set(r.month, set);
+          }
+          set.add(r.state);
+        });
+        return Array.from(statesByMonth.keys())
+          .sort()
+          .filter((month) => isMonthComplete(month, statesByMonth.get(month).size));
+      }
+
+      function applyDefaultDateBounds(forceToEnd = false) {
+        if (!activeRows.length) return;
         const months = activeRows.map((r) => r.month).sort();
+        let defaultFrom = months[0];
+        let defaultTo = months[months.length - 1];
         if (stateSelect.value === "__ALL__" && !includePartialInput.checked) {
-          const aggAll = aggregateByMonth(activeRows, metricSelect.value);
-          const completeMonths = aggAll.filter((pt) => pt.complete).map((pt) => pt.month);
+          const completeMonths = completeMonthsList(activeRows);
           if (completeMonths.length) {
-            fromMonthInput.value = completeMonths[0];
-            toMonthInput.value = completeMonths[completeMonths.length - 1];
-            return;
+            defaultFrom = completeMonths[0];
+            defaultTo = completeMonths[completeMonths.length - 1];
           }
         }
-        fromMonthInput.value = months[0];
-        toMonthInput.value = months[months.length - 1];
+        if (!userChangedFrom || !fromMonthInput.value) fromMonthInput.value = defaultFrom;
+        if (forceToEnd || !userChangedTo || !toMonthInput.value) toMonthInput.value = defaultTo;
       }
 
       async function loadSelection() {
@@ -779,22 +820,23 @@ __STATE_OPTIONS__
             sortCol = col;
             sortAsc = col === "state" || col === "month";
           }
-          refreshView();
+          renderTable(filteredRows());
         });
       });
 
       stateSelect.addEventListener("change", loadSelection);
       metricSelect.addEventListener("change", refreshView);
       fromMonthInput.addEventListener("change", () => {
-        userChangedDates = true;
+        userChangedFrom = true;
         refreshView();
       });
       toMonthInput.addEventListener("change", () => {
-        userChangedDates = true;
+        userChangedTo = true;
         refreshView();
       });
       includePartialInput.addEventListener("change", () => {
-        applyDefaultDateBounds();
+        userChangedTo = false;
+        applyDefaultDateBounds(true);
         refreshView();
       });
 
@@ -811,7 +853,7 @@ def render_index_html(states: Sequence[tuple[str, str]] | None = None) -> str:
     if states is None:
         states = [(slug, slug.replace("_", " ").title()) for slug in ALL_STATES]
     options_html = "\n".join(
-        f'          <option value="{slug}">{display}</option>'
+        f'          <option value="{escape(slug, quote=True)}">{escape(display)}</option>'
         for slug, display in states
     )
     return INDEX_HTML_TEMPLATE.replace("__STATE_OPTIONS__", options_html)
@@ -819,8 +861,6 @@ def render_index_html(states: Sequence[tuple[str, str]] | None = None) -> str:
 
 def write_index_html(docs_dir: str, states: Sequence[tuple[str, str]] | None = None) -> str:
     """Write ``<docs_dir>/index.html`` and return its path."""
-    os.makedirs(docs_dir, exist_ok=True)
     out_path = os.path.join(docs_dir, "index.html")
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(render_index_html(states))
-    return out_path
+    html = render_index_html(states)
+    return atomic_write_file(out_path, lambda fh: fh.write(html), suffix=".html")

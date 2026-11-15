@@ -1,16 +1,38 @@
 """Currency, PDF/OCR, Excel, and fuzzy label parsing helpers."""
 from __future__ import annotations
 
+import functools
+import math
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 from typing import Callable
 
-from .model import hold_pct, round_or_blank
+from .model import hold_pct, round_or_blank, safe_float
 
 _LABEL_NORM_RE = re.compile(r"[^a-z0-9 ]+")
+_MONEY_STRIP_RE = re.compile(r"[\$,\s]+")
+_PLACEHOLDERS = frozenset({"", "-", "—", "–", "n/a", "na", "none", "null"})
+_ORIG_SHUTIL_WHICH = shutil.which
+
+
+@functools.lru_cache(maxsize=32)
+def _cached_which(name: str, path_env: str) -> str | None:
+    return _ORIG_SHUTIL_WHICH(name)
+
+
+def _which(*names: str) -> str | None:
+    """Resolve first available executable on PATH with safe test-mock awareness."""
+    which_fn = shutil.which
+    path_env = os.environ.get("PATH", "")
+    for name in names:
+        resolved = _cached_which(name, path_env) if which_fn is _ORIG_SHUTIL_WHICH else which_fn(name)
+        if resolved:
+            return resolved
+    return None
 
 MAIN_HEADERS: list[str] = [
     "Month", "Handle", "Revenue", "Hold%",
@@ -19,40 +41,60 @@ MAIN_HEADERS: list[str] = [
 ]
 
 
-def parse_dollar(s: object) -> float | None:
-    """Parse '$1,234,567' or '(1,234,567)' strings to float. Returns None on failure."""
-    if s is None:
+def _parse_numeric_token(s: object, *, strip_percent: bool = False) -> float | None:
+    """Parse a dollar/numeric token like '$1,234', '($500)', '-500', '500-' into a finite float."""
+    if s is None or isinstance(s, bool):
         return None
+    if isinstance(s, (int, float)):
+        return safe_float(s)
     text = str(s).strip()
     if not text:
         return None
-    negative = "(" in text or text.startswith("-")
-    text = re.sub(r"[($),\s]", "", text)
+    text = text.replace("\u2212", "-")
+    text = _MONEY_STRIP_RE.sub("", text)
+    if strip_percent:
+        text = text.replace("%", "")
+    elif "%" in text:
+        return None
+    if text.lower() in _PLACEHOLDERS or text in {"+", "-"}:
+        return None
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1]
+    if text.startswith("-"):
+        negative = True
+        text = text[1:]
+    elif text.startswith("+"):
+        text = text[1:]
+    if not negative and text.endswith("-"):
+        negative = True
+        text = text[:-1]
+    if not text or text[0] in "+-" or "(" in text or ")" in text:
+        return None
     try:
         amount = float(text)
     except ValueError:
         return None
+    if not math.isfinite(amount):
+        return None
+    if amount == 0.0:
+        return 0.0
     return -amount if negative else amount
 
 
-def _parse_money(text: str) -> float | None:
-    text = (text or "").strip()
-    if not text or text in {"-", "—", "N/A", "n/a"}:
-        return None
-    negative = text.startswith("(") and text.endswith(")")
-    cleaned = re.sub(r"[\$,()\s]", "", text)
-    if not cleaned or cleaned == "-":
-        return None
-    try:
-        value = float(cleaned)
-    except ValueError:
-        return None
-    return -value if negative else value
+def parse_dollar(s: object) -> float | None:
+    """Parse '$1,234,567' or '(1,234,567)' strings to float. Returns None on failure."""
+    return _parse_numeric_token(s)
+
+
+def _parse_money(text: object) -> float | None:
+    return _parse_numeric_token(text)
 
 
 def is_number(value: object) -> bool:
-    """Return True for int/float values, excluding bool."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """Return True for finite int/float values, excluding bool."""
+    return safe_float(value) is not None
 
 
 def normalize_label(text: object) -> str:
@@ -64,7 +106,7 @@ def normalize_label(text: object) -> str:
         return ""
     lowered = str(text).lower()
     cleaned = _LABEL_NORM_RE.sub(" ", lowered)
-    return re.sub(r"\s+", " ", cleaned).strip()
+    return " ".join(cleaned.split())
 
 
 def label_matches(line: object, *fragments: str) -> bool:
@@ -116,7 +158,7 @@ def extract_pdf_text_with_ocr(
     (with a single WARN) when any dependency is missing so the caller can
     proceed without OCR rather than crash.
     """
-    if shutil.which("tesseract") is None:
+    if _which("tesseract") is None:
         if log:
             log("WARN tesseract not installed; OCR fallback unavailable (apt install tesseract-ocr)")
         return None
@@ -174,7 +216,8 @@ def extract_pdf_text(
             if log:
                 log(f"WARN pdfplumber failed: {exc}")
 
-    if shutil.which("pdftotext") is None:
+    pdftotext_bin = _which("pdftotext")
+    if pdftotext_bin is None:
         if log:
             log("WARN pdftotext is not installed")
         return None
@@ -184,7 +227,7 @@ def extract_pdf_text(
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
             fh.write(data)
             tmp_path = fh.name
-        args = ["pdftotext"]
+        args = [pdftotext_bin]
         if raw:
             args.append("-raw")
         if first_page is not None:
@@ -192,7 +235,12 @@ def extract_pdf_text(
         if last_page is not None:
             args.extend(["-l", str(last_page)])
         args.extend([tmp_path, "-"])
-        result = subprocess.run(args, capture_output=True, text=True)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        except (subprocess.SubprocessError, OSError) as exc:
+            if log:
+                log(f"WARN pdftotext execution failed: {exc}")
+            return None
         if result.returncode != 0:
             if log:
                 log(f"WARN pdftotext failed: {result.stderr.strip()}")
@@ -220,24 +268,41 @@ def ensure_xlsx(
         return data
     if not data.startswith(b"\xd0\xcf\x11\xe0"):
         return None
-    if shutil.which("libreoffice") is None and shutil.which("soffice") is None:
+    bin_name = _which("libreoffice", "soffice")
+    if bin_name is None:
         if log:
             log("WARN libreoffice not installed; cannot convert legacy .xls")
         return None
-    bin_name = "libreoffice" if shutil.which("libreoffice") else "soffice"
     with tempfile.TemporaryDirectory() as tmp:
         src_path = os.path.join(tmp, "src.xls")
+        profile_dir = os.path.join(tmp, "lo_profile")
+        os.makedirs(profile_dir, exist_ok=True)
         with open(src_path, "wb") as fh:
             fh.write(data)
         try:
-            subprocess.run(
-                [bin_name, "--headless", "--convert-to", "xlsx",
-                 "--outdir", tmp, src_path],
-                capture_output=True, timeout=60,
+            proc = subprocess.run(
+                [
+                    bin_name,
+                    f"-env:UserInstallation={Path(profile_dir).as_uri()}",
+                    "--headless",
+                    "--convert-to",
+                    "xlsx",
+                    "--outdir",
+                    tmp,
+                    src_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
         except Exception as exc:
             if log:
                 log(f"WARN libreoffice xls→xlsx conversion failed: {exc}")
+            return None
+        if proc.returncode != 0:
+            if log:
+                err = (proc.stderr or proc.stdout or "").strip()
+                log(f"WARN libreoffice xls→xlsx exited {proc.returncode}: {err}")
             return None
         out_path = os.path.join(tmp, "src.xlsx")
         if not os.path.isfile(out_path):

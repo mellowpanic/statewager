@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 import os
 import sys
@@ -67,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite existing per-state CSV rows instead of merging by month.",
     )
     parser.add_argument(
+        "--jobs",
+        type=int,
+        default=4,
+        help="Parallel worker threads for state fetches (default: 4).",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-month statewager progress logs.",
@@ -84,24 +91,42 @@ def publish_all(
     offline: bool = False,
     quiet: bool = False,
     merge_existing: bool = True,
+    jobs: int = 4,
 ) -> dict[str, list[StateMonthResult]]:
     """Run ``statewager`` for ``states`` and write ``docs/data/*.csv`` + ``docs/index.html``."""
     data_dir = os.path.join(docs_dir, "data")
     by_state: dict[str, list[StateMonthResult]] = {}
-    combined: list[StateMonthResult] = []
-    state_options: list[tuple[str, str]] = []
 
-    silent_log = (lambda _msg: None) if quiet else None
+    modules = []
+    seen_slugs: set[str] = set()
     for raw_state in states:
         mod = load_state_module(raw_state)
         slug = mod.__name__.rsplit(".", 1)[-1]
-        results = mod.fetch(
+        if slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        modules.append((slug, mod))
+
+    silent_log = (lambda _msg: None) if quiet else None
+
+    def _fetch_one(item: tuple[str, object]) -> list[StateMonthResult]:
+        _slug, mod = item
+        return mod.fetch(
             month_start,
             month_end,
             cache_dir=cache_dir,
             offline=offline,
             log=silent_log,
         )
+
+    worker_count = min(max(1, jobs), len(modules)) if modules else 1
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            fetched_lists = list(pool.map(_fetch_one, modules))
+    else:
+        fetched_lists = [_fetch_one(item) for item in modules]
+
+    for (slug, mod), results in zip(modules, fetched_lists):
         csv_path = os.path.join(data_dir, f"{slug}.csv")
         if merge_existing:
             merged = merge_state_results(read_state_csv(csv_path), results)
@@ -109,8 +134,24 @@ def publish_all(
             merged = sorted(results, key=lambda r: r.month)
         write_state_csv(data_dir, slug, merged)
         by_state[slug] = merged
-        combined.extend(merged)
-        state_options.append((slug, mod.STATE_NAME))
+
+    combined: list[StateMonthResult] = []
+    state_options: list[tuple[str, str]] = []
+    if merge_existing:
+        for slug in ALL_STATES:
+            mod = load_state_module(slug)
+            if slug in by_state:
+                combined.extend(by_state[slug])
+                state_options.append((slug, mod.STATE_NAME))
+            else:
+                existing_path = os.path.join(data_dir, f"{slug}.csv")
+                if os.path.isfile(existing_path):
+                    combined.extend(read_state_csv(existing_path))
+                    state_options.append((slug, mod.STATE_NAME))
+    else:
+        for slug, mod in modules:
+            combined.extend(by_state[slug])
+            state_options.append((slug, mod.STATE_NAME))
 
     write_combined_csv(data_dir, combined)
     write_index_html(docs_dir, state_options)
@@ -140,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         offline=args.offline,
         quiet=args.quiet,
         merge_existing=not args.no_merge,
+        jobs=max(1, args.jobs),
     )
     total_rows = sum(len(rows) for rows in by_state.values())
     populated_states = sum(1 for rows in by_state.values() if rows)

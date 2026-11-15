@@ -25,25 +25,26 @@ from ..http import fetch_with_wayback_fallback
 from ..model import (
     StateMonthResult,
     build_state_logger,
+    finalize_state_month,
     format_iso_month,
-    hold_pct,
     log_skip,
     resolve_fetch_months,
-    validate_result,
 )
+from ..parse import is_number
 
 STATE_NAME = "Louisiana"
 LAUNCH_DATE: date | None = None
 EXTRA_HEADERS: list[str] = []
 HAS_DETAILS = False
 
-USER_AGENT = "Mozilla/5.0"
 REPORTS_URL = (
     "https://lsp.org/about/leadershipsections/bureau-of-investigations/"
     "gaming-enforcement-division/gaming-revenue-reports/"
 )
 _DEFAULT_LOG = build_state_logger("LA")
 _LA_CACHE_FILE_RE = re.compile(r"^louisiana_(20\d{2})_(0[1-9]|1[0-2])_(mobile|retail)\.xlsx$", re.IGNORECASE)
+_CACHE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+_LABEL_HINT_RE = re.compile(r"([A-Za-z]{3})[\s\-_]+(\d{4})")
 
 
 def discover_remote_links(
@@ -124,7 +125,7 @@ def parse_workbook_all_months(
                 revenue = row[4] if len(row) > 4 else None
                 if not isinstance(month_cell, (datetime, date)):
                     continue
-                if not isinstance(handle, (int, float)) or not isinstance(revenue, (int, float)):
+                if not is_number(handle) or not is_number(revenue):
                     continue
                 if handle == 0 or handle == -1:
                     continue
@@ -150,11 +151,11 @@ def _load_one(
         except Exception as exc:
             log(f"WARN could not read local file {url_or_path}: {exc}")
             return None
-    cache_filename = re.sub(r"[^A-Za-z0-9._-]", "_", f"{label_hint}_{os.path.basename(urlparse(url_or_path).path)}")
+    cache_filename = _CACHE_SAFE_RE.sub("_", f"{label_hint}_{os.path.basename(urlparse(url_or_path).path)}")
     cache_file = cache_path(cache_dir, cache_filename)
 
     timestamp = None
-    label_match = re.search(r"([A-Za-z]{3})[\s\-_]+(\d{4})", label_hint)
+    label_match = _LABEL_HINT_RE.search(label_hint)
     if label_match:
         try:
             timestamp = datetime.strptime(
@@ -248,9 +249,11 @@ def _scan_cache_dir(
             continue
         for label in target_labels:
             bucket = cumulative.setdefault(f"{label}:{channel}", [])
+            seen = set(bucket)
             for path in newest_first:
-                if path not in bucket:
+                if path not in seen:
                     bucket.append(path)
+                    seen.add(path)
     return per_month, cumulative
 
 
@@ -378,34 +381,28 @@ def fetch(
             retail_handle, retail_revenue = retail_values
             total_handle = mobile_handle + retail_handle
             total_revenue = mobile_revenue + retail_revenue
-            validated = validate_result(label, total_handle, total_revenue)
-            if validated is None:
-                continue
-            handle, revenue = validated
-            hold = hold_pct(handle, revenue)
-            retail_hold = hold_pct(retail_handle, retail_revenue) if retail_handle else None
-            mobile_hold = hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None
             m_src = resolved_sources.get((label, "mobile"), "")
             source_url = m_src if m_src.startswith("http") else REPORTS_URL
-            results.append(
-                StateMonthResult(
-                    state=STATE_NAME,
-                    month=iso_month,
-                    handle=handle,
-                    revenue=revenue,
-                    hold=hold,
-                    retail_handle=retail_handle,
-                    retail_revenue=retail_revenue,
-                    retail_hold=retail_hold,
-                    mobile_handle=mobile_handle,
-                    mobile_revenue=mobile_revenue,
-                    mobile_hold=mobile_hold,
-                    source_url=source_url,
-                )
+            item = finalize_state_month(
+                state=STATE_NAME,
+                iso_month=iso_month,
+                handle=total_handle,
+                revenue=total_revenue,
+                retail_handle=retail_handle,
+                retail_revenue=retail_revenue,
+                mobile_handle=mobile_handle,
+                mobile_revenue=mobile_revenue,
+                source_url=source_url,
+                reconcile_splits=False,
+                log=logger,
+                label=label,
             )
+            if item is None:
+                continue
+            results.append(item)
             logger(
-                f"INFO {label}: handle={handle:,.0f} revenue={revenue:,.0f} "
-                f"retail_handle={retail_handle:,.0f} mobile_handle={mobile_handle:,.0f} hold={hold:.1f}%"
+                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
+                f"retail_handle={retail_handle:,.0f} mobile_handle={mobile_handle:,.0f} hold={item.hold:.1f}%"
             )
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")

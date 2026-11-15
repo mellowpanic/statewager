@@ -16,18 +16,17 @@ except ImportError:
     pdfplumber = None
 
 from ..cache import cache_path, load_cached_or_fetch
-from ..discover import MONTH_NAMES, DiscoveryReport, crawl_anchors
+from ..discover import MONTH_NAMES, TEXT_MONTH_RE, DiscoveryReport, crawl_anchors
 from ..http import fetch_with_wayback_fallback
 from ..model import (
-    OperatorMonthResult,
     StateMonthResult,
+    build_operator_results,
     build_state_logger,
+    finalize_state_month,
+    fiscal_year_july,
     format_iso_month,
-    hold_pct,
     log_skip,
-    reconcile_components,
     resolve_fetch_months,
-    validate_result,
 )
 from ..parse import parse_dollar
 
@@ -36,7 +35,6 @@ LAUNCH_DATE: date | None = date(2025, 12, 1)
 EXTRA_HEADERS: list[str] = []
 HAS_DETAILS = True
 
-USER_AGENT = "Mozilla/5.0"
 MGC_BASE = "https://www.mgc.dps.mo.gov"
 MGC_SW_REPORTS_PAGE = f"{MGC_BASE}/SportsWagering/sw_financials/rb_SWFin_main.html"
 MGC_FINANCIALS_PAGE = f"{MGC_BASE}/Casino_Gaming/rb_financials/rb_Fin_main.html"
@@ -51,18 +49,17 @@ PDF_NAME_RE = re.compile(
     r"SW(?:%20|[\s_])+Monthly(?:%20|[\s_])+Financials?(?:%20|[\s_])+(\d{4})(?:(?:%20|[\s_])*[a-z0-9_-]*)?\.pdf",
     re.IGNORECASE,
 )
-TEXT_MONTH_RE = re.compile(
-    r"\b("
-    + "|".join(sorted(MONTH_NAMES.keys(), key=len, reverse=True))
-    + r")\b(?:\s+report)?(?:\s*\(pdf\))?[\s,\-]+(20\d{2})",
-    re.IGNORECASE,
-)
 ROW_MONTH_RE = re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2}\b", re.IGNORECASE)
+_DOLLAR_TOKEN_RE = re.compile(r"[+\-\u2212]?\(?\$[\d,]+(?:\.\d+)?\)?")
+_MOBILE_WORD_RE = re.compile(r"\bmobile\b")
+_RETAIL_WORD_RE = re.compile(r"\bretail\b")
+_WS_RE = re.compile(r"\s+")
+_CHANNEL_SUFFIX_RE = re.compile(r"\s*-\s*(retail|mobile)\s*$", re.IGNORECASE)
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 def fiscal_year(year: int, month: int) -> int:
-    fy = year + 1 if month >= 7 else year
-    return fy % 100
+    return fiscal_year_july(year, month)[1] % 100
 
 
 def build_pdf_url(year: int, month: int) -> str:
@@ -143,6 +140,8 @@ def scrape_pdf_urls(
         if match:
             mmyy = match.group(1)
             month_num = int(mmyy[:2])
+            if not (1 <= month_num <= 12):
+                continue
             year = 2000 + int(mmyy[2:])
         else:
             meta = " ".join(unescape(link.get(key, "")) for key in ("title", "text"))
@@ -166,7 +165,7 @@ def scrape_pdf_urls(
 
 
 def extract_amounts(line: str) -> tuple[float, float] | None:
-    amounts = [parse_dollar(token) for token in re.findall(r"\(?\$[\d,]+(?:\.\d+)?\)?", line)]
+    amounts = [parse_dollar(token) for token in _DOLLAR_TOKEN_RE.findall(line)]
     amounts = [amount for amount in amounts if amount is not None]
     if len(amounts) < 3:
         return None
@@ -216,13 +215,13 @@ def parse_report_state_totals(page_texts: list[str], report_name: str) -> tuple[
 
 
 def clean_operator_name(operator: str) -> str:
-    cleaned = re.sub(r"\s+", " ", operator).strip(" -")
-    cleaned = re.sub(r"\s*-\s*(retail|mobile)\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _WS_RE.sub(" ", operator).strip(" -")
+    cleaned = _CHANNEL_SUFFIX_RE.sub("", cleaned)
     return cleaned.strip(" -")
 
 
 def detail_operator_key(operator: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", clean_operator_name(operator).lower()).strip()
+    return _NON_ALNUM_RE.sub(" ", clean_operator_name(operator).lower()).strip()
 
 
 def parse_licensee_line(line: str, month_token: str) -> tuple[str, float, float] | None:
@@ -348,8 +347,8 @@ def parse_pdf(
             page_texts = [page.extract_text() or "" for page in pdf.pages]
             retail = parse_report_state_totals(page_texts, "SPORTS WAGERING RETAIL STATISTICAL REPORT")
             mobile = parse_report_state_totals(page_texts, "SPORTS WAGERING MOBILE STATISTICAL REPORT")
-            details = parse_report_details(page_texts, year, month)
             if retail is not None and mobile is not None:
+                details = parse_report_details(page_texts, year, month)
                 return (
                     retail[0] + mobile[0],
                     retail[1] + mobile[1],
@@ -369,10 +368,10 @@ def parse_pdf(
     for line in text.splitlines():
         stripped = line.strip()
         lower = stripped.lower()
-        if re.search(r"\bmobile\b", lower) and "retail" not in lower:
+        if _MOBILE_WORD_RE.search(lower) and "retail" not in lower:
             section = "mobile"
             continue
-        if re.search(r"\bretail\b", lower) and "mobile" not in lower:
+        if _RETAIL_WORD_RE.search(lower) and "mobile" not in lower:
             section = "retail"
             continue
         if section == "mobile":
@@ -387,10 +386,10 @@ def parse_pdf(
     return (
         total[0],
         total[1],
-        retail[0] if retail else None,
-        retail[1] if retail else None,
-        mobile[0] if mobile else None,
-        mobile[1] if mobile else None,
+        retail[0],
+        retail[1],
+        mobile[0],
+        mobile[1],
         [],
     )
 
@@ -462,14 +461,14 @@ def fetch(
                 else:
                     if live_urls is None and (not cached or report is not None):
                         live_urls = scrape_pdf_urls(report=report, log=logger)
-                    if live_urls is not None:
+                    if live_urls:
                         url = live_urls.get(label)
-                    if not url and not cached:
-                        logger(f"INFO {label}: not yet published on MGC SW index; skipping")
-                        if report is not None:
-                            report.add_probe(f"{label}:summary", "(none)", reason="not-on-index")
-                        continue
-                    if not url:
+                        if not url and not cached:
+                            logger(f"INFO {label}: not yet published on MGC SW index; skipping")
+                            if report is not None:
+                                report.add_probe(f"{label}:summary", "(none)", reason="not-on-index")
+                            continue
+                    else:
                         url = build_pdf_url(year, month)
                         if not cached:
                             logger(f"INFO {label}: scraped URL missing; falling back to constructed URL")
@@ -500,66 +499,29 @@ def fetch(
                 log_skip(logger, label, "no parseable MGC PDF")
                 continue
             handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details = parsed
-            validated = validate_result(label, handle, revenue)
-            if validated is None:
+            operator_details = build_operator_results(iso_month, details)
+            item = finalize_state_month(
+                state=STATE_NAME,
+                iso_month=iso_month,
+                handle=handle,
+                revenue=revenue,
+                retail_handle=retail_handle,
+                retail_revenue=retail_revenue,
+                mobile_handle=mobile_handle,
+                mobile_revenue=mobile_revenue,
+                source_url=chosen_url,
+                details=operator_details,
+                log=logger,
+                label=label,
+            )
+            if item is None:
                 continue
-            handle, revenue = validated
-            retail_handle, retail_revenue, mobile_handle, mobile_revenue = reconcile_components(
-                label,
-                handle,
-                revenue,
-                retail_handle,
-                retail_revenue,
-                mobile_handle,
-                mobile_revenue,
-            )
-            hold = hold_pct(handle, revenue)
-            retail_hold = hold_pct(retail_handle, retail_revenue) if retail_handle else None
-            mobile_hold = hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None
-            operator_details: list[OperatorMonthResult] = []
-            for (
-                operator_name,
-                operator_handle,
-                operator_revenue,
-                operator_retail_handle,
-                operator_retail_revenue,
-                operator_mobile_handle,
-                operator_mobile_revenue,
-            ) in details:
-                operator_details.append(
-                    OperatorMonthResult(
-                        month=iso_month,
-                        operator=operator_name,
-                        handle=operator_handle,
-                        revenue=operator_revenue,
-                        hold=hold_pct(operator_handle, operator_revenue),
-                        retail_handle=operator_retail_handle,
-                        retail_revenue=operator_retail_revenue,
-                        mobile_handle=operator_mobile_handle,
-                        mobile_revenue=operator_mobile_revenue,
-                    )
-                )
-            results.append(
-                StateMonthResult(
-                    state=STATE_NAME,
-                    month=iso_month,
-                    handle=handle,
-                    revenue=revenue,
-                    hold=hold,
-                    retail_handle=retail_handle,
-                    retail_revenue=retail_revenue,
-                    retail_hold=retail_hold,
-                    mobile_handle=mobile_handle,
-                    mobile_revenue=mobile_revenue,
-                    mobile_hold=mobile_hold,
-                    source_url=chosen_url,
-                    details=operator_details,
-                )
-            )
+            results.append(item)
             logger(
-                f"INFO {label}: handle={handle:,.0f} revenue={revenue:,.0f} "
-                f"retail_handle={retail_handle if retail_handle is not None else 'n/a'} "
-                f"mobile_handle={mobile_handle if mobile_handle is not None else 'n/a'} hold={hold:.1f}%"
+                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
+                f"retail_handle={item.retail_handle if item.retail_handle is not None else 'n/a'} "
+                f"mobile_handle={item.mobile_handle if item.mobile_handle is not None else 'n/a'} "
+                f"hold={(item.hold or 0.0):.1f}%"
             )
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")

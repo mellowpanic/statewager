@@ -2,34 +2,43 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
-from typing import Iterable, Sequence
+import tempfile
+from typing import Callable, Iterable, Sequence, TextIO
 
-from statewager.model import CORE_RESULT_FIELDS, StateMonthResult
+from statewager.model import CORE_RESULT_FIELDS, StateMonthResult, safe_float
 
 CSV_HEADERS: list[str] = list(CORE_RESULT_FIELDS)
 
 
 def _format_amount(value: float | None) -> str:
-    if value is None:
+    num = safe_float(value)
+    if num is None:
         return ""
-    rounded_int = round(value)
-    if abs(value - rounded_int) < 0.005:
+    rounded_int = round(num)
+    if abs(num - rounded_int) < 0.005:
         return str(int(rounded_int))
-    return f"{value:.2f}"
+    return f"{num:.2f}"
 
 
 def _format_pct(value: float | None) -> str:
-    if value is None:
+    num = safe_float(value)
+    if num is None:
         return ""
-    return f"{value:.2f}"
+    if abs(num) < 0.005:
+        num = 0.0
+    return f"{num:.2f}"
 
 
 def _parse_opt_float(value: str | None) -> float | None:
     text = (value or "").strip()
     if not text:
         return None
-    return float(text)
+    val = float(text)
+    if not math.isfinite(val):
+        return None
+    return 0.0 if val == 0.0 else val
 
 
 def read_state_csv(csv_path: str) -> list[StateMonthResult]:
@@ -47,9 +56,9 @@ def read_state_csv(csv_path: str) -> list[StateMonthResult]:
                 StateMonthResult(
                     state=state,
                     month=month,
-                    handle=_parse_opt_float(raw.get("handle")) or 0.0,
-                    revenue=_parse_opt_float(raw.get("revenue")) or 0.0,
-                    hold=_parse_opt_float(raw.get("hold")) or 0.0,
+                    handle=_parse_opt_float(raw.get("handle")),
+                    revenue=_parse_opt_float(raw.get("revenue")),
+                    hold=_parse_opt_float(raw.get("hold")),
                     retail_handle=_parse_opt_float(raw.get("retail_handle")),
                     retail_revenue=_parse_opt_float(raw.get("retail_revenue")),
                     retail_hold=_parse_opt_float(raw.get("retail_hold")),
@@ -72,7 +81,7 @@ def merge_state_results(
         by_key[(item.state, item.month)] = item
     for item in fresh:
         by_key[(item.state, item.month)] = item
-    return sorted(by_key.values(), key=lambda r: r.month)
+    return sorted(by_key.values(), key=lambda r: (r.month, r.state))
 
 
 def result_to_csv_row(item: StateMonthResult) -> list[str]:
@@ -93,21 +102,48 @@ def result_to_csv_row(item: StateMonthResult) -> list[str]:
     ]
 
 
+def atomic_write_file(
+    out_path: str,
+    write_fn: Callable[[TextIO], None],
+    *,
+    suffix: str = ".tmp",
+    newline: str | None = None,
+) -> str:
+    """Atomically write ``out_path`` via a temporary file with 0644 permissions."""
+    parent = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=suffix, dir=parent)
+    try:
+        with os.fdopen(fd, "w", newline=newline, encoding="utf-8") as fh:
+            write_fn(fh)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, out_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return out_path
+
+
+def _atomic_write_csv(out_path: str, ordered: Sequence[StateMonthResult]) -> str:
+    def _write(fh: TextIO) -> None:
+        writer = csv.writer(fh)
+        writer.writerow(CSV_HEADERS)
+        for item in ordered:
+            writer.writerow(result_to_csv_row(item))
+
+    return atomic_write_file(out_path, _write, suffix=".csv", newline="")
+
+
 def write_state_csv(
     data_dir: str,
     state_slug: str,
     results: Sequence[StateMonthResult],
 ) -> str:
     """Write ``<data_dir>/<state_slug>.csv`` sorted by ISO month and return its path."""
-    os.makedirs(data_dir, exist_ok=True)
     ordered = sorted(results, key=lambda r: r.month)
     out_path = os.path.join(data_dir, f"{state_slug}.csv")
-    with open(out_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(CSV_HEADERS)
-        for item in ordered:
-            writer.writerow(result_to_csv_row(item))
-    return out_path
+    return _atomic_write_csv(out_path, ordered)
 
 
 def write_combined_csv(
@@ -115,12 +151,6 @@ def write_combined_csv(
     all_results: Iterable[StateMonthResult],
 ) -> str:
     """Write ``<data_dir>/all.csv`` sorted by ``(state, month)`` and return its path."""
-    os.makedirs(data_dir, exist_ok=True)
     ordered = sorted(all_results, key=lambda r: (r.state, r.month))
     out_path = os.path.join(data_dir, "all.csv")
-    with open(out_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(CSV_HEADERS)
-        for item in ordered:
-            writer.writerow(result_to_csv_row(item))
-    return out_path
+    return _atomic_write_csv(out_path, ordered)

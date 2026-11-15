@@ -16,31 +16,32 @@ except ImportError:
 
 from dateutil.relativedelta import relativedelta
 
-from ..cache import cache_path, load_cached_or_fetch, save_cache
+from ..cache import cache_path, load_cached_or_fetch, refresh_cached_if_stale
 from ..discover import (
+    AnchorParser,
     DiscoveryReport,
     classify_sportsbook_filename,
     crawl_anchors,
 )
 from ..http import fetch_bytes, fetch_text, fetch_with_wayback_fallback
 from ..model import (
-    OperatorMonthResult,
+    MONTH_ABBR,
     StateMonthResult,
+    build_operator_results,
     build_state_logger,
+    finalize_state_month,
+    fiscal_year_july,
     format_iso_month,
-    hold_pct,
     log_skip,
-    reconcile_components,
     resolve_fetch_months,
-    validate_result,
 )
+from ..parse import is_number
 
 STATE_NAME = "Pennsylvania"
 LAUNCH_DATE: date | None = None
 EXTRA_HEADERS: list[str] = []
 HAS_DETAILS = True
 
-USER_AGENT = "Mozilla/5.0"
 HTTP_TIMEOUT = 30
 HTTP_RETRIES = 3
 PGCB_BASE = "https://gamingcontrolboard.pa.gov"
@@ -50,13 +51,14 @@ _FY_OPTION_RE = re.compile(
     r'<option[^>]*value=["\'](\d+)["\'][^>]*>\s*FY\s*(20\d{2})\s*/\s*(20\d{2})\s*</option>',
     re.IGNORECASE,
 )
-MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+_FY_TEXT_RE = re.compile(r"fy[ _-]?(\d{2})[ _-]?(\d{2})")
+_WS_RE = re.compile(r"\s+")
 
 _DEFAULT_LOG = build_state_logger("PA")
 
 
 def get_fy(cal_month: int, cal_year: int) -> tuple[int, int]:
-    return (cal_year, cal_year + 1) if cal_month >= 7 else (cal_year - 1, cal_year)
+    return fiscal_year_july(cal_year, cal_month)
 
 
 def _absolute_url(href: str) -> str:
@@ -79,8 +81,9 @@ def parse_filter_options(html: str) -> dict[tuple[int, int], int]:
 def crawl_revenue_index(
     report: DiscoveryReport | None = None,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    target_fys: set[tuple[int, int]] | list[tuple[int, int]] | None = None,
 ) -> list[dict[str, str]]:
-    """Crawl PGCB revenue page once, optionally across FY filter views."""
+    """Crawl PGCB revenue page once, optionally across needed FY filter views."""
     filter_ids = dict(FILTER_IDS)
     try:
         index_html = fetch_text(REVENUE_PAGE, timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES)
@@ -89,17 +92,17 @@ def crawl_revenue_index(
     if index_html:
         for fy_key, fid in parse_filter_options(index_html).items():
             filter_ids.setdefault(fy_key, fid)
-    indices = [REVENUE_PAGE]
-    for (_fy_start, _fy_end), filter_id in sorted(filter_ids.items(), reverse=True):
-        indices.append(f"{REVENUE_PAGE}?field_gaming_revenue_fiscal_year_target_id={filter_id}")
+    if target_fys is not None:
+        target_set = set(target_fys)
+        filter_ids = {k: v for k, v in filter_ids.items() if k in target_set}
     seen_hrefs: set[str] = set()
     aggregated: list[dict[str, str]] = []
-    for url in indices:
-        links = crawl_anchors(url, log=log)
+
+    def _collect(links: list[dict[str, str]], page_url: str) -> None:
         if not links:
-            continue
+            return
         if report is not None:
-            report.add_index(url, anchor_count=len(links))
+            report.add_index(page_url, anchor_count=len(links))
         for link in links:
             href = unescape(link.get("href", "").strip())
             if not href or href in seen_hrefs:
@@ -110,6 +113,16 @@ def crawl_revenue_index(
                 "title": link.get("title", ""),
                 "text": link.get("text", ""),
             })
+
+    if index_html:
+        parser = AnchorParser()
+        parser.feed(index_html)
+        _collect(parser.links, REVENUE_PAGE)
+    else:
+        _collect(crawl_anchors(REVENUE_PAGE, log=log), REVENUE_PAGE)
+    for (_fy_start, _fy_end), filter_id in sorted(filter_ids.items(), reverse=True):
+        url = f"{REVENUE_PAGE}?field_gaming_revenue_fiscal_year_target_id={filter_id}"
+        _collect(crawl_anchors(url, log=log), url)
     return aggregated
 
 
@@ -120,7 +133,7 @@ def _classify_pa_anchor(
     if not lower_href.endswith(".xlsx") and not lower_href.endswith(".pdf"):
         return "other", None
     combined = " ".join(part for part in (href, title, text) if part).lower()
-    fy_match = re.search(r"fy[ _-]?(\d{2})[ _-]?(\d{2})", combined)
+    fy_match = _FY_TEXT_RE.search(combined)
     fy_pair: tuple[int, int] | None = None
     if fy_match:
         fy_pair = (2000 + int(fy_match.group(1)), 2000 + int(fy_match.group(2)))
@@ -144,7 +157,7 @@ def discover_fy_link(
     fy_token = f"FY{fy_start % 100:02d}-{fy_end % 100:02d}"
     fy_token_lower = fy_token.lower()
     if anchors is None:
-        anchors = crawl_revenue_index(report=report, log=log)
+        anchors = crawl_revenue_index(report=report, log=log, target_fys={(fy_start, fy_end)})
 
     for anchor in anchors:
         category, fy_pair = _classify_pa_anchor(anchor["href"], anchor["title"], anchor["text"])
@@ -158,6 +171,8 @@ def discover_fy_link(
             return anchor["href"]
 
     today = date.today().replace(day=1)
+    min_pub = date(fy_start, 7, 1)
+    max_pub = min(today, date(fy_end, 9, 1))
     patterns = [
         "{base}/sites/default/files/{published:%Y-%m}/{fy_token}%20Monthly%20Sports%20Wagering%20Report%20Summary{suffix}",
         "{base}/sites/default/files/{published:%Y-%m}/{fy_token}-Monthly-Sports-Wagering-Report-Summary{suffix}",
@@ -165,8 +180,8 @@ def discover_fy_link(
         "{base}/sites/default/files/{published:%Y-%m}/{fy_token}%20Sports%20Wagering%20Report%20Summary{suffix}",
     ]
     suffixes = (".xlsx", "%20.xlsx")
-    for offset in range(24):
-        published = today - relativedelta(months=offset)
+    published = max_pub
+    while published >= min_pub:
         for pattern in patterns:
             for suffix in suffixes:
                 guessed = pattern.format(
@@ -178,12 +193,13 @@ def discover_fy_link(
                 if report is not None:
                     report.add_probe(f"FY{fy_start % 100:02d}-{fy_end % 100:02d}", guessed, reason="probe")
                 try:
-                    data = fetch_bytes(guessed)
+                    data = fetch_bytes(guessed, retries=1, timeout=10)
                 except Exception as exc:
                     log(f"WARN could not probe {guessed}: {exc}")
                     continue
                 if data and data.startswith(b"PK"):
                     return guessed
+        published -= relativedelta(months=1)
     return None
 
 
@@ -216,12 +232,8 @@ def download_fy_workbook(
     return None
 
 
-def is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def normalize_label(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    return _WS_RE.sub(" ", str(value or "").strip()).lower()
 
 
 def extract_section_metrics(
@@ -253,6 +265,12 @@ def extract_section_metrics(
     return results
 
 
+_MONTH_HEADER_PATTERNS: tuple[tuple[int, str, re.Pattern[str]], ...] = tuple(
+    (month_index, abbr, re.compile(rf"\b{abbr}[a-z]*\b", re.IGNORECASE))
+    for month_index, abbr in MONTH_ABBR.items()
+)
+
+
 def parse_month_columns(rows: list[tuple[object, ...]], fy_start: int, fy_end: int) -> dict[int, str]:
     header_row = None
     for index, row in enumerate(rows[:12]):
@@ -267,16 +285,23 @@ def parse_month_columns(rows: list[tuple[object, ...]], fy_start: int, fy_end: i
         text = str(cell or "").strip()
         if not text:
             continue
-        for month_index, month in enumerate(MONTH_NAMES, start=1):
-            if month.lower() in text.lower():
+        for month_index, month, pattern in _MONTH_HEADER_PATTERNS:
+            if pattern.search(text):
                 year = fy_end if month_index <= 6 else fy_start
                 col_to_label[column] = f"{month} {year}"
                 break
     return col_to_label
 
 
-def parse_sheet_totals(rows: list[tuple[object, ...]], fy_start: int, fy_end: int) -> dict[str, tuple[float, float]]:
-    col_to_label = parse_month_columns(rows, fy_start, fy_end)
+def parse_sheet_totals(
+    rows: list[tuple[object, ...]],
+    fy_start: int,
+    fy_end: int,
+    *,
+    col_to_label: dict[int, str] | None = None,
+) -> dict[str, tuple[float, float]]:
+    if col_to_label is None:
+        col_to_label = parse_month_columns(rows, fy_start, fy_end)
     if not col_to_label:
         return {}
     for index, row in enumerate(rows):
@@ -298,8 +323,11 @@ def parse_section_totals(
     fy_end: int,
     section_label: str,
     revenue_labels: tuple[str, ...],
+    *,
+    col_to_label: dict[int, str] | None = None,
 ) -> dict[str, tuple[float, float]]:
-    col_to_label = parse_month_columns(rows, fy_start, fy_end)
+    if col_to_label is None:
+        col_to_label = parse_month_columns(rows, fy_start, fy_end)
     if not col_to_label:
         return {}
     target = normalize_label(section_label)
@@ -326,8 +354,11 @@ def parse_detail_metrics(
     rows: list[tuple[object, ...]],
     fy_start: int,
     fy_end: int,
+    *,
+    col_to_label: dict[int, str] | None = None,
 ) -> dict[str, list[tuple[str, float, float, float | None, float | None, float | None, float | None]]]:
-    col_to_label = parse_month_columns(rows, fy_start, fy_end)
+    if col_to_label is None:
+        col_to_label = parse_month_columns(rows, fy_start, fy_end)
     if not col_to_label:
         return {}
     details: dict[str, list[tuple[str, float, float, float | None, float | None, float | None, float | None]]] = {
@@ -359,9 +390,9 @@ def parse_detail_metrics(
         retail_section = normalize_label(rows[index + 8][0] if rows[index + 8] else "")
         retail_metric = normalize_label(rows[index + 9][0] if rows[index + 9] else "")
         retail_revenue_metric = normalize_label(rows[index + 10][0] if rows[index + 10] else "")
-        mobile_section = normalize_label(rows[index + 13][0] if index + 13 < len(rows) and rows[index + 13] else "")
-        mobile_metric = normalize_label(rows[index + 14][0] if index + 14 < len(rows) and rows[index + 14] else "")
-        mobile_revenue_metric = normalize_label(rows[index + 15][0] if index + 15 < len(rows) and rows[index + 15] else "")
+        mobile_section = normalize_label(rows[index + 13][0] if rows[index + 13] else "")
+        mobile_metric = normalize_label(rows[index + 14][0] if rows[index + 14] else "")
+        mobile_revenue_metric = normalize_label(rows[index + 15][0] if rows[index + 15] else "")
         handle_row = rows[index + 2]
         revenue_row = rows[index + 3]
         retail_handle_row = rows[index + 9] if retail_section == "retail sports wagering" and retail_metric == "handle*" else None
@@ -453,13 +484,15 @@ def parse_fy_xlsx(
         return {}
     try:
         first_sheet_rows = [tuple(row) for row in workbook[workbook.sheetnames[0]].iter_rows(values_only=True)]
-        total_metrics = parse_sheet_totals(first_sheet_rows, fy_start, fy_end)
+        col_to_label = parse_month_columns(first_sheet_rows, fy_start, fy_end)
+        total_metrics = parse_sheet_totals(first_sheet_rows, fy_start, fy_end, col_to_label=col_to_label)
         retail_metrics = parse_section_totals(
             first_sheet_rows,
             fy_start,
             fy_end,
             "Retail Sports Wagering",
             ("gross revenue (taxable)", "revenue"),
+            col_to_label=col_to_label,
         )
         mobile_metrics = parse_section_totals(
             first_sheet_rows,
@@ -467,6 +500,7 @@ def parse_fy_xlsx(
             fy_end,
             "Online Sports Wagering",
             ("gross revenue (taxable)", "revenue"),
+            col_to_label=col_to_label,
         )
         if not retail_metrics and not mobile_metrics:
             retail_metrics = {}
@@ -482,7 +516,7 @@ def parse_fy_xlsx(
                     retail_metrics.update(parsed)
                 else:
                     mobile_metrics.update(parsed)
-        detail_metrics = parse_detail_metrics(first_sheet_rows, fy_start, fy_end)
+        detail_metrics = parse_detail_metrics(first_sheet_rows, fy_start, fy_end, col_to_label=col_to_label)
         detail_retail_metrics, detail_mobile_metrics = aggregate_detail_totals(detail_metrics)
         if detail_retail_metrics:
             retail_metrics = detail_retail_metrics
@@ -556,17 +590,24 @@ def fetch(
     ] = {}
     anchors: list[dict[str, str]] | None = None
 
+    needed_fys = sorted({get_fy(month, year) for month, year, _ in months})
+
     def _ensure_anchors() -> list[dict[str, str]]:
         nonlocal anchors
         if anchors is None:
-            anchors = crawl_revenue_index(report=report, log=logger)
+            try:
+                anchors = crawl_revenue_index(report=report, log=logger, target_fys=needed_fys)
+            except TypeError as exc:
+                if "target_fys" not in str(exc):
+                    raise
+                anchors = crawl_revenue_index(report=report, log=logger)
             logger(f"INFO crawled {len(anchors)} PGCB anchors from {REVENUE_PAGE}")
         return anchors
 
     if report is not None and not offline:
         _ensure_anchors()
 
-    for fy_start, fy_end in sorted({get_fy(month, year) for month, year, _ in months}):
+    for fy_start, fy_end in needed_fys:
         try:
             data = parse_local_file(local_dir, fy_start, fy_end) if local_dir else None
             if data:
@@ -598,12 +639,18 @@ def fetch(
                 and path is not None
                 and any(lbl not in fy_parsed or fy_parsed[lbl][0] <= 0 for lbl in fy_labels)
             ):
-                fresh_data = download_fy_workbook(
-                    fy_start, fy_end, anchors=_ensure_anchors(), report=report, log=logger,
+                refreshed = refresh_cached_if_stale(
+                    path,
+                    data,
+                    fetcher=lambda: download_fy_workbook(
+                        fy_start, fy_end, anchors=_ensure_anchors(), report=report, log=logger,
+                    ),
+                    validate=lambda payload: payload.startswith(b"PK"),
+                    offline=offline,
+                    log=logger,
                 )
-                if fresh_data and fresh_data.startswith(b"PK") and fresh_data != data:
-                    save_cache(path, fresh_data)
-                    fy_parsed = parse_fy_xlsx(fresh_data, fy_start, fy_end, log=logger)
+                if refreshed is not None:
+                    fy_parsed = parse_fy_xlsx(refreshed, fy_start, fy_end, log=logger)
             all_data.update(fy_parsed)
         except Exception as exc:
             logger(f"WARN failed Pennsylvania FY workbook processing for {fy_start}-{fy_end}: {exc}")
@@ -615,65 +662,28 @@ def fetch(
             log_skip(logger, label, "no parsed value")
             continue
         handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details = all_data[label]
-        validated = validate_result(label, handle, revenue)
-        if validated is None:
+        operator_details = build_operator_results(iso_month, details)
+        item = finalize_state_month(
+            state=STATE_NAME,
+            iso_month=iso_month,
+            handle=handle,
+            revenue=revenue,
+            retail_handle=retail_handle,
+            retail_revenue=retail_revenue,
+            mobile_handle=mobile_handle,
+            mobile_revenue=mobile_revenue,
+            source_url=REVENUE_PAGE,
+            details=operator_details,
+            log=logger,
+            label=label,
+        )
+        if item is None:
             continue
-        handle, revenue = validated
-        retail_handle, retail_revenue, mobile_handle, mobile_revenue = reconcile_components(
-            label,
-            handle,
-            revenue,
-            retail_handle,
-            retail_revenue,
-            mobile_handle,
-            mobile_revenue,
-        )
-        hold = hold_pct(handle, revenue)
-        retail_hold = hold_pct(retail_handle, retail_revenue) if retail_handle else None
-        mobile_hold = hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None
-        operator_details: list[OperatorMonthResult] = []
-        for (
-            operator_name,
-            operator_handle,
-            operator_revenue,
-            operator_retail_handle,
-            operator_retail_revenue,
-            operator_mobile_handle,
-            operator_mobile_revenue,
-        ) in details:
-            operator_details.append(
-                OperatorMonthResult(
-                    month=iso_month,
-                    operator=operator_name,
-                    handle=operator_handle,
-                    revenue=operator_revenue,
-                    hold=hold_pct(operator_handle, operator_revenue),
-                    retail_handle=operator_retail_handle,
-                    retail_revenue=operator_retail_revenue,
-                    mobile_handle=operator_mobile_handle,
-                    mobile_revenue=operator_mobile_revenue,
-                )
-            )
-        results.append(
-            StateMonthResult(
-                state=STATE_NAME,
-                month=iso_month,
-                handle=handle,
-                revenue=revenue,
-                hold=hold,
-                retail_handle=retail_handle,
-                retail_revenue=retail_revenue,
-                retail_hold=retail_hold,
-                mobile_handle=mobile_handle,
-                mobile_revenue=mobile_revenue,
-                mobile_hold=mobile_hold,
-                source_url=REVENUE_PAGE,
-                details=operator_details,
-            )
-        )
+        results.append(item)
         logger(
-            f"INFO {label}: handle={handle:,.0f} revenue={revenue:,.0f} "
-            f"retail_handle={retail_handle if retail_handle is not None else 'n/a'} "
-            f"mobile_handle={mobile_handle if mobile_handle is not None else 'n/a'} hold={hold:.1f}%"
+            f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
+            f"retail_handle={item.retail_handle if item.retail_handle is not None else 'n/a'} "
+            f"mobile_handle={item.mobile_handle if item.mobile_handle is not None else 'n/a'} "
+            f"hold={(item.hold or 0.0):.1f}%"
         )
     return results

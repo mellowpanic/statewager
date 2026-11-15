@@ -321,3 +321,197 @@ def test_missouri_pdf_name_re_matches_underscores_and_revised() -> None:
     m2 = missouri.PDF_NAME_RE.search("FY27_SWFinReport/09_Sep/SW Monthly Financials 0926.pdf")
     assert m1 is not None and m1.group(1) == "0326"
     assert m2 is not None and m2.group(1) == "0926"
+
+
+def test_cache_path_traversal_zero_byte_and_stale_refresh(tmp_path) -> None:
+    import os
+    import pytest
+    from statewager.cache import cache_path, load_cached_or_fetch, refresh_cached_if_stale
+
+    base = str(tmp_path)
+    for bad in ("", "../secret.pdf", "/etc/passwd", "sub/../../secret.pdf"):
+        with pytest.raises(ValueError):
+            cache_path(base, bad)
+    assert cache_path(base, "sub/file.pdf") == os.path.join(os.path.abspath(base), "sub", "file.pdf")
+
+    empty_file = tmp_path / "empty.bin"
+    empty_file.write_bytes(b"")
+    calls = 0
+
+    def _fetch_ok() -> bytes:
+        nonlocal calls
+        calls += 1
+        return b"PKvalid"
+
+    assert (
+        load_cached_or_fetch(cache_file=str(empty_file), fetcher=_fetch_ok, offline=True)
+        is None
+    )
+    assert calls == 0
+    assert (
+        load_cached_or_fetch(cache_file=str(empty_file), fetcher=_fetch_ok, offline=False)
+        == b"PKvalid"
+    )
+    assert calls == 1
+
+    corrupt = tmp_path / "corrupt.xlsx"
+    corrupt.write_bytes(b"<html>error</html>")
+    assert (
+        load_cached_or_fetch(
+            cache_file=str(corrupt),
+            fetcher=lambda: None,
+            validate=lambda p: p.startswith(b"PK"),
+            offline=True,
+        )
+        is None
+    )
+
+    valid_cached = tmp_path / "ok.xlsx"
+    valid_cached.write_bytes(b"PKold")
+    assert (
+        refresh_cached_if_stale(
+            str(valid_cached),
+            b"PKold",
+            max_age_seconds=3600,
+            fetcher=lambda: b"PKnew",
+            validate=lambda p: p.startswith(b"PK"),
+            offline=True,
+        )
+        is None
+    )
+    assert (
+        refresh_cached_if_stale(
+            str(valid_cached),
+            b"PKold",
+            max_age_seconds=3600,
+            fetcher=lambda: b"PKnew",
+            validate=lambda p: p.startswith(b"PK"),
+        )
+        is None
+    )
+    assert (
+        refresh_cached_if_stale(
+            str(valid_cached),
+            b"PKold",
+            max_age_seconds=0,
+            fetcher=lambda: b"<html>bad</html>",
+            validate=lambda p: p.startswith(b"PK"),
+        )
+        is None
+    )
+    assert (
+        refresh_cached_if_stale(
+            str(valid_cached),
+            b"PKold",
+            max_age_seconds=-1,
+            fetcher=lambda: b"PKnew",
+            validate=lambda p: p.startswith(b"PK"),
+        )
+        == b"PKnew"
+    )
+    assert valid_cached.read_bytes() == b"PKnew"
+
+
+def test_http_signature_discover_model_and_quality_guards(monkeypatch) -> None:
+    import datetime
+    import math
+    from statewager import quality
+    from statewager.discover import extract_month_label
+    from statewager.http import _matches_signature
+    from statewager.model import (
+        fiscal_year_july,
+        hold_pct,
+        parse_month_spec,
+        safe_float,
+    )
+
+    assert _matches_signature(b"<!doctype html><html></html>", "https://example.com/a.pdf", "auto") is False
+    assert _matches_signature(b"<!doctype html><html></html>", "https://example.com/download", "auto") is False
+    assert _matches_signature(b"<html>ok</html>", "https://example.com/a.html", "auto") is True
+    assert extract_month_label("report_20250315.pdf") is None
+
+    assert parse_month_spec("Mar 2025") == datetime.date(2025, 3, 1)
+    assert parse_month_spec("March 2025") == datetime.date(2025, 3, 1)
+
+    assert safe_float(True) is None
+    assert safe_float(float("nan")) is None
+    neg_zero_norm = safe_float(-0.0)
+    assert neg_zero_norm == 0.0 and math.copysign(1.0, neg_zero_norm) > 0
+    zero_hold = hold_pct(100.0, -0.001)
+    assert zero_hold == 0.0 and math.copysign(1.0, zero_hold) > 0
+    assert fiscal_year_july(2025, 7) == (2025, 2026)
+    assert fiscal_year_july(2026, 6) == (2025, 2026)
+
+    monkeypatch.setattr(quality, "_aggregator_lookup", lambda _s, _l, _log: (100_000.0, 10_000.0))
+    agg_logs: list[str] = []
+    assert quality.validate_against_aggregators(
+        "Indiana", "Mar 2025", 100_000.0, 0.0, log=agg_logs.append
+    ) is False
+    assert any("revenue $0" in m for m in agg_logs)
+
+    anom_logs: list[str] = []
+    assert quality.check_anomaly(
+        "Indiana",
+        "Mar 2025",
+        0.0,
+        0.0,
+        [(100_000.0, 10_000.0), (102_000.0, 10_200.0), (98_000.0, 9_800.0)],
+        log=anom_logs.append,
+    ) is False
+    assert any("handle $0" in m for m in anom_logs)
+
+
+def test_state_edge_cases_and_csv_null_roundtrip(tmp_path) -> None:
+    from publish.csv_writer import read_state_csv, write_state_csv
+    from statewager.model import StateMonthResult
+    from statewager.parse import parse_dollar
+    from statewager.states import illinois, kansas, nevada
+
+    assert parse_dollar("-3455.1100") == -3455.11
+    assert parse_dollar(-3455.11) == -3455.11
+    assert illinois._NUM_TOKEN_RE.search("-$1,234.56") is not None
+    assert illinois._NUM_TOKEN_RE.search("\u2212$500") is not None
+    accrual_csv = (
+        "Location Type,Licensee,State AGR\n"
+        "In-Person Wagering,Casino A,100.00\n"
+        "Online Wagering,Book B,-100.00\n"
+    ).encode("utf-8")
+    assert illinois.parse_accrual_csv(accrual_csv) == (0.0, 100.0, -100.0)
+
+    assert kansas.normalize_pdf_label("  Subtotal  -  Retail: ") == "subtotal - retail:"
+    assert "-" in kansas.AMOUNT_TOKEN_RE.findall("DraftKings  $1,000  -  $100")
+
+    details = [("Clark County", 100.0, 50.0), ("Washoe County", 20.0, 60.0)]
+    reconciled = nevada.reconcile_county_details(details, 50.0, log=lambda _msg: None)
+    assert reconciled == [("Clark County", 100.0, 50.0)]
+
+    partial = StateMonthResult(
+        state="Mississippi",
+        month="2025-03",
+        handle=1000.0,
+        revenue=-0.001,
+        hold=-0.0,
+        retail_handle=1000.0,
+        retail_revenue=0.0,
+        retail_hold=0.0,
+        mobile_handle=None,
+        mobile_revenue=None,
+        mobile_hold=None,
+        source_url="https://example.com/ms.xlsx",
+    )
+    csv_path = write_state_csv(str(tmp_path), "mississippi", [partial])
+    loaded = read_state_csv(csv_path)
+    assert len(loaded) == 1
+    assert loaded[0].mobile_handle is None
+    assert loaded[0].hold == 0.0
+
+    empty_holder = tmp_path / "empty_metrics.csv"
+    empty_holder.write_text(
+        "state,month,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url\n"
+        "Test,2025-03,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+    loaded_blank = read_state_csv(str(empty_holder))
+    assert loaded_blank[0].handle is None
+    assert loaded_blank[0].revenue is None
+    assert loaded_blank[0].hold is None

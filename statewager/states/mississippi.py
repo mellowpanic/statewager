@@ -17,11 +17,10 @@ from ..http import probe_url_variants
 from ..model import (
     StateMonthResult,
     build_state_logger,
+    finalize_state_month,
     format_iso_month,
-    hold_pct,
     log_skip,
     resolve_fetch_months,
-    validate_result,
 )
 from ..parse import ensure_xlsx, is_number
 
@@ -37,9 +36,6 @@ EXTRA_HEADERS: list[str] = [
 ]
 HAS_DETAILS = False
 
-USER_AGENT = "Mozilla/5.0"
-HTTP_TIMEOUT = 30
-HTTP_RETRIES = 3
 BASE_URL = "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_sports_wagering.xlsx"
 URL_VARIANT_TEMPLATES = [
     "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_sports_wagering.xlsx",
@@ -59,6 +55,8 @@ def download_xlsx(
     yy: str,
     report: DiscoveryReport | None = None,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    matched_url: list[str] | None = None,
 ) -> bytes | None:
     """Try the known MSGC filename variants and return XLSX bytes."""
     return probe_url_variants(
@@ -70,6 +68,7 @@ def download_xlsx(
         log=log,
         report=report,
         report_key=f"20{yy}-{mm}",
+        matched_url=matched_url,
     )
 
 
@@ -88,6 +87,7 @@ def parse_state_totals(
         log(f"WARN could not open workbook: {exc}")
         return None
     try:
+        state_totals: tuple[float, float] | None = None
         region_totals: list[tuple[float, float]] = []
         detail_rows: list[tuple[str, float, float]] = []
         for sheet in workbook.worksheets:
@@ -99,8 +99,8 @@ def parse_state_totals(
                 if "overall for state" in label:
                     handle = row[2] if len(row) > 2 else None
                     revenue = row[4] if len(row) > 4 else None
-                    if is_number(handle) and is_number(revenue):
-                        return float(handle), float(revenue), detail_rows
+                    if state_totals is None and is_number(handle) and is_number(revenue):
+                        state_totals = (float(handle), float(revenue))
                 if "overall for region" in label:
                     handle = row[2] if len(row) > 2 else None
                     revenue = row[4] if len(row) > 4 else None
@@ -108,6 +108,8 @@ def parse_state_totals(
                         region_totals.append((float(handle), float(revenue)))
                         if region_name:
                             detail_rows.append((region_name, float(handle), float(revenue)))
+        if state_totals is not None:
+            return state_totals[0], state_totals[1], detail_rows
         if region_totals:
             return (
                 sum(handle for handle, _ in region_totals),
@@ -152,7 +154,7 @@ def fetch(
         raise RuntimeError("openpyxl is required to fetch Mississippi sports wagering data")
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
-    current_year_2digit = date.today().strftime("%y")
+    current_year = date.today().year
     results: list[StateMonthResult] = []
     for mdate in target_dates:
         mm = mdate.strftime("%m")
@@ -166,16 +168,26 @@ def fetch(
             parsed = parse_local_file(local_dir, mm, yy, log=logger) if local_dir else None
             if parsed:
                 logger(f"INFO parsed local workbook for {label}")
+            found_urls: list[str] = []
             if parsed is None:
                 path = cache_path(cache_dir, f"mississippi_{yyyy}_{mm}.xlsx")
+
+                def _fetch_ms(m: str = mm, y: str = yy, urls: list[str] = found_urls) -> bytes | None:
+                    try:
+                        return download_xlsx(m, y, report=report, log=logger, matched_url=urls)
+                    except TypeError as exc:
+                        if "matched_url" not in str(exc):
+                            raise
+                        return download_xlsx(m, y, report=report, log=logger)
+
                 data = load_cached_or_fetch(
                     cache_file=path,
-                    fetcher=lambda m=mm, y=yy: download_xlsx(m, y, report=report, log=logger),
+                    fetcher=_fetch_ms,
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {label}",
                     fetch_error_message=f"could not download Mississippi workbook for {label}",
-                    validate=lambda payload: payload.startswith(b"PK"),
-                    cache_ttl_seconds=7 * 86400 if yy >= current_year_2digit else None,
+                    validate=lambda payload: payload.startswith((b"PK", b"\xd0\xcf\x11\xe0")),
+                    cache_ttl_seconds=7 * 86400 if mdate.year >= current_year else None,
                     offline=offline,
                 )
                 if data:
@@ -184,12 +196,6 @@ def fetch(
                 log_skip(logger, label, "workbook unavailable or unparseable")
                 continue
             handle, revenue, regions = parsed
-            validated = validate_result(label, handle, revenue)
-            if validated is None:
-                continue
-            handle, revenue = validated
-            hold = hold_pct(handle, revenue)
-            retail_hold = hold_pct(handle, revenue) if handle else None
             region_map = {
                 region_name: (region_handle, region_revenue)
                 for region_name, region_handle, region_revenue in regions
@@ -199,24 +205,25 @@ def fetch(
                 region_handle, region_revenue = region_map.get(region_name, (None, None))
                 extra[f"{region_name} Handle"] = region_handle
                 extra[f"{region_name} Revenue"] = region_revenue
-            results.append(
-                StateMonthResult(
-                    state=STATE_NAME,
-                    month=iso_month,
-                    handle=handle,
-                    revenue=revenue,
-                    hold=hold,
-                    retail_handle=handle,
-                    retail_revenue=revenue,
-                    retail_hold=retail_hold,
-                    mobile_handle=None,
-                    mobile_revenue=None,
-                    mobile_hold=None,
-                    source_url=source_url,
-                    extra=extra,
-                )
+            item = finalize_state_month(
+                state=STATE_NAME,
+                iso_month=iso_month,
+                handle=handle,
+                revenue=revenue,
+                retail_handle=handle,
+                retail_revenue=revenue,
+                mobile_handle=None,
+                mobile_revenue=None,
+                source_url=found_urls[-1] if found_urls else source_url,
+                reconcile_splits=False,
+                extra=extra,
+                log=logger,
+                label=label,
             )
-            logger(f"INFO {label}: handle={handle:,.0f} revenue={revenue:,.0f} hold={hold:.1f}%")
+            if item is None:
+                continue
+            results.append(item)
+            logger(f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} hold={(item.hold or 0.0):.1f}%")
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")
     return results

@@ -4,13 +4,31 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 import logging
-from typing import Callable, TypeVar
+import math
+from typing import Callable, Iterable, Mapping, Sequence, TypeVar
 
 from dateutil.relativedelta import relativedelta
 
 T = TypeVar("T")
 
 DQ_WARN_PREFIX = "DQ-WARN"
+
+MONTH_NAMES: dict[int, str] = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
+}
+
+MONTH_ABBR: dict[int, str] = {m: name[:3] for m, name in MONTH_NAMES.items()}
 
 CORE_RESULT_FIELDS: tuple[str, ...] = (
     "state",
@@ -27,7 +45,7 @@ CORE_RESULT_FIELDS: tuple[str, ...] = (
     "source_url",
 )
 
-_MONTH_NAME_TO_NUM: dict[str, int] = {
+MONTH_NAME_TO_NUM: dict[str, int] = {
     "january": 1, "jan": 1,
     "february": 2, "feb": 2,
     "march": 3, "mar": 3,
@@ -99,7 +117,7 @@ def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
                 return date(int(parts[0]), int(parts[1]), 1)
         parts = text.split()
         if len(parts) == 2:
-            mon = _MONTH_NAME_TO_NUM.get(parts[0].lower())
+            mon = MONTH_NAME_TO_NUM.get(parts[0].lower())
             if mon is not None and parts[1].isdigit():
                 return date(int(parts[1]), mon, 1)
     raise ValueError(f"Invalid month specification: {value!r} (expected 'YYYY-MM', 'Mon YYYY', date, or (year, month))")
@@ -161,14 +179,18 @@ def column_letter(index: int) -> str:
 
 def build_state_logger(prefix: str) -> Callable[[str], None]:
     """Return a consistent logger wrapper used by the state modules."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
     logger = logging.getLogger(prefix)
 
+    def _ensure_logging() -> None:
+        if not logging.getLogger().handlers and not logger.handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+
     def log(message: str) -> None:
+        _ensure_logging()
         text = f"{prefix} {message}".strip()
         if message.startswith("WARN "):
             logger.warning(text)
@@ -255,21 +277,47 @@ def month_range(
     return [transform(month) for month in months]
 
 
+def safe_float(value: object) -> float | None:
+    """Coerce int/float (excluding bool/NaN/Inf) to finite float with +0.0 normalization."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    if not math.isfinite(val):
+        return None
+    return 0.0 if val == 0.0 else val
+
+
+def fiscal_year_july(year: int, month: int) -> tuple[int, int]:
+    """Return the July–June fiscal year ``(fy_start, fy_end)`` containing ``(year, month)``."""
+    return (year, year + 1) if month >= 7 else (year - 1, year)
+
+
 def hold_pct(handle: float | None, revenue: float | None) -> float | None:
     """Return revenue/handle * 100 rounded to two decimals, or None when invalid."""
-    if handle is None or revenue is None or handle == 0:
+    h_val = safe_float(handle)
+    r_val = safe_float(revenue)
+    if h_val is None or r_val is None or h_val == 0:
         return None
-    return round(revenue / handle * 100, 2)
+    rounded = round(r_val / h_val * 100, 2)
+    return 0.0 if rounded == 0.0 else rounded
 
 
 def round_or_blank(value: float | int | None) -> int | str:
     """Round numeric values for tabular output, otherwise return an empty string."""
-    return round(value) if value is not None else ""
+    val = safe_float(value)
+    return round(val) if val is not None else ""
 
 
 def blank_if_none(value: object) -> object:
     """Convert None to empty string."""
     return "" if value is None else value
+
+
+def _emit_warn(log: Callable[[str], None] | None, message: str) -> None:
+    if log is not None:
+        log(f"WARN {message}")
+    else:
+        logging.getLogger(__name__).warning("%s", message)
 
 
 def validate_result(
@@ -278,19 +326,32 @@ def validate_result(
     revenue: float | None,
     *,
     max_abs_hold: float = 0.50,
+    log: Callable[[str], None] | None = None,
 ) -> tuple[float, float] | None:
     """Validate handle/revenue pair. Logs warning and returns None if invalid."""
-    logger = logging.getLogger(__name__)
-    if handle is None or handle <= 0:
-        logger.warning("%s: invalid handle %s", label, handle)
+    if (
+        handle is None
+        or isinstance(handle, bool)
+        or not isinstance(handle, (int, float))
+        or not math.isfinite(float(handle))
+        or handle <= 0
+    ):
+        _emit_warn(log, f"{label}: invalid handle {handle}")
         return None
-    if revenue is None:
-        logger.warning("%s: missing revenue", label)
+    if (
+        revenue is None
+        or isinstance(revenue, bool)
+        or not isinstance(revenue, (int, float))
+        or not math.isfinite(float(revenue))
+    ):
+        _emit_warn(log, f"{label}: missing revenue")
         return None
-    hold = revenue / handle
+    h = float(handle)
+    r = float(revenue)
+    hold = r / h
     if abs(hold) > max_abs_hold:
-        logger.warning("%s: suspicious hold %% %.1f%%", label, hold * 100)
-    return handle, revenue
+        _emit_warn(log, f"{label}: suspicious hold % {hold * 100:.1f}%")
+    return h, r
 
 
 def log_skip(log: Callable[[str], None], label: str, reason: str) -> None:
@@ -308,9 +369,9 @@ def reconcile_components(
     mobile_revenue: float | None,
     *,
     tolerance: float = 1.0,
+    log: Callable[[str], None] | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """Fill missing component values from totals and warn on inconsistent sums."""
-    logger = logging.getLogger(__name__)
     if retail_handle is None and mobile_handle is not None:
         retail_handle = total_handle - mobile_handle
     if mobile_handle is None and retail_handle is not None:
@@ -322,12 +383,138 @@ def reconcile_components(
     if retail_handle is not None and mobile_handle is not None:
         handle_delta = (retail_handle + mobile_handle) - total_handle
         if abs(handle_delta) > tolerance:
-            logger.warning("%s: retail/mobile handle mismatch vs total by %.2f", label, handle_delta)
+            _emit_warn(log, f"{label}: retail/mobile handle mismatch vs total by {handle_delta:.2f}")
     if retail_revenue is not None and mobile_revenue is not None:
         revenue_delta = (retail_revenue + mobile_revenue) - total_revenue
         if abs(revenue_delta) > tolerance:
-            logger.warning("%s: retail/mobile revenue mismatch vs total by %.2f", label, revenue_delta)
+            _emit_warn(log, f"{label}: retail/mobile revenue mismatch vs total by {revenue_delta:.2f}")
     return retail_handle, retail_revenue, mobile_handle, mobile_revenue
+
+
+def build_operator_results(
+    iso_month: str,
+    entries: Iterable[Mapping[str, object] | Sequence[object]],
+) -> list[OperatorMonthResult]:
+    """Convert raw operator rows or dicts into ``OperatorMonthResult`` records."""
+    results: list[OperatorMonthResult] = []
+    for entry in entries:
+        if isinstance(entry, Mapping):
+            operator = str(entry["operator"])
+            handle = entry.get("handle")
+            revenue = entry.get("revenue")
+            retail_handle = entry.get("retail_handle")
+            retail_revenue = entry.get("retail_revenue")
+            mobile_handle = entry.get("mobile_handle")
+            mobile_revenue = entry.get("mobile_revenue")
+        else:
+            seq = tuple(entry)
+            if len(seq) == 3:
+                op_raw, handle, revenue = seq
+                retail_handle = retail_revenue = mobile_handle = mobile_revenue = None
+            elif len(seq) == 7:
+                (
+                    op_raw,
+                    handle,
+                    revenue,
+                    retail_handle,
+                    retail_revenue,
+                    mobile_handle,
+                    mobile_revenue,
+                ) = seq
+            else:
+                raise ValueError(f"Expected 3- or 7-item operator entry, got {len(seq)}")
+            operator = str(op_raw)
+        h_val = safe_float(handle)
+        r_val = safe_float(revenue)
+        results.append(
+            OperatorMonthResult(
+                month=iso_month,
+                operator=operator,
+                handle=h_val,
+                revenue=r_val,
+                hold=hold_pct(h_val, r_val),
+                retail_handle=safe_float(retail_handle),
+                retail_revenue=safe_float(retail_revenue),
+                mobile_handle=safe_float(mobile_handle),
+                mobile_revenue=safe_float(mobile_revenue),
+            )
+        )
+    return results
+
+
+def finalize_state_month(
+    *,
+    state: str,
+    iso_month: str,
+    handle: float | None,
+    revenue: float | None,
+    retail_handle: float | None = None,
+    retail_revenue: float | None = None,
+    mobile_handle: float | None = None,
+    mobile_revenue: float | None = None,
+    source_url: str | None = None,
+    reconcile_splits: bool = True,
+    tolerance: float = 1.0,
+    strict_split_pct: float | None = None,
+    extra: dict[str, float | None] | None = None,
+    details: list[OperatorMonthResult] | None = None,
+    log: Callable[[str], None] | None = None,
+    label: str | None = None,
+) -> StateMonthResult | None:
+    """Validate totals, optionally reconcile retail/mobile splits, compute holds, and build ``StateMonthResult``."""
+    tag = label or f"{state} {iso_month}"
+    validated = validate_result(tag, handle, revenue, log=log)
+    if validated is None:
+        return None
+    total_h, total_r = validated
+    if reconcile_splits:
+        rh, rr, mh, mr = reconcile_components(
+            tag,
+            total_h,
+            total_r,
+            retail_handle,
+            retail_revenue,
+            mobile_handle,
+            mobile_revenue,
+            tolerance=tolerance,
+            log=log,
+        )
+        if strict_split_pct is not None and rh is not None and mh is not None:
+            handle_delta_pct = abs((rh + mh) - total_h) / total_h
+            if handle_delta_pct > strict_split_pct:
+                if log:
+                    log(
+                        f"WARN {tag}: retail/mobile handle reconciliation failed "
+                        f"({handle_delta_pct * 100:.2f}% delta vs total); blanking splits"
+                    )
+                rh = rr = mh = mr = None
+            elif rr is not None and mr is not None and total_r != 0:
+                revenue_delta_pct = abs((rr + mr) - total_r) / abs(total_r)
+                if revenue_delta_pct > strict_split_pct:
+                    if log:
+                        log(
+                            f"WARN {tag}: retail/mobile revenue reconciliation failed "
+                            f"({revenue_delta_pct * 100:.2f}% delta vs total); blanking splits"
+                        )
+                    rh = rr = mh = mr = None
+    else:
+        rh, rr, mh, mr = retail_handle, retail_revenue, mobile_handle, mobile_revenue
+    return StateMonthResult(
+        state=state,
+        month=iso_month,
+        handle=total_h,
+        revenue=total_r,
+        hold=hold_pct(total_h, total_r),
+        retail_handle=rh,
+        retail_revenue=rr,
+        retail_hold=hold_pct(rh, rr) if rh else None,
+        mobile_handle=mh,
+        mobile_revenue=mr,
+        mobile_hold=hold_pct(mh, mr) if mh else None,
+        source_url=source_url,
+        extra=extra if extra is not None else {},
+        details=details if details is not None else [],
+    )
 
 
 def dq_warn(log: Callable[[str], None] | None, message: str) -> None:
@@ -356,13 +543,10 @@ def find_stale_months(
         parts = label.split()
         if len(parts) != 2:
             return (9999, 0)
-        mon = parts[0].lower()[:3]
-        order = {
-            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-        }
+        tok = parts[0].lower()
+        mon = MONTH_NAME_TO_NUM.get(tok, MONTH_NAME_TO_NUM.get(tok[:3], 0))
         try:
-            return (int(parts[1]), order.get(mon, 0))
+            return (int(parts[1]), mon)
         except ValueError:
             return (9999, 0)
 

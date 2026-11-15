@@ -7,7 +7,6 @@ import io
 import os
 import re
 import shutil
-import time
 from typing import Callable
 from urllib.parse import urljoin
 
@@ -16,17 +15,16 @@ try:
 except ImportError:
     pdfplumber = None
 
-from ..cache import cache_path, load_cache, load_cached_or_fetch
-from ..discover import MONTH_NAMES, DiscoveryReport, crawl_anchors, extract_month_label
+from ..cache import cache_path, load_cached_or_fetch
+from ..discover import MONTH_NAMES, TEXT_MONTH_RE, DiscoveryReport, crawl_anchors, extract_month_label
 from ..http import fetch_with_wayback_fallback
 from ..model import (
     StateMonthResult,
     build_state_logger,
+    finalize_state_month,
     format_iso_month,
-    hold_pct,
     log_skip,
     resolve_fetch_months,
-    validate_result,
 )
 from ..parse import extract_pdf_text, extract_pdf_text_with_ocr, parse_dollar
 
@@ -35,7 +33,6 @@ LAUNCH_DATE: date | None = date(2022, 9, 1)
 EXTRA_HEADERS: list[str] = []
 HAS_DETAILS = False
 
-USER_AGENT = "Mozilla/5.0"
 KS_LOTTERY_BASE = "https://www.kslottery.gov"
 KS_SUMMARY_PAGE = f"{KS_LOTTERY_BASE}/publications/sports-monthly-revenues/"
 KS_DETAIL_PAGE = f"{KS_LOTTERY_BASE}/publications/sports-monthly-detail-breakdown/"
@@ -79,14 +76,11 @@ _DEFAULT_LOG = build_state_logger("KS")
 
 SUMMARY_PDF_NAME_RE = re.compile(r"sports-wagering-monthly-revenue-(\d{4})-(\d{2})\.pdf", re.IGNORECASE)
 DETAIL_PDF_NAME_RE = re.compile(r"sports-wagering-monthly-detail-(\d{4})-(\d{2})\.pdf", re.IGNORECASE)
-TEXT_MONTH_RE = re.compile(
-    r"\b("
-    + "|".join(sorted(MONTH_NAMES.keys(), key=len, reverse=True))
-    + r")\b(?:\s+report)?(?:\s*\(pdf\))?[\s,\-]+(20\d{2})",
-    re.IGNORECASE,
-)
+_SPACED_FRAGMENTS_RE = re.compile(r"(?:\b\w\s+){3,}\w\b")
+_USABLE_WORD_RE = re.compile(r"\b[\w$(),.-]+\b")
 
-AMOUNT_TOKEN_RE = re.compile(r"\(?\$?[\d,]+(?:\.\d+)?\)?|-")
+AMOUNT_TOKEN_RE = re.compile(r"[+\-\u2212]?\(?\$?[\d,]+(?:\.\d+)?\)?|(?<!\w)-(?![\w$(])")
+_WS_RE = re.compile(r"\s+")
 LABEL_KEYWORDS = {
     "subtotal - retail": "retail",
     "subtotal - online": "mobile",
@@ -142,6 +136,8 @@ def scrape_pdf_urls(
         match = pdf_name_re.search(href)
         if match:
             year, month_num = int(match.group(1)), int(match.group(2))
+            if not (1 <= month_num <= 12):
+                continue
             label = datetime(year, month_num, 1).strftime("%b %Y")
         else:
             meta = " ".join(unescape(link.get(key, "")) for key in ("title", "text"))
@@ -190,7 +186,7 @@ def build_download_url(
 
 
 def normalize_pdf_label(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    return _WS_RE.sub(" ", str(value or "").strip()).lower()
 
 
 def _extract_handle_and_revenue_from_line(line: str) -> tuple[float | None, float | None]:
@@ -208,8 +204,12 @@ def _extract_handle_and_revenue_from_line(line: str) -> tuple[float | None, floa
     return None, None
 
 
+_HAS_DIGIT_RE = re.compile(r"\d")
+_HAS_ALPHA_RE = re.compile(r"[A-Za-z]")
+
+
 def _is_label_only_line(normalized: str, raw_line: str) -> bool:
-    return normalized in LABEL_KEYWORDS and not re.search(r"\d", raw_line)
+    return normalized in LABEL_KEYWORDS and not _HAS_DIGIT_RE.search(raw_line)
 
 
 def _map_label_block(
@@ -233,7 +233,7 @@ def _map_label_block(
         if (
             normalized not in LABEL_KEYWORDS
             and len(AMOUNT_TOKEN_RE.findall(candidate)) >= 2
-            and not re.search(r"[A-Za-z]", candidate)
+            and not _HAS_ALPHA_RE.search(candidate)
         ):
             amount_lines.append(candidate)
         probe -= 1
@@ -271,8 +271,6 @@ def _extract_from_text(text: str) -> tuple[float, float, float | None, float | N
         total = (retail[0] + mobile[0], retail[1] + mobile[1])
     if total is None:
         return None
-    if total[0] is None or total[1] is None:
-        return None
     return (
         total[0],
         total[1],
@@ -288,7 +286,7 @@ def _looks_fragmented_text(text: str) -> bool:
     if not lines:
         return False
     single_char_lines = sum(1 for line in lines if len(line) == 1)
-    spaced_fragments = sum(1 for line in lines if re.search(r"(?:\b\w\s+){3,}\w\b", line))
+    spaced_fragments = sum(1 for line in lines if _SPACED_FRAGMENTS_RE.search(line))
     return single_char_lines >= 10 or spaced_fragments >= 3
 
 
@@ -301,13 +299,15 @@ def _extract_pdf_label(text: str) -> str | None:
     month_match = TEXT_MONTH_RE.search(text)
     if not month_match:
         return None
-    month_num = MONTH_NAMES[month_match.group(1).lower()]
+    month_num = MONTH_NAMES.get(month_match.group(1).lower())
     year = int(month_match.group(2))
+    if not month_num or not (1900 <= year <= 2100):
+        return None
     return datetime(year, month_num, 1).strftime("%b %Y")
 
 
 def _count_usable_words(text: str) -> int:
-    return len(re.findall(r"\b[\w$(),.-]+\b", text or ""))
+    return len(_USABLE_WORD_RE.findall(text or ""))
 
 
 def parse_summary_pdf(
@@ -417,30 +417,6 @@ def parse_local_file(
     return None
 
 
-def _try_fresh_cache(
-    path: str | None,
-    *,
-    ttl_seconds: float | None,
-    offline: bool,
-    hit_message: str,
-    log: Callable[[str], None],
-) -> bytes | None:
-    if not path or not os.path.isfile(path):
-        return None
-    if not offline and ttl_seconds is not None:
-        try:
-            age = time.time() - os.path.getmtime(path)
-        except OSError:
-            age = 0.0
-        if age > ttl_seconds:
-            return None
-    data = load_cache(path)
-    if data and data.startswith(b"%PDF"):
-        log(hit_message)
-        return data
-    return None
-
-
 def fetch(
     month_start: str | date | datetime | tuple[int, int],
     month_end: str | date | datetime | tuple[int, int] | None = None,
@@ -466,6 +442,7 @@ def fetch(
         year = mdate.year
         label = mdate.strftime("%b %Y")
         iso_month = format_iso_month(year, month)
+        ts_ym = f"{year}{month:02d}"
         ttl_seconds = 7 * 86400 if year >= current_year else None
         try:
             logger(f"INFO processing {label}")
@@ -482,55 +459,59 @@ def fetch(
 
             if summary_parsed is None:
                 summary_path = cache_path(cache_dir, f"kansas_{year}_{month:02d}.pdf")
-                summary_data = _try_fresh_cache(
-                    summary_path,
-                    ttl_seconds=ttl_seconds,
-                    offline=offline,
-                    hit_message=f"INFO using cached file for {label}",
-                    log=logger,
-                )
-                url: str | None = None
-                if summary_data is None and not offline:
+                fetched_summary_url: list[str] = []
+
+                def _fetch_summary(
+                    lbl: str = label,
+                    ts: str = ts_ym,
+                    out_url: list[str] = fetched_summary_url,
+                ) -> bytes | None:
+                    nonlocal summary_urls
                     if summary_urls is None:
                         summary_urls = scrape_pdf_urls(
                             KS_SUMMARY_PAGE, SUMMARY_PDF_NAME_RE, "summary", report=report, log=logger,
                         )
-                    url = build_download_url(
-                        label,
+                    target_url = build_download_url(
+                        lbl,
                         summary_urls,
                         kind="summary",
                         hashes=SUMMARY_PDF_HASHES,
                         filename_prefix="sports-wagering-monthly-revenue",
                         log=logger,
                     )
-                    if not url:
-                        logger(f"WARN {label}: no discovered or fallback PDF URL")
+                    if not target_url:
+                        logger(f"WARN {lbl}: no discovered or fallback PDF URL")
                         if report is not None:
-                            report.add_probe(f"{label}:summary", "(none)", reason="no-url")
-                    else:
-                        summary_ts = datetime.strptime(label, "%b %Y").strftime("%Y%m")
-                        summary_data = load_cached_or_fetch(
-                            cache_file=summary_path,
-                            fetcher=lambda u=url, ts=summary_ts: fetch_with_wayback_fallback(
-                                u, timestamp_yyyymm=ts, signature_check=b"%PDF", log=logger,
-                            ),
-                            log=logger,
-                            cache_hit_message=f"INFO using cached file for {label}",
-                            fetch_success_message=f"INFO {label}: downloaded from {url}",
-                            fetch_error_message=f"could not download Kansas PDF for {label}",
-                            validate=lambda payload: payload.startswith(b"%PDF"),
-                            cache_ttl_seconds=ttl_seconds,
-                            offline=offline,
+                            report.add_probe(f"{lbl}:summary", "(none)", reason="no-url")
+                        return None
+                    out_url[:] = [target_url]
+                    downloaded = fetch_with_wayback_fallback(
+                        target_url, timestamp_yyyymm=ts, signature_check=b"%PDF", log=logger,
+                    )
+                    if report is not None:
+                        report.add_probe(
+                            f"{lbl}:summary",
+                            target_url,
+                            status="ok" if downloaded else "fail",
+                            reason="downloaded" if downloaded else "fetch-failed",
                         )
-                        if report is not None:
-                            report.add_probe(
-                                f"{label}:summary",
-                                url,
-                                status="ok" if summary_data else "fail",
-                                reason="downloaded" if summary_data else "fetch-failed",
-                            )
-                else:
-                    url = build_download_url(
+                    return downloaded
+
+                summary_data = load_cached_or_fetch(
+                    cache_file=summary_path,
+                    fetcher=_fetch_summary,
+                    log=logger,
+                    cache_hit_message=f"INFO using cached file for {label}",
+                    fetch_success_message=f"INFO {label}: downloaded summary PDF",
+                    fetch_error_message=f"could not download Kansas PDF for {label}",
+                    validate=lambda payload: payload.startswith(b"%PDF"),
+                    cache_ttl_seconds=ttl_seconds,
+                    offline=offline,
+                )
+                url = (
+                    fetched_summary_url[0]
+                    if fetched_summary_url
+                    else build_download_url(
                         label,
                         summary_urls or {},
                         kind="summary",
@@ -538,6 +519,7 @@ def fetch(
                         filename_prefix="sports-wagering-monthly-revenue",
                         log=lambda _m: None,
                     )
+                )
                 if summary_data:
                     summary_parsed = parse_summary_pdf(summary_data, log=logger)
                     chosen_url = url or KS_SUMMARY_PAGE
@@ -551,53 +533,57 @@ def fetch(
             (handle, revenue), summary_strategy = summary_parsed
             retail_handle = retail_revenue = mobile_handle = mobile_revenue = None
             detail_path = cache_path(cache_dir, f"kansas_detail_{year}_{month:02d}.pdf")
-            detail_data = _try_fresh_cache(
-                detail_path,
-                ttl_seconds=ttl_seconds,
-                offline=offline,
-                hit_message=f"INFO using cached detail file for {label}",
-                log=logger,
-            )
-            detail_url: str | None = None
-            if detail_data is None and not offline:
+            fetched_detail_url: list[str] = []
+
+            def _fetch_detail(
+                lbl: str = label,
+                ts: str = ts_ym,
+                out_url: list[str] = fetched_detail_url,
+            ) -> bytes | None:
+                nonlocal detail_urls
                 if detail_urls is None:
                     detail_urls = scrape_pdf_urls(
                         KS_DETAIL_PAGE, DETAIL_PDF_NAME_RE, "detail", report=report, log=logger,
                     )
-                detail_url = build_download_url(
-                    label,
+                target_url = build_download_url(
+                    lbl,
                     detail_urls,
                     kind="detail",
                     hashes=DETAIL_PDF_HASHES,
                     filename_prefix="sports-wagering-monthly-detail",
                     log=logger,
                 )
-                if detail_url:
-                    detail_ts = datetime.strptime(label, "%b %Y").strftime("%Y%m")
-                    detail_data = load_cached_or_fetch(
-                        cache_file=detail_path,
-                        fetcher=lambda u=detail_url, ts=detail_ts: fetch_with_wayback_fallback(
-                            u, timestamp_yyyymm=ts, signature_check=b"%PDF", log=logger,
-                        ),
-                        log=logger,
-                        cache_hit_message=f"INFO using cached detail file for {label}",
-                        fetch_success_message=f"INFO {label}: downloaded detail from {detail_url}",
-                        fetch_error_message=f"could not download Kansas detail PDF for {label}",
-                        validate=lambda payload: payload.startswith(b"%PDF"),
-                        cache_ttl_seconds=ttl_seconds,
-                        offline=offline,
+                if not target_url:
+                    logger(f"INFO {lbl}: no detail PDF discovered; leaving split columns blank")
+                    return None
+                out_url[:] = [target_url]
+                downloaded = fetch_with_wayback_fallback(
+                    target_url, timestamp_yyyymm=ts, signature_check=b"%PDF", log=logger,
+                )
+                if report is not None:
+                    report.add_probe(
+                        f"{lbl}:detail",
+                        target_url,
+                        status="ok" if downloaded else "fail",
+                        reason="downloaded" if downloaded else "fetch-failed",
                     )
-                    if report is not None:
-                        report.add_probe(
-                            f"{label}:detail",
-                            detail_url,
-                            status="ok" if detail_data else "fail",
-                            reason="downloaded" if detail_data else "fetch-failed",
-                        )
-                else:
-                    logger(f"INFO {label}: no detail PDF discovered; leaving split columns blank")
-            else:
-                detail_url = build_download_url(
+                return downloaded
+
+            detail_data = load_cached_or_fetch(
+                cache_file=detail_path,
+                fetcher=_fetch_detail,
+                log=logger,
+                cache_hit_message=f"INFO using cached detail file for {label}",
+                fetch_success_message=f"INFO {label}: downloaded detail PDF",
+                fetch_error_message=f"could not download Kansas detail PDF for {label}",
+                validate=lambda payload: payload.startswith(b"%PDF"),
+                cache_ttl_seconds=ttl_seconds,
+                offline=offline,
+            )
+            detail_url = (
+                fetched_detail_url[0]
+                if fetched_detail_url
+                else build_download_url(
                     label,
                     detail_urls or {},
                     kind="detail",
@@ -605,6 +591,7 @@ def fetch(
                     filename_prefix="sports-wagering-monthly-detail",
                     log=lambda _m: None,
                 )
+            )
 
             if detail_data:
                 detail_parsed = parse_detail_pdf(detail_data, label, log=logger)
@@ -624,33 +611,27 @@ def fetch(
                 else:
                     logger(f"WARN {label}: detail PDF parse returned no split rows")
 
-            validated = validate_result(label, handle, revenue)
-            if validated is None:
-                continue
-            handle, revenue = validated
-            hold = hold_pct(handle, revenue)
-            retail_hold = hold_pct(retail_handle, retail_revenue) if retail_handle else None
-            mobile_hold = hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None
-            results.append(
-                StateMonthResult(
-                    state=STATE_NAME,
-                    month=iso_month,
-                    handle=handle,
-                    revenue=revenue,
-                    hold=hold,
-                    retail_handle=retail_handle,
-                    retail_revenue=retail_revenue,
-                    retail_hold=retail_hold,
-                    mobile_handle=mobile_handle,
-                    mobile_revenue=mobile_revenue,
-                    mobile_hold=mobile_hold,
-                    source_url=chosen_url,
-                )
+            item = finalize_state_month(
+                state=STATE_NAME,
+                iso_month=iso_month,
+                handle=handle,
+                revenue=revenue,
+                retail_handle=retail_handle,
+                retail_revenue=retail_revenue,
+                mobile_handle=mobile_handle,
+                mobile_revenue=mobile_revenue,
+                source_url=chosen_url,
+                reconcile_splits=False,
+                log=logger,
+                label=label,
             )
+            if item is None:
+                continue
+            results.append(item)
             logger(
-                f"INFO parsed {label} via {summary_strategy}: handle={handle:,.0f} revenue={revenue:,.0f} "
-                f"retail_handle={retail_handle if retail_handle is not None else 'n/a'} "
-                f"mobile_handle={mobile_handle if mobile_handle is not None else 'n/a'} hold={hold:.1f}%"
+                f"INFO parsed {label} via {summary_strategy}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
+                f"retail_handle={item.retail_handle if item.retail_handle is not None else 'n/a'} "
+                f"mobile_handle={item.mobile_handle if item.mobile_handle is not None else 'n/a'} hold={item.hold:.1f}%"
             )
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")

@@ -11,19 +11,17 @@ try:
 except ImportError:
     openpyxl = None
 
-from ..cache import cache_path, load_cached_or_fetch, save_cache
+from ..cache import cache_path, load_cached_or_fetch, refresh_cached_if_stale
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
-    OperatorMonthResult,
     StateMonthResult,
+    build_operator_results,
     build_state_logger,
+    finalize_state_month,
     format_iso_month,
-    hold_pct,
     log_skip,
-    reconcile_components,
     resolve_fetch_months,
-    validate_result,
 )
 from ..parse import find_sheet_fuzzy, is_number
 
@@ -31,10 +29,6 @@ STATE_NAME = "Ohio"
 LAUNCH_DATE: date | None = None
 EXTRA_HEADERS: list[str] = []
 HAS_DETAILS = True
-
-USER_AGENT = "Mozilla/5.0"
-HTTP_TIMEOUT = 30
-HTTP_RETRIES = 3
 
 _DEFAULT_LOG = build_state_logger("OH")
 
@@ -71,6 +65,8 @@ def download_cumulative_workbook(
     latest_report_number: int,
     report: DiscoveryReport | None = None,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    matched_url: list[str] | None = None,
 ) -> bytes | None:
     urls = candidate_workbook_urls(year, latest_report_number)
     return probe_url_variants(
@@ -81,6 +77,7 @@ def download_cumulative_workbook(
         log=log,
         report=report,
         report_key=f"{year}:cumulative",
+        matched_url=matched_url,
     )
 
 
@@ -118,15 +115,26 @@ def parse_month_sheet(
             continue
         if "subtotal type a online" in row_text:
             numeric = [float(cell) for cell in row if is_number(cell)]
-            online_handle, online_revenue = numeric[0], numeric[4]
+            if len(row) > 5 and is_number(row[1]) and is_number(row[5]):
+                online_handle, online_revenue = float(row[1]), float(row[5])
+            elif len(numeric) >= 5:
+                online_handle, online_revenue = numeric[0], numeric[4]
             section = None
         elif "subtotal type b retail" in row_text:
             numeric = [float(cell) for cell in row if is_number(cell)]
-            retail_handle, retail_revenue = numeric[0], numeric[4]
+            if len(row) > 5 and is_number(row[1]) and is_number(row[5]):
+                retail_handle, retail_revenue = float(row[1]), float(row[5])
+            elif len(numeric) >= 5:
+                retail_handle, retail_revenue = numeric[0], numeric[4]
             section = None
         elif "total online and retail" in row_text:
             numeric = [float(cell) for cell in row if is_number(cell)]
-            total_handle, total_revenue = numeric[0], numeric[4]
+            if len(row) > 5 and is_number(row[1]) and is_number(row[5]):
+                total_handle, total_revenue = float(row[1]), float(row[5])
+            elif len(numeric) >= 5:
+                total_handle, total_revenue = numeric[0], numeric[4]
+            else:
+                continue
             if None not in (online_handle, online_revenue, retail_handle, retail_revenue):
                 return (
                     total_handle,
@@ -193,13 +201,7 @@ def parse_cumulative_xlsx(
             ],
         ] = {}
         for month_name, _, _, label in target_months:
-            sheet = find_sheet_fuzzy(
-                workbook,
-                month_name.upper(),
-                month_name.capitalize(),
-                month_name,
-                month_name.title(),
-            )
+            sheet = find_sheet_fuzzy(workbook, month_name)
             if sheet is None:
                 continue
             parsed = parse_month_sheet(sheet)
@@ -292,16 +294,27 @@ def fetch(
         try:
             year_months = [entry for entry in months if int(entry[1]) == year]
             latest_report_number = max(int(month_num) for _, _, month_num, _ in year_months)
-            source_by_year[year] = candidate_workbook_urls(year, latest_report_number)[0]
+            found_urls: list[str] = []
+
+            def _download_oh(
+                y: int = year,
+                lrn: int = latest_report_number,
+                urls: list[str] = found_urls,
+            ) -> bytes | None:
+                try:
+                    return download_cumulative_workbook(y, lrn, report=report, log=logger, matched_url=urls)
+                except TypeError as exc:
+                    if "matched_url" not in str(exc):
+                        raise
+                    return download_cumulative_workbook(y, lrn, report=report, log=logger)
+
             parsed = parse_local_files(local_dir, year, year_months, log=logger) if local_dir else {}
             if not parsed:
                 path = _resolve_ohio_cache_path(cache_dir, year)
                 was_cached = bool(path and os.path.isfile(path))
                 data = load_cached_or_fetch(
                     cache_file=path,
-                    fetcher=lambda y=year, lrn=latest_report_number: download_cumulative_workbook(
-                        y, lrn, report=report, log=logger,
-                    ),
+                    fetcher=_download_oh,
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {year}",
                     fetch_error_message=f"could not download Ohio cumulative workbook for {year}",
@@ -311,13 +324,27 @@ def fetch(
                 )
                 if data:
                     parsed = parse_cumulative_xlsx(data, year_months, log=logger)
-                if was_cached and not offline and path and len(parsed) < len(year_months):
-                    fresh_data = download_cumulative_workbook(
-                        year, latest_report_number, report=report, log=logger,
+                latest_requested = max(date(int(yr), int(mo), 1) for _, yr, mo, _ in year_months)
+                if (
+                    was_cached
+                    and not offline
+                    and path
+                    and len(parsed) < len(year_months)
+                    and (date.today() - latest_requested).days <= 90
+                ):
+                    refreshed = refresh_cached_if_stale(
+                        path,
+                        data,
+                        fetcher=_download_oh,
+                        validate=lambda payload: payload.startswith(b"PK"),
+                        offline=offline,
+                        log=logger,
                     )
-                    if fresh_data and fresh_data.startswith(b"PK") and fresh_data != data:
-                        save_cache(path, fresh_data)
-                        parsed = parse_cumulative_xlsx(fresh_data, year_months, log=logger)
+                    if refreshed is not None:
+                        parsed = parse_cumulative_xlsx(refreshed, year_months, log=logger)
+            source_by_year[year] = (
+                found_urls[-1] if found_urls else candidate_workbook_urls(year, latest_report_number)[0]
+            )
             parsed_by_label.update(parsed)
         except Exception as exc:
             logger(f"WARN failed Ohio workbook processing for {year}: {exc}")
@@ -337,64 +364,28 @@ def fetch(
             mobile_revenue,
             details,
         ) = parsed_by_label[label]
-        validated = validate_result(label, total_handle, total_revenue)
-        if validated is None:
+        operator_details = build_operator_results(iso_month, details)
+        item = finalize_state_month(
+            state=STATE_NAME,
+            iso_month=iso_month,
+            handle=total_handle,
+            revenue=total_revenue,
+            retail_handle=retail_handle,
+            retail_revenue=retail_revenue,
+            mobile_handle=mobile_handle,
+            mobile_revenue=mobile_revenue,
+            source_url=source_by_year.get(mdate.year),
+            details=operator_details,
+            log=logger,
+            label=label,
+        )
+        if item is None:
             continue
-        handle, revenue = validated
-        retail_handle, retail_revenue, mobile_handle, mobile_revenue = reconcile_components(
-            label,
-            handle,
-            revenue,
-            retail_handle,
-            retail_revenue,
-            mobile_handle,
-            mobile_revenue,
-        )
-        hold = hold_pct(handle, revenue)
-        retail_hold = hold_pct(retail_handle, retail_revenue) if retail_handle else None
-        mobile_hold = hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None
-        operator_details: list[OperatorMonthResult] = []
-        for (
-            operator_name,
-            operator_handle,
-            operator_revenue,
-            operator_retail_handle,
-            operator_retail_revenue,
-            operator_mobile_handle,
-            operator_mobile_revenue,
-        ) in details:
-            operator_details.append(
-                OperatorMonthResult(
-                    month=iso_month,
-                    operator=operator_name,
-                    handle=operator_handle,
-                    revenue=operator_revenue,
-                    hold=hold_pct(operator_handle, operator_revenue),
-                    retail_handle=operator_retail_handle,
-                    retail_revenue=operator_retail_revenue,
-                    mobile_handle=operator_mobile_handle,
-                    mobile_revenue=operator_mobile_revenue,
-                )
-            )
-        results.append(
-            StateMonthResult(
-                state=STATE_NAME,
-                month=iso_month,
-                handle=handle,
-                revenue=revenue,
-                hold=hold,
-                retail_handle=retail_handle,
-                retail_revenue=retail_revenue,
-                retail_hold=retail_hold,
-                mobile_handle=mobile_handle,
-                mobile_revenue=mobile_revenue,
-                mobile_hold=mobile_hold,
-                source_url=source_by_year.get(mdate.year),
-                details=operator_details,
-            )
-        )
+        results.append(item)
         logger(
-            f"INFO {label}: handle={handle:,.0f} revenue={revenue:,.0f} "
-            f"retail_handle={retail_handle:,.0f} mobile_handle={mobile_handle:,.0f} hold={hold:.1f}%"
+            f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
+            f"retail_handle={f'{item.retail_handle:,.0f}' if item.retail_handle is not None else 'n/a'} "
+            f"mobile_handle={f'{item.mobile_handle:,.0f}' if item.mobile_handle is not None else 'n/a'} "
+            f"hold={(item.hold or 0.0):.1f}%"
         )
     return results
