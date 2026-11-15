@@ -16,6 +16,7 @@ from ..discover import DiscoveryReport, crawl_anchors, extract_month_label
 from ..http import fetch_with_wayback_fallback, probe_url_variants, retry_request
 from ..model import (
     StateMonthResult,
+    build_operator_results,
     build_state_logger,
     finalize_state_month,
     format_iso_month,
@@ -27,7 +28,7 @@ from ..parse import extract_pdf_text, parse_dollar
 STATE_NAME = "Illinois"
 LAUNCH_DATE: date | None = None
 EXTRA_HEADERS: list[str] = []
-HAS_DETAILS = False
+HAS_DETAILS = True
 
 USER_AGENT = "Mozilla/5.0"
 HTTP_TIMEOUT = 30
@@ -294,6 +295,80 @@ def parse_accrual_csv(data: bytes, log: Callable[[str], None] = _DEFAULT_LOG) ->
     return (retail_agr + mobile_agr, retail_agr, mobile_agr)
 
 
+def parse_csv_details(
+    cash_data: bytes,
+    accrual_data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
+    """Extract per-licensee retail/mobile handle and State AGR from Illinois CSV exports."""
+    cash_lines = cash_data.decode("utf-8-sig", errors="replace").splitlines()
+    cash_hdr = next((i for i, line in enumerate(cash_lines) if "Sport Level" in line and "Tier 1 Handle" in line), None)
+    accrual_lines = accrual_data.decode("utf-8-sig", errors="replace").splitlines()
+    accrual_hdr = next((i for i, line in enumerate(accrual_lines) if "Location Type" in line and "State AGR" in line), None)
+    if cash_hdr is None or accrual_hdr is None:
+        return []
+
+    by_licensee: dict[str, dict[str, float | bool]] = {}
+
+    def _entry(licensee: str) -> dict[str, float | bool]:
+        return by_licensee.setdefault(
+            licensee,
+            {
+                "rh": 0.0,
+                "rr": 0.0,
+                "mh": 0.0,
+                "mr": 0.0,
+                "has_retail": False,
+                "has_mobile": False,
+            },
+        )
+
+    for row in csv.DictReader(io.StringIO("\n".join(cash_lines[cash_hdr:]))):
+        licensee = " ".join(str(row.get("Licensee") or "").split())
+        location_type = classify_location_type(row.get("Location Type"))
+        if not licensee or location_type is None:
+            continue
+        tier1 = parse_dollar(row.get("Tier 1 Handle"))
+        tier2 = parse_dollar(row.get("Tier 2 Handle"))
+        if tier1 is None and tier2 is None:
+            continue
+        amount = (tier1 or 0.0) + (tier2 or 0.0)
+        rec = _entry(licensee)
+        if location_type == "retail":
+            rec["rh"] = float(rec["rh"]) + amount
+            rec["has_retail"] = True
+        else:
+            rec["mh"] = float(rec["mh"]) + amount
+            rec["has_mobile"] = True
+
+    for row in csv.DictReader(io.StringIO("\n".join(accrual_lines[accrual_hdr:]))):
+        licensee = " ".join(str(row.get("Licensee") or "").split())
+        location_type = classify_location_type(row.get("Location Type"))
+        state_agr = parse_dollar(row.get("State AGR"))
+        if not licensee or location_type is None or state_agr is None:
+            continue
+        rec = _entry(licensee)
+        if location_type == "retail":
+            rec["rr"] = float(rec["rr"]) + state_agr
+            rec["has_retail"] = True
+        else:
+            rec["mr"] = float(rec["mr"]) + state_agr
+            rec["has_mobile"] = True
+
+    details: list[tuple[str, float, float, float | None, float | None, float | None, float | None]] = []
+    for licensee, rec in by_licensee.items():
+        rh = float(rec["rh"]) if rec["has_retail"] else None
+        rr = float(rec["rr"]) if rec["has_retail"] else None
+        mh = float(rec["mh"]) if rec["has_mobile"] else None
+        mr = float(rec["mr"]) if rec["has_mobile"] else None
+        total_h = (rh or 0.0) + (mh or 0.0)
+        total_r = (rr or 0.0) + (mr or 0.0)
+        if total_h == 0.0 and total_r == 0.0:
+            continue
+        details.append((licensee, total_h, total_r, rh, rr, mh, mr))
+    return details
+
+
 def parse_local_file(
     local_dir: str,
     month_name: str,
@@ -339,6 +414,27 @@ def parse_local_file(
     return None
 
 
+def _read_local_csv_pair(local_dir: str, month_name: str, year: str) -> tuple[bytes | None, bytes | None]:
+    normalized_targets = {
+        f"{month_name}{year}swreport".lower(),
+        f"{month_name[:3]}{year}swreport".lower(),
+        f"{month_name}{year}".lower(),
+        f"{month_name[:3]}{year}".lower(),
+    }
+    cash_data = None
+    accrual_data = None
+    for entry in sorted(os.listdir(local_dir)):
+        lower = entry.replace(" ", "").lower()
+        if not lower.endswith(".csv") or not any(target in lower for target in normalized_targets):
+            continue
+        path = os.path.join(local_dir, entry)
+        if "detail" in lower:
+            with open(path, "rb") as file_handle:
+                cash_data = file_handle.read()
+        elif "tax" in lower:
+            with open(path, "rb") as file_handle:
+                accrual_data = file_handle.read()
+    return cash_data, accrual_data
 _ORIG_DOWNLOAD_PDF = download_pdf
 _ORIG_POST_REPORT_CSV = post_report_csv
 
@@ -484,11 +580,15 @@ def fetch(
                 logger(f"INFO processing {label}")
                 parsed_tuple = None
                 source_url: str | None = None
+                raw_csv_pair: tuple[bytes, bytes] | None = None
                 if local_dir:
                     parsed_tuple = parse_local_file(local_dir, month_name, year, log=logger)
                     if parsed_tuple:
                         logger(f"INFO parsed local export for {label}")
                         source_url = REPORT_URL
+                        local_cash, local_accrual = _read_local_csv_pair(local_dir, month_name, year)
+                        if local_cash and local_accrual:
+                            raw_csv_pair = (local_cash, local_accrual)
                 # 1. Check cached CSVs first without making any network calls.
                 cached_cash = None
                 cached_accrual = None
@@ -505,6 +605,7 @@ def fetch(
                         parsed_tuple = _try_parse_csv_pair(cached_cash, cached_accrual, label, logger)
                         if parsed_tuple is not None:
                             source_url = REPORT_URL
+                            raw_csv_pair = (cached_cash, cached_accrual)
                 # 2. Check cached legacy PDF without making any network calls.
                 cached_pdf = None
                 legacy_path = cache_path(cache_dir, f"illinois_{year}_{month_num}_legacy.pdf")
@@ -543,10 +644,20 @@ def fetch(
                         parsed_tuple = _try_parse_csv_pair(cash_csv, accrual_csv, label, logger)
                         if parsed_tuple is not None:
                             source_url = REPORT_URL
+                            if cash_csv and accrual_csv:
+                                raw_csv_pair = (cash_csv, accrual_csv)
                 if parsed_tuple is None:
                     log_skip(logger, label, "no parseable local export, legacy PDF, or CSV form result")
                     continue
                 handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue = parsed_tuple
+                operator_details = (
+                    build_operator_results(
+                        iso_month,
+                        parse_csv_details(raw_csv_pair[0], raw_csv_pair[1], log=logger),
+                    )
+                    if raw_csv_pair is not None
+                    else []
+                )
                 item = finalize_state_month(
                     state=STATE_NAME,
                     iso_month=iso_month,
@@ -557,6 +668,7 @@ def fetch(
                     mobile_handle=mobile_handle,
                     mobile_revenue=mobile_revenue,
                     source_url=source_url,
+                    details=operator_details,
                     log=logger,
                     label=label,
                 )

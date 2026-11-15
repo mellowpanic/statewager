@@ -515,3 +515,207 @@ def test_state_edge_cases_and_csv_null_roundtrip(tmp_path) -> None:
     assert loaded_blank[0].handle is None
     assert loaded_blank[0].revenue is None
     assert loaded_blank[0].hold is None
+
+
+def test_operator_normalization_and_brand_classification() -> None:
+    from statewager.operators import BRAND_ORDER, classify_operator_brand, normalize_operator_name
+
+    assert normalize_operator_name("JACK CLEVELAND (BETJACK)") == "Jack Cleveland - BetJack"
+    assert normalize_operator_name("FANATICS-AMERISTAR KC") == "Fanatics - Ameristar KC"
+    assert normalize_operator_name("KS CROSSING - CAESAR'S") == "Kansas Crossing - Caesars"
+    assert normalize_operator_name("WALKER'S BLUFF CASINO RESORT, LLC") == "Walker's Bluff Casino Resort, LLC"
+    assert normalize_operator_name("VALLEY FORGE CASINO¹") == "Valley Forge Casino"
+
+    # No residual multi-letter ALL-CAPS tokens outside known acronyms.
+    allowed_acronyms = {"LLC", "KC", "IA", "IL", "IN", "KS", "MO", "OH", "PA", "ESPN", "TSB", "betPARX"}
+    for raw in [
+        "HOLLYWOOD COLUMBUS - PENN INTERACTIVE (TSB)",
+        "BLUE CHIP CASINO",
+        "PAR-A-DICE GAMING CORPORATION",
+        "CAESARS SPORTSBOOK",
+    ]:
+        norm = normalize_operator_name(raw)
+        for tok in norm.replace(",", " ").replace("(", " ").replace(")", " ").split():
+            letters = "".join(ch for ch in tok if ch.isalpha())
+            if len(letters) >= 2 and letters.isupper():
+                assert tok in allowed_acronyms, f"Unexpected ALL-CAPS token {tok!r} in {norm!r}"
+
+    assert classify_operator_brand("Fairmount Park, Inc.", state="Illinois") == "FanDuel"
+    assert classify_operator_brand("Northside Crown Gaming LLC", state="Illinois") == "DraftKings"
+    assert classify_operator_brand("Alton Casino, LLC", state="Illinois") == "Fanatics"
+    assert classify_operator_brand("Hillside (Iowa) LLC", state="Iowa") == "bet365"
+    assert classify_operator_brand("Ameristar Casino (Retail)", state="Iowa") == "Other / Retail Venue"
+    assert classify_operator_brand("Kansas Star - Bet365", state="Kansas") == "bet365"
+    assert classify_operator_brand("HOLLYWOOD - THE SCORE", state="Missouri") in {"PENN / ESPN Bet", "Other / Retail Venue"}
+    assert classify_operator_brand("HOLLYWOOD - THESCORE", state="Missouri") == "PENN / ESPN Bet"
+    assert classify_operator_brand("Valley Forge Casino", state="Pennsylvania") == "FanDuel"
+    assert BRAND_ORDER[0] == "DraftKings"
+    assert BRAND_ORDER[-1] == "Other / Retail Venue"
+
+
+def test_seven_states_expose_has_details() -> None:
+    from statewager.states import ALL_STATES, load_state_module
+
+    detail_slugs = {
+        slug for slug in ALL_STATES if getattr(load_state_module(slug), "HAS_DETAILS", False)
+    }
+    assert detail_slugs == {
+        "illinois",
+        "indiana",
+        "iowa",
+        "kansas",
+        "missouri",
+        "ohio",
+        "pennsylvania",
+    }
+
+
+def test_detail_csv_extraction_dedup_merge_and_write(tmp_path) -> None:
+    from publish.csv_writer import (
+        DETAIL_CSV_HEADERS,
+        PublishedDetailRow,
+        extract_published_details,
+        merge_detail_results,
+        read_detail_csv,
+        write_combined_detail_csv,
+        write_state_detail_csv,
+    )
+    from statewager.model import OperatorMonthResult, StateMonthResult, finalize_state_month
+
+    # finalize_state_month prefers publish_details during publish while preserving details for downstream consumers.
+    indiana_res = finalize_state_month(
+        state="Indiana",
+        iso_month="2025-03",
+        handle=500.0,
+        revenue=50.0,
+        details=[
+            OperatorMonthResult("2025-03", "French Lick Resort", 300.0, 30.0, 10.0),
+        ],
+        publish_details=[
+            OperatorMonthResult("2025-03", "French Lick Resort - bet365", 200.0, 20.0, 10.0),
+            OperatorMonthResult("2025-03", "French Lick Resort - BetRivers", 100.0, 10.0, 10.0),
+        ],
+    )
+    assert indiana_res is not None
+    assert len(indiana_res.details) == 1
+    assert indiana_res.details[0].operator == "French Lick Resort"
+
+    # extract_published_details normalizes and sums duplicate normalized operators (e.g., mobile + retail lines).
+    ohio_res = finalize_state_month(
+        state="Ohio",
+        iso_month="2025-03",
+        handle=1000.0,
+        revenue=100.0,
+        source_url="https://example.com/oh.xlsx",
+        details=[
+            OperatorMonthResult(
+                "2025-03",
+                "BELTERRA PARK - FANDUEL",
+                600.0,
+                60.0,
+                10.0,
+                mobile_handle=600.0,
+                mobile_revenue=60.0,
+            ),
+            OperatorMonthResult(
+                "2025-03",
+                "Belterra Park - FanDuel",
+                400.0,
+                40.0,
+                10.0,
+                retail_handle=400.0,
+                retail_revenue=40.0,
+            ),
+        ],
+    )
+    assert ohio_res is not None
+    extracted = extract_published_details([indiana_res, ohio_res])
+    assert len(extracted) == 3
+    oh_row = next(r for r in extracted if r.state == "Ohio")
+    assert oh_row.operator == "Belterra Park - FanDuel"
+    assert oh_row.brand == "FanDuel"
+    assert oh_row.handle == 1000.0
+    assert oh_row.revenue == 100.0
+    assert oh_row.mobile_handle == 600.0
+    assert oh_row.retail_handle == 400.0
+
+    # Month-scoped merge replaces stale operators within a refreshed (state, month) while preserving older months.
+    existing = [
+        PublishedDetailRow("Ohio", "2025-02", "Old Op", "Other / Retail Venue", 10.0, 1.0, 10.0),
+        PublishedDetailRow("Ohio", "2025-03", "Stale Removed Op", "Other / Retail Venue", 50.0, 5.0, 10.0),
+    ]
+    merged = merge_detail_results(existing, [oh_row])
+    assert [(r.month, r.operator) for r in merged] == [
+        ("2025-02", "Old Op"),
+        ("2025-03", "Belterra Park - FanDuel"),
+    ]
+
+    details_dir = tmp_path / "details"
+    oh_csv = write_state_detail_csv(str(details_dir), "ohio", merged)
+    all_csv = write_combined_detail_csv(str(details_dir), merged)
+    assert oh_csv.endswith("ohio.csv") and all_csv.endswith("all.csv")
+    reloaded = read_detail_csv(oh_csv)
+    assert len(reloaded) == 2
+    assert reloaded[1].operator == "Belterra Park - FanDuel"
+    header_line = (details_dir / "ohio.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert header_line.split(",") == list(DETAIL_CSV_HEADERS)
+
+
+def test_index_html_has_entity_dropdown_and_detail_columns() -> None:
+    import json
+    import re
+    from publish.site import render_index_html
+
+    html = render_index_html()
+    assert 'id="entitySelect"' in html
+    assert 'id="detailCsvLink"' in html
+    assert 'id="kpiRowsLabel"' in html
+    assert 'data-col="operator"' in html
+    assert 'data-col="brand"' in html
+    assert "Not Disclosed by State Regulator" in html
+
+    m = re.search(r"const DETAIL_STATES = new Set\((\[.*?\])\);", html)
+    assert m is not None
+    detail_states = set(json.loads(m.group(1)))
+    assert detail_states == {
+        "illinois",
+        "indiana",
+        "iowa",
+        "kansas",
+        "missouri",
+        "ohio",
+        "pennsylvania",
+    }
+    assert "nevada" not in detail_states
+
+
+def test_indiana_spacer_columns_and_missouri_hyphen_spacing_regressions() -> None:
+    import pytest
+    openpyxl = pytest.importorskip("openpyxl")
+    from statewager.states import indiana, missouri
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet7"
+    ws.append(["INDIANA GAMING COMMISSION"])
+    ws.append(["SPORTS WAGERING AGR", "Handle", None, "Taxable AGR*", None, "Sports Wagering Tax"])
+    ws.append(["Ameristar Casino", 131476210.78, None, 16056131.55, None, 1525332.47])
+    ws.append(["TOTAL", 131476210.78, None, 16056131.55, None, 1525332.47])
+    locs = indiana.parse_location_totals(wb)
+    assert locs == {"Ameristar Casino": (131476210.78, 16056131.55)}
+    wb.close()
+
+    mo_page = "\n".join([
+        "SPORTS WAGERING MOBILE STATISTICAL REPORT",
+        "PENN SPORTS INTERACTIVE- MOBILE Dec-25 264,479 $6,253,851.56 $6,026,261.76 $227,589.80 $22,758.98",
+        "Jan-26 265,726 $6,722,817.56 $6,577,175.43 $145,642.13 $14,564.21",
+        "Feb-26 164,600 $5,141,463.54 $4,875,544.90 $265,918.64 $26,591.86",
+        "TOTALS: 694,805 $18,118,132.66 $17,478,982.09 $639,150.57 $63,915.06",
+    ])
+    mo_details = missouri.parse_report_details([mo_page], 2026, 2)
+    assert len(mo_details) == 1
+    assert mo_details[0][0] == "PENN SPORTS INTERACTIVE"
+    assert round(mo_details[0][1], 2) == 5141463.54
+    assert round(mo_details[0][2], 2) == 265918.64
+
+

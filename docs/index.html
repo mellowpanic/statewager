@@ -124,6 +124,11 @@
       background: #fff;
       color: var(--text);
     }
+    select:disabled {
+      background: #f1f5f9;
+      color: var(--muted);
+      cursor: not-allowed;
+    }
     .kpis {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -208,6 +213,7 @@
     }
     th:nth-child(1), td:nth-child(1),
     th:nth-child(2), td:nth-child(2),
+    th.col-text, td.col-text,
     th:last-child, td:last-child {
       text-align: left;
     }
@@ -249,6 +255,7 @@
       <div class="downloads">
         <a class="btn" href="data/all.csv" download>Download all.csv</a>
         <a class="btn" id="stateCsvLink" href="data/all.csv" download style="display:none">Download State CSV</a>
+        <a class="btn" id="detailCsvLink" href="data/details/all.csv" download style="display:none">Download Details CSV</a>
       </div>
     </div>
   </header>
@@ -271,6 +278,12 @@
           <option value="nevada">Nevada</option>
           <option value="ohio">Ohio</option>
           <option value="pennsylvania">Pennsylvania</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="entitySelect">Company / Venue</label>
+        <select id="entitySelect">
+          <option value="__STATE_TOTAL__">Statewide Totals (All States)</option>
         </select>
       </div>
       <div class="field">
@@ -304,7 +317,7 @@
       <div class="kpi"><div class="label">Total Revenue</div><div class="value" id="kpiRevenue">—</div></div>
       <div class="kpi"><div class="label">Blended Hold</div><div class="value" id="kpiHold">—</div></div>
       <div class="kpi"><div class="label">Mobile Handle Share</div><div class="value" id="kpiMobileShare">—</div></div>
-      <div class="kpi"><div class="label">State-Months</div><div class="value" id="kpiRows">—</div></div>
+      <div class="kpi"><div class="label" id="kpiRowsLabel">State-Months</div><div class="value" id="kpiRows">—</div></div>
     </section>
 
     <section class="card">
@@ -327,15 +340,17 @@
             <tr>
               <th data-col="month">Month</th>
               <th data-col="state">State</th>
+              <th data-col="operator" class="col-text detail-col" style="display:none">Company / Venue</th>
+              <th data-col="brand" class="col-text detail-col" style="display:none">Brand</th>
               <th data-col="handle">Handle</th>
               <th data-col="revenue">Revenue</th>
               <th data-col="hold">Hold %</th>
-              <th data-col="retail_handle">Retail Handle</th>
-              <th data-col="retail_revenue">Retail Revenue</th>
-              <th data-col="retail_hold">Retail Hold %</th>
-              <th data-col="mobile_handle">Mobile Handle</th>
-              <th data-col="mobile_revenue">Mobile Revenue</th>
-              <th data-col="mobile_hold">Mobile Hold %</th>
+              <th data-col="retail_handle" class="channel-col">Retail Handle</th>
+              <th data-col="retail_revenue" class="channel-col">Retail Revenue</th>
+              <th data-col="retail_hold" class="channel-col">Retail Hold %</th>
+              <th data-col="mobile_handle" class="channel-col">Mobile Handle</th>
+              <th data-col="mobile_revenue" class="channel-col">Mobile Revenue</th>
+              <th data-col="mobile_hold" class="channel-col">Mobile Hold %</th>
               <th>Source</th>
             </tr>
           </thead>
@@ -349,16 +364,27 @@
 
   <script>
     (function () {
+      const DETAIL_STATES = new Set(["illinois", "indiana", "iowa", "kansas", "missouri", "ohio", "pennsylvania"]);
+      const BRAND_ORDER = ["DraftKings", "FanDuel", "BetMGM", "Fanatics", "Caesars", "bet365", "PENN / ESPN Bet", "BetRivers", "Hard Rock Bet", "betPARX", "Circa Sports", "Bally Bet", "BetJack", "Other / Retail Venue"];
       const csvCache = new Map();
+      const detailCsvCache = new Map();
+      let activeStateRows = [];
+      let activeDetailRows = [];
       let activeRows = [];
       let allStatesCount = 10;
       let hasMissouri = true;
+      let stateMinDetailMonth = new Map();
+      let stateLatestDetailMonth = new Map();
+      let detailDisclosingStates = [];
+      let brandFirstMonth = new Map();
+      let brandLastMonth = new Map();
       let userChangedFrom = false;
       let userChangedTo = false;
       let sortCol = "month";
       let sortAsc = false;
 
       const stateSelect = document.getElementById("stateSelect");
+      const entitySelect = document.getElementById("entitySelect");
       const metricSelect = document.getElementById("metricSelect");
       const fromMonthInput = document.getElementById("fromMonth");
       const toMonthInput = document.getElementById("toMonth");
@@ -367,6 +393,8 @@
       const chartNote = document.getElementById("chartNote");
       const statusBanner = document.getElementById("statusBanner");
       const stateCsvLink = document.getElementById("stateCsvLink");
+      const detailCsvLink = document.getElementById("detailCsvLink");
+      const kpiRowsLabel = document.getElementById("kpiRowsLabel");
       const chartSvg = document.getElementById("chartSvg");
       const tooltip = document.getElementById("tooltip");
 
@@ -404,7 +432,7 @@
         return Number.isFinite(n) ? n : null;
       }
 
-      function parseCsv(text) {
+      function parseCsvObjects(text) {
         const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.trim().length > 0);
         if (lines.length <= 1) return [];
         const headers = parseCsvLine(lines[0]);
@@ -412,21 +440,27 @@
           const cols = parseCsvLine(line);
           const raw = {};
           headers.forEach((h, idx) => { raw[h] = cols[idx] ?? ""; });
-          return {
-            state: raw.state,
-            month: raw.month,
-            handle: toNum(raw.handle),
-            revenue: toNum(raw.revenue),
-            hold: toNum(raw.hold),
-            retail_handle: toNum(raw.retail_handle),
-            retail_revenue: toNum(raw.retail_revenue),
-            retail_hold: toNum(raw.retail_hold),
-            mobile_handle: toNum(raw.mobile_handle),
-            mobile_revenue: toNum(raw.mobile_revenue),
-            mobile_hold: toNum(raw.mobile_hold),
-            source_url: raw.source_url || ""
-          };
+          return raw;
         });
+      }
+
+      function parseNormalizedCsv(text) {
+        return parseCsvObjects(text).map((raw) => ({
+          state: raw.state || "",
+          month: raw.month || "",
+          operator: raw.operator || "",
+          brand: raw.brand || "",
+          handle: toNum(raw.handle),
+          revenue: toNum(raw.revenue),
+          hold: toNum(raw.hold),
+          retail_handle: toNum(raw.retail_handle),
+          retail_revenue: toNum(raw.retail_revenue),
+          retail_hold: toNum(raw.retail_hold),
+          mobile_handle: toNum(raw.mobile_handle),
+          mobile_revenue: toNum(raw.mobile_revenue),
+          mobile_hold: toNum(raw.mobile_hold),
+          source_url: raw.source_url || ""
+        }));
       }
 
       async function fetchCsvRows(slug) {
@@ -434,10 +468,32 @@
         if (csvCache.has(url)) return csvCache.get(url);
         const resp = await fetch(url);
         if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
-        const text = await resp.text();
-        const rows = parseCsv(text);
+        const rows = parseNormalizedCsv(await resp.text());
         csvCache.set(url, rows);
         return rows;
+      }
+
+      async function fetchDetailRows(slug) {
+        if (slug !== "__ALL__" && !DETAIL_STATES.has(slug)) return [];
+        const url = slug === "__ALL__" ? "data/details/all.csv" : `data/details/${slug}.csv`;
+        if (detailCsvCache.has(url)) return detailCsvCache.get(url);
+        const resp = await fetch(url);
+        if (resp.status === 404) {
+          detailCsvCache.set(url, []);
+          return [];
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
+        const rows = parseNormalizedCsv(await resp.text());
+        detailCsvCache.set(url, rows);
+        return rows;
+      }
+
+      function isDetailView() {
+        return entitySelect.value !== "__STATE_TOTAL__";
+      }
+
+      function isMultiStateView() {
+        return stateSelect.value === "__ALL__" && !entitySelect.value.startsWith("op:");
       }
 
       const moneyFmt = new Intl.NumberFormat("en-US", {
@@ -502,13 +558,59 @@
         document.getElementById("kpiRows").textContent = String(rows.length);
       }
 
+      function updateDetailCompletenessMeta(entityRows) {
+        stateMinDetailMonth = new Map();
+        stateLatestDetailMonth = new Map();
+        activeDetailRows.forEach((r) => {
+          const minM = stateMinDetailMonth.get(r.state);
+          if (!minM || r.month < minM) stateMinDetailMonth.set(r.state, r.month);
+          const maxM = stateLatestDetailMonth.get(r.state);
+          if (!maxM || r.month > maxM) stateLatestDetailMonth.set(r.state, r.month);
+        });
+        detailDisclosingStates = Array.from(stateMinDetailMonth.keys());
+
+        brandFirstMonth = new Map();
+        brandLastMonth = new Map();
+        entityRows.forEach((r) => {
+          const firstM = brandFirstMonth.get(r.state);
+          if (!firstM || r.month < firstM) brandFirstMonth.set(r.state, r.month);
+          const lastM = brandLastMonth.get(r.state);
+          if (!lastM || r.month > lastM) brandLastMonth.set(r.state, r.month);
+        });
+      }
+
       function expectedStatesForMonth(month) {
-        if (stateSelect.value !== "__ALL__") return 1;
-        return Math.max(1, allStatesCount - (hasMissouri && month < "2025-12" ? 1 : 0));
+        if (!isMultiStateView()) return 1;
+        if (!isDetailView()) {
+          return Math.max(1, allStatesCount - (hasMissouri && month < "2025-12" ? 1 : 0));
+        }
+        const ent = entitySelect.value;
+        if (ent === "__ALL_DETAILS__") {
+          let exp = 0;
+          detailDisclosingStates.forEach((s) => {
+            if (s !== "Missouri" || month >= "2025-12") exp += 1;
+          });
+          return Math.max(1, exp);
+        }
+        let exp = 0;
+        brandFirstMonth.forEach((bFirst, s) => {
+          if (s === "Missouri" && month < "2025-12") return;
+          const stateMin = stateMinDetailMonth.get(s) || bFirst;
+          const stateMax = stateLatestDetailMonth.get(s);
+          const bLast = brandLastMonth.get(s);
+          const launchedOrPreHistory = (month < stateMin) || (bFirst <= month);
+          const stillActive = (month <= bLast) || (bLast >= stateMax);
+          if (launchedOrPreHistory && stillActive) exp += 1;
+        });
+        return Math.max(1, exp);
       }
 
       function isMonthComplete(month, count) {
-        return count >= Math.max(1, expectedStatesForMonth(month) - 1);
+        const expected = expectedStatesForMonth(month);
+        if (isDetailView()) {
+          return count >= expected;
+        }
+        return count >= Math.max(1, expected - 1);
       }
 
       function svgEl(tag, attrs, text) {
@@ -551,17 +653,21 @@
       }
 
       function renderChart(rows) {
-        const isAll = stateSelect.value === "__ALL__";
+        const multi = isMultiStateView();
+        const detail = isDetailView();
         const metric = metricSelect.value;
         const metricLabel = metricSelect.options[metricSelect.selectedIndex].text;
         const stateLabel = stateSelect.options[stateSelect.selectedIndex].text;
-        document.getElementById("chartTitle").textContent = `${stateLabel} — ${metricLabel}`;
+        const entityLabel = entitySelect.options[entitySelect.selectedIndex]?.text || "";
+        document.getElementById("chartTitle").textContent = detail
+          ? `${stateLabel} — ${entityLabel} — ${metricLabel}`
+          : `${stateLabel} — ${metricLabel}`;
 
         const rawSeries = aggregateByMonth(rows, metric);
         let series = rawSeries;
         let hiddenPartial = 0;
         let fallbackToPartial = false;
-        if (isAll && !includePartialInput.checked) {
+        if (multi && !includePartialInput.checked) {
           const completeOnly = rawSeries.filter((pt) => pt.complete);
           if (completeOnly.length) {
             hiddenPartial = rawSeries.length - completeOnly.length;
@@ -570,17 +676,20 @@
             fallbackToPartial = true;
           }
         }
-        if (!isAll) {
-          chartNote.textContent = "";
+        if (!multi) {
+          chartNote.textContent = detail && stateSelect.value !== "__ALL__"
+            ? (entitySelect.value.startsWith("brand:") ? "Normalized brand rollup from state regulator disclosures" : "")
+            : "";
         } else if (hiddenPartial > 0) {
-          chartNote.textContent = `Showing ${series.length} full-panel months (${hiddenPartial} partial month${hiddenPartial === 1 ? "" : "s"} hidden)`;
+          const scopeNote = detail ? " across disclosing states" : "";
+          chartNote.textContent = `Showing ${series.length} full-panel months${scopeNote} (${hiddenPartial} partial month${hiddenPartial === 1 ? "" : "s"} hidden)`;
         } else if (fallbackToPartial) {
-          chartNote.textContent = "All months in selected range have partial state coverage (dashed bars)";
+          chartNote.textContent = `All months in selected range have partial ${detail ? "disclosing-state" : "state"} coverage (dashed bars)`;
         } else {
           const partialVisible = series.filter((pt) => pt.partial).length;
           chartNote.textContent = partialVisible
             ? `${partialVisible} partial-coverage month${partialVisible === 1 ? "" : "s"} shown with dashed outline`
-            : "";
+            : (detail ? "7 disclosing states (LA, MS, NV do not disclose operators)" : "");
         }
         chartSvg.innerHTML = "";
         if (!series.length) return;
@@ -629,7 +738,7 @@
           const rectH = Math.max(2, Math.abs(zeroY - yVal));
           const isNeg = pt.value < 0;
           const attrs = { x, y: rectY, width: barW, height: rectH, rx: 3 };
-          if (pt.partial && isAll) {
+          if (pt.partial && multi) {
             attrs.fill = isNeg ? "#fca5a5" : "#93c5fd";
             attrs.stroke = isNeg ? "#dc2626" : "#2563eb";
             attrs["stroke-width"] = 1.5;
@@ -640,8 +749,8 @@
           const rect = svgEl("rect", attrs);
 
           const formatted = metric === "hold" ? fmtPct(pt.value) : fmtMoney(pt.value);
-          const countInfo = isAll
-            ? ` (${pt.count}/${pt.expected} states${pt.partial ? " — partial" : ""})`
+          const countInfo = multi
+            ? ` (${pt.count}/${pt.expected} ${detail ? "disclosing states" : "states"}${pt.partial ? " — partial" : ""})`
             : "";
           rect.addEventListener("mousemove", (ev) => {
             tooltip.style.display = "block";
@@ -654,7 +763,7 @@
           });
           chartSvg.appendChild(rect);
 
-          if (pt.partial && isAll && barW >= 14) {
+          if (pt.partial && multi && barW >= 14) {
             const badgeY = isNeg
               ? Math.min(H - 28, rectY + rectH + 11)
               : Math.max(12, rectY - 4);
@@ -688,11 +797,29 @@
         }
       }
 
+      function activeHasRetail() {
+        return activeRows.some((r) => r.retail_handle !== null || r.retail_revenue !== null);
+      }
+
+      function activeHasMobile() {
+        return activeRows.some((r) => r.mobile_handle !== null || r.mobile_revenue !== null);
+      }
+
+      function activeShowChannels() {
+        return !isDetailView() || activeHasRetail() || activeHasMobile();
+      }
+
       function renderTable(rows) {
+        const detail = isDetailView();
+        const showChannels = activeShowChannels();
         const sorted = [...rows].sort((a, b) => {
           const av = a[sortCol];
           const bv = b[sortCol];
-          if (av === bv) return b.month.localeCompare(a.month) || a.state.localeCompare(b.state);
+          if (av === bv) {
+            return b.month.localeCompare(a.month)
+              || a.state.localeCompare(b.state)
+              || (a.operator || "").localeCompare(b.operator || "");
+          }
           if (av === null) return 1;
           if (bv === null) return -1;
           const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
@@ -705,22 +832,34 @@
         sorted.forEach((r) => {
           const tr = document.createElement("tr");
           const cells = [
-            [r.month, false],
-            [r.state, false],
-            [fmtMoney(r.handle), false],
-            [fmtMoney(r.revenue), r.revenue !== null && r.revenue < 0],
-            [fmtPct(r.hold), r.hold !== null && r.hold < 0],
-            [fmtMoney(r.retail_handle), false],
-            [fmtMoney(r.retail_revenue), r.retail_revenue !== null && r.retail_revenue < 0],
-            [fmtPct(r.retail_hold), r.retail_hold !== null && r.retail_hold < 0],
-            [fmtMoney(r.mobile_handle), false],
-            [fmtMoney(r.mobile_revenue), r.mobile_revenue !== null && r.mobile_revenue < 0],
-            [fmtPct(r.mobile_hold), r.mobile_hold !== null && r.mobile_hold < 0]
+            [r.month, false, true],
+            [r.state, false, true]
           ];
-          cells.forEach(([text, isNeg]) => {
+          if (detail) {
+            cells.push([r.operator || "—", false, true]);
+            cells.push([r.brand || "—", false, true]);
+          }
+          cells.push(
+            [fmtMoney(r.handle), false, false],
+            [fmtMoney(r.revenue), r.revenue !== null && r.revenue < 0, false],
+            [fmtPct(r.hold), r.hold !== null && r.hold < 0, false]
+          );
+          if (showChannels) {
+            cells.push(
+              [fmtMoney(r.retail_handle), false, false],
+              [fmtMoney(r.retail_revenue), r.retail_revenue !== null && r.retail_revenue < 0, false],
+              [fmtPct(r.retail_hold), r.retail_hold !== null && r.retail_hold < 0, false],
+              [fmtMoney(r.mobile_handle), false, false],
+              [fmtMoney(r.mobile_revenue), r.mobile_revenue !== null && r.mobile_revenue < 0, false],
+              [fmtPct(r.mobile_hold), r.mobile_hold !== null && r.mobile_hold < 0, false]
+            );
+          }
+          cells.forEach(([text, isNeg, isTextCol]) => {
             const td = document.createElement("td");
             td.textContent = text;
-            if (isNeg) td.className = "neg";
+            if (isTextCol && isNeg) td.className = "col-text neg";
+            else if (isTextCol) td.className = "col-text";
+            else if (isNeg) td.className = "neg";
             tr.appendChild(td);
           });
           const srcTd = document.createElement("td");
@@ -769,7 +908,7 @@
         const months = activeRows.map((r) => r.month).sort();
         let defaultFrom = months[0];
         let defaultTo = months[months.length - 1];
-        if (stateSelect.value === "__ALL__" && !includePartialInput.checked) {
+        if (isMultiStateView() && !includePartialInput.checked) {
           const completeMonths = completeMonthsList(activeRows);
           if (completeMonths.length) {
             defaultFrom = completeMonths[0];
@@ -780,26 +919,200 @@
         if (forceToEnd || !userChangedTo || !toMonthInput.value) toMonthInput.value = defaultTo;
       }
 
+      function populateEntitySelect(slug, detailRows, preferredVal) {
+        entitySelect.innerHTML = "";
+        if (slug !== "__ALL__" && !DETAIL_STATES.has(slug)) {
+          const opt = document.createElement("option");
+          opt.value = "__STATE_TOTAL__";
+          opt.textContent = "Not Disclosed by State Regulator";
+          entitySelect.appendChild(opt);
+          entitySelect.value = "__STATE_TOTAL__";
+          entitySelect.disabled = true;
+          return;
+        }
+
+        entitySelect.disabled = false;
+        const totalOpt = document.createElement("option");
+        totalOpt.value = "__STATE_TOTAL__";
+        totalOpt.textContent = slug === "__ALL__"
+          ? "Statewide Totals (All States)"
+          : "Statewide Totals";
+        entitySelect.appendChild(totalOpt);
+
+        if (!detailRows.length) {
+          entitySelect.value = "__STATE_TOTAL__";
+          return;
+        }
+
+        const allDetailOpt = document.createElement("option");
+        allDetailOpt.value = "__ALL_DETAILS__";
+        allDetailOpt.textContent = slug === "__ALL__"
+          ? "All Disclosed Venues (7 States)"
+          : "All Disclosed Companies & Venues";
+        entitySelect.appendChild(allDetailOpt);
+
+        const stateLabel = stateSelect.options[stateSelect.selectedIndex]?.text || "";
+        const presentBrands = new Set(detailRows.map((r) => r.brand).filter(Boolean));
+        const orderedBrands = BRAND_ORDER.filter((b) => presentBrands.has(b));
+        Array.from(presentBrands)
+          .filter((b) => !BRAND_ORDER.includes(b))
+          .sort((a, b) => a.localeCompare(b))
+          .forEach((b) => orderedBrands.push(b));
+
+        if (orderedBrands.length) {
+          const brandGroup = document.createElement("optgroup");
+          brandGroup.label = slug === "__ALL__"
+            ? "Operator Brands (7 Disclosing States)"
+            : `${stateLabel} — Operator Brands`;
+          orderedBrands.forEach((b) => {
+            const o = document.createElement("option");
+            o.value = `brand:${b}`;
+            o.textContent = b;
+            brandGroup.appendChild(o);
+          });
+          entitySelect.appendChild(brandGroup);
+        }
+
+        const venuePairs = new Map();
+        detailRows.forEach((r) => {
+          if (!r.operator) return;
+          const key = JSON.stringify([r.state, r.operator]);
+          if (!venuePairs.has(key)) venuePairs.set(key, { state: r.state, operator: r.operator });
+        });
+        const sortedVenues = Array.from(venuePairs.entries()).sort((a, b) => {
+          const va = a[1], vb = b[1];
+          return va.state.localeCompare(vb.state) || va.operator.localeCompare(vb.operator);
+        });
+        if (sortedVenues.length) {
+          const venueGroup = document.createElement("optgroup");
+          venueGroup.label = slug === "__ALL__"
+            ? "Companies / Venues by State"
+            : `${stateLabel} — Companies / Venues`;
+          sortedVenues.forEach(([key, pair]) => {
+            const o = document.createElement("option");
+            o.value = `op:${key}`;
+            o.textContent = slug === "__ALL__" ? `${pair.state} — ${pair.operator}` : pair.operator;
+            venueGroup.appendChild(o);
+          });
+          entitySelect.appendChild(venueGroup);
+        }
+
+        const hasPreferred = preferredVal && Array.from(entitySelect.options).some((o) => o.value === preferredVal);
+        entitySelect.value = hasPreferred ? preferredVal : "__STATE_TOTAL__";
+      }
+
+      function resolveActiveRows() {
+        const ent = entitySelect.value;
+        if (ent === "__STATE_TOTAL__") {
+          activeRows = activeStateRows;
+          updateDetailCompletenessMeta([]);
+          return;
+        }
+        if (ent === "__ALL_DETAILS__") {
+          activeRows = activeDetailRows;
+          updateDetailCompletenessMeta(activeDetailRows);
+          return;
+        }
+        if (ent.startsWith("brand:")) {
+          const brand = ent.slice(6);
+          activeRows = activeDetailRows.filter((r) => r.brand === brand);
+          updateDetailCompletenessMeta(activeRows);
+          return;
+        }
+        if (ent.startsWith("op:")) {
+          const [targetState, targetOp] = JSON.parse(ent.slice(3));
+          activeRows = activeDetailRows.filter((r) => r.state === targetState && r.operator === targetOp);
+          updateDetailCompletenessMeta(activeRows);
+          return;
+        }
+        activeRows = activeStateRows;
+      }
+
+      function syncControlsAndSelection() {
+        const detail = isDetailView();
+        const multi = isMultiStateView();
+        const slug = stateSelect.value;
+
+        partialField.style.display = multi ? "" : "none";
+        kpiRowsLabel.textContent = detail ? "Operator-Months" : "State-Months";
+
+        if (slug === "__ALL__") {
+          stateCsvLink.style.display = "none";
+        } else {
+          stateCsvLink.href = `data/${slug}.csv`;
+          stateCsvLink.textContent = `Download ${slug}.csv`;
+          stateCsvLink.style.display = "inline-flex";
+        }
+
+        if (detail && slug === "__ALL__") {
+          detailCsvLink.href = "data/details/all.csv";
+          detailCsvLink.textContent = "Download details/all.csv";
+          detailCsvLink.style.display = "inline-flex";
+        } else if (slug !== "__ALL__" && DETAIL_STATES.has(slug) && activeDetailRows.length) {
+          detailCsvLink.href = `data/details/${slug}.csv`;
+          detailCsvLink.textContent = `Download ${slug} details CSV`;
+          detailCsvLink.style.display = "inline-flex";
+        } else {
+          detailCsvLink.style.display = "none";
+        }
+
+        const showChannels = activeShowChannels();
+        const allowMobile = !detail || activeHasMobile();
+        const allowRetail = !detail || activeHasRetail();
+
+        Array.from(metricSelect.options).forEach((opt) => {
+          if (opt.value === "mobile_handle") opt.disabled = !allowMobile;
+          else if (opt.value === "retail_handle") opt.disabled = !allowRetail;
+        });
+        if ((!allowMobile && metricSelect.value === "mobile_handle") || (!allowRetail && metricSelect.value === "retail_handle")) {
+          metricSelect.value = "handle";
+        }
+
+        document.querySelectorAll("th.detail-col").forEach((th) => {
+          th.style.display = detail ? "" : "none";
+        });
+        document.querySelectorAll("th.channel-col").forEach((th) => {
+          th.style.display = showChannels ? "" : "none";
+        });
+
+        if (!showChannels && (sortCol.startsWith("retail_") || sortCol.startsWith("mobile_"))) {
+          sortCol = "month";
+          sortAsc = false;
+        } else if (!detail && (sortCol === "operator" || sortCol === "brand")) {
+          sortCol = "month";
+          sortAsc = false;
+        }
+      }
+
+      function onEntityChange() {
+        resolveActiveRows();
+        syncControlsAndSelection();
+        applyDefaultDateBounds();
+        refreshView();
+      }
+
       async function loadSelection() {
         const slug = stateSelect.value;
+        const prevEntity = entitySelect.value;
         try {
           statusBanner.className = "status";
           statusBanner.style.display = "block";
           statusBanner.textContent = `Loading ${slug === "__ALL__" ? "data/all.csv" : "data/" + slug + ".csv"}…`;
-          activeRows = await fetchCsvRows(slug);
+          const [stateRows, detailRows] = await Promise.all([
+            fetchCsvRows(slug),
+            fetchDetailRows(slug)
+          ]);
+          activeStateRows = stateRows;
+          activeDetailRows = detailRows;
           statusBanner.style.display = "none";
-          const isAll = slug === "__ALL__";
-          partialField.style.display = isAll ? "" : "none";
-          if (isAll) {
-            const distinctStates = new Set(activeRows.map((r) => r.state));
+          if (slug === "__ALL__") {
+            const distinctStates = new Set(activeStateRows.map((r) => r.state));
             allStatesCount = distinctStates.size || 1;
             hasMissouri = distinctStates.has("Missouri");
-            stateCsvLink.style.display = "none";
-          } else {
-            stateCsvLink.href = `data/${slug}.csv`;
-            stateCsvLink.textContent = `Download ${slug}.csv`;
-            stateCsvLink.style.display = "inline-flex";
           }
+          populateEntitySelect(slug, activeDetailRows, prevEntity);
+          resolveActiveRows();
+          syncControlsAndSelection();
           applyDefaultDateBounds();
           refreshView();
         } catch (err) {
@@ -816,13 +1129,14 @@
             sortAsc = !sortAsc;
           } else {
             sortCol = col;
-            sortAsc = col === "state" || col === "month";
+            sortAsc = col === "state" || col === "month" || col === "operator" || col === "brand";
           }
           renderTable(filteredRows());
         });
       });
 
       stateSelect.addEventListener("change", loadSelection);
+      entitySelect.addEventListener("change", onEntityChange);
       metricSelect.addEventListener("change", refreshView);
       fromMonthInput.addEventListener("change", () => {
         userChangedFrom = true;

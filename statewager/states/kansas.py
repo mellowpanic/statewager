@@ -20,6 +20,7 @@ from ..discover import MONTH_NAMES, TEXT_MONTH_RE, DiscoveryReport, crawl_anchor
 from ..http import fetch_with_wayback_fallback
 from ..model import (
     StateMonthResult,
+    build_operator_results,
     build_state_logger,
     finalize_state_month,
     format_iso_month,
@@ -31,7 +32,7 @@ from ..parse import extract_pdf_text, extract_pdf_text_with_ocr, parse_dollar
 STATE_NAME = "Kansas"
 LAUNCH_DATE: date | None = date(2022, 9, 1)
 EXTRA_HEADERS: list[str] = []
-HAS_DETAILS = False
+HAS_DETAILS = True
 
 KS_LOTTERY_BASE = "https://www.kslottery.gov"
 KS_SUMMARY_PAGE = f"{KS_LOTTERY_BASE}/publications/sports-monthly-revenues/"
@@ -105,6 +106,40 @@ DETAIL_IMAGE_OVERRIDES = {
         12011851.0,
     ),
 }
+
+DETAIL_OPERATOR_OVERRIDES: dict[
+    str,
+    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+] = {
+    "Aug 2025": [
+        ("Boot Hill - DraftKings", 76436807.0, 5445804.0, 231476.0, 33351.0, 76205331.0, 5412453.0),
+        ("Kansas Star - FanDuel", 59032691.0, 5010090.0, 760887.0, 123141.0, 58271804.0, 4886949.0),
+        ("Hollywood - ESPNBet", 6931050.0, 909344.0, 1859461.0, 368936.0, 5071589.0, 540408.0),
+        ("KS Crossing - Caesar's", 7955037.0, 29071.0, 142786.0, 24293.0, 7812251.0, 4778.0),
+        ("Kansas Star - BET365", 5472548.0, 0.0, None, None, 5472548.0, 0.0),
+        ("KS Crossing - BetMGM", 15234535.0, 0.0, None, None, 15234535.0, 0.0),
+        ("KS Crossing - Fanatics", 18740258.0, 1077920.0, None, None, 18740258.0, 1077920.0),
+    ],
+    "Oct 2025": [
+        ("Boot Hill - DraftKings", 129328220.0, 6149917.0, 317098.0, 39225.0, 129011122.0, 6110692.0),
+        ("Kansas Star - FanDuel", 103241281.0, 3421281.0, 1649661.0, 103518.0, 101591620.0, 3317763.0),
+        ("Hollywood - ESPNBet", 13882301.0, 732244.0, 4020004.0, 436564.0, 9862297.0, 295680.0),
+        ("KS Crossing - Caesar's", 11029199.0, 142226.0, 536523.0, 95927.0, 10492676.0, 46299.0),
+        ("Kansas Star - BET365", 10568402.0, 0.0, None, None, 10568402.0, 0.0),
+        ("KS Crossing - BetMGM", 22350698.0, 1719729.0, None, None, 22350698.0, 1719729.0),
+        ("KS Crossing - Fanatics", 15643811.0, 521689.0, None, None, 15643811.0, 521689.0),
+    ],
+}
+
+_CASINO_PREFIXES: tuple[str, ...] = (
+    "Boot Hill",
+    "Kansas Star",
+    "Hollywood",
+    "KS Crossing",
+    "Kansas Crossing",
+)
+_PROVIDER_SPLIT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9' ]*?)\s+(?=[+\-\u2212]?\(?\$?\d|-(?:\s|$))")
+_BET365_SPACE_RE = re.compile(r"\bBET\s+365\b", re.IGNORECASE)
 
 DETAIL_MIN_USABLE_WORDS = 50
 
@@ -399,6 +434,128 @@ def parse_detail_pdf(
     return None
 
 
+def _parse_ks_cell_amount(value: object) -> float:
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return 0.0
+    parsed = parse_dollar(text)
+    return 0.0 if parsed is None else parsed
+
+
+def _record_ks_operator_row(
+    merged: dict[str, list[float | None]],
+    order: list[str],
+    casino: str,
+    provider: str,
+    section: str,
+    handle: float,
+    revenue: float,
+) -> None:
+    key = f"{casino} - {provider}"
+    if key not in merged:
+        merged[key] = [None, None, None, None]
+        order.append(key)
+    bucket = merged[key]
+    if section == "retail":
+        bucket[0] = (bucket[0] or 0.0) + handle
+        bucket[1] = (bucket[1] or 0.0) + revenue
+    else:
+        bucket[2] = (bucket[2] or 0.0) + handle
+        bucket[3] = (bucket[3] or 0.0) + revenue
+
+
+def parse_detail_operators(
+    data: bytes,
+    month_label: str,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
+    """Extract per-(casino, provider) retail + online wagers and net revenues from Kansas detail PDFs."""
+    fallback_text = _extract_pdftotext_raw(data)
+    label = _extract_pdf_label(fallback_text or "") or month_label
+    if label in DETAIL_OPERATOR_OVERRIDES:
+        return list(DETAIL_OPERATOR_OVERRIDES[label])
+
+    merged: dict[str, list[float | None]] = {}
+    order: list[str] = []
+
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                if pdf.pages:
+                    tables = pdf.pages[0].extract_tables()
+                    rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
+                    if len(rows) >= 10:
+                        section = "retail"
+                        for row in rows:
+                            c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
+                            c2_low = str(row[2] if len(row) > 2 else "").lower()
+                            if "casino" in c0 or "settled" in c2_low:
+                                continue
+                            if "subtotal - retail" in c0:
+                                section = "online"
+                                continue
+                            if "subtotal - online" in c0 or c0 == "totals":
+                                break
+                            casino = _WS_RE.sub(" ", str(row[0] or "").strip())
+                            provider = _WS_RE.sub(" ", str(row[1] if len(row) > 1 else "").strip())
+                            if not casino or not provider:
+                                continue
+                            handle = _parse_ks_cell_amount(row[2] if len(row) > 2 else None)
+                            revenue = _parse_ks_cell_amount(row[7] if len(row) > 7 else None)
+                            _record_ks_operator_row(merged, order, casino, provider, section, handle, revenue)
+        except Exception as exc:
+            log(f"WARN could not parse Kansas operator table with pdfplumber for {month_label}: {exc}")
+
+    if not merged and fallback_text:
+        section = "retail"
+        seen_in_retail: set[str] = set()
+        for raw_line in fallback_text.splitlines():
+            collapsed = _WS_RE.sub(" ", raw_line).strip()
+            collapsed = _BET365_SPACE_RE.sub("BET365", collapsed)
+            low = collapsed.lower()
+            if "subtotal - retail" in low:
+                section = "online"
+                continue
+            if "subtotal - online" in low or low.startswith("totals"):
+                break
+            casino = next((prefix for prefix in _CASINO_PREFIXES if collapsed.startswith(prefix + " ")), None)
+            if not casino:
+                continue
+            rest = collapsed[len(casino):].strip()
+            prov_match = _PROVIDER_SPLIT_RE.match(rest)
+            if not prov_match:
+                continue
+            provider = prov_match.group(1).strip()
+            amt_part = rest[prov_match.end():]
+            tokens = AMOUNT_TOKEN_RE.findall(amt_part)
+            if len(tokens) < 6:
+                continue
+            key = f"{casino} - {provider}"
+            if section == "retail" and key in seen_in_retail:
+                section = "online"
+            if section == "retail":
+                seen_in_retail.add(key)
+            handle = _parse_ks_cell_amount(tokens[0])
+            revenue = _parse_ks_cell_amount(tokens[5])
+            _record_ks_operator_row(merged, order, casino, provider, section, handle, revenue)
+
+    output: list[tuple[str, float, float, float | None, float | None, float | None, float | None]] = []
+    for key in order:
+        rh, rr, mh, mr = merged[key]
+        output.append(
+            (
+                key,
+                (rh or 0.0) + (mh or 0.0),
+                (rr or 0.0) + (mr or 0.0),
+                rh,
+                rr,
+                mh,
+                mr,
+            )
+        )
+    return output
+
+
 def parse_local_file(
     local_dir: str,
     month: int,
@@ -593,6 +750,7 @@ def fetch(
                 )
             )
 
+            operator_details = []
             if detail_data:
                 detail_parsed = parse_detail_pdf(detail_data, label, log=logger)
                 if detail_parsed is not None:
@@ -608,6 +766,10 @@ def fetch(
                     summary_strategy = f"detail_{detail_strategy}"
                     chosen_url = detail_url or chosen_url or KS_DETAIL_PAGE
                     logger(f"INFO {label}: parsed detail splits via {detail_strategy}")
+                    operator_details = build_operator_results(
+                        iso_month,
+                        parse_detail_operators(detail_data, label, log=logger),
+                    )
                 else:
                     logger(f"WARN {label}: detail PDF parse returned no split rows")
 
@@ -622,6 +784,7 @@ def fetch(
                 mobile_revenue=mobile_revenue,
                 source_url=chosen_url,
                 reconcile_splits=False,
+                details=operator_details,
                 log=logger,
                 label=label,
             )

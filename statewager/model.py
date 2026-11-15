@@ -94,6 +94,7 @@ class StateMonthResult:
     source_url: str | None
     extra: dict[str, float | None] = field(default_factory=dict)
     details: list[OperatorMonthResult] = field(default_factory=list)
+    publish_details: list[OperatorMonthResult] = field(default_factory=list)
 
 
 def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
@@ -458,6 +459,7 @@ def finalize_state_month(
     strict_split_pct: float | None = None,
     extra: dict[str, float | None] | None = None,
     details: list[OperatorMonthResult] | None = None,
+    publish_details: list[OperatorMonthResult] | None = None,
     log: Callable[[str], None] | None = None,
     label: str | None = None,
 ) -> StateMonthResult | None:
@@ -514,6 +516,7 @@ def finalize_state_month(
         source_url=source_url,
         extra=extra if extra is not None else {},
         details=details if details is not None else [],
+        publish_details=publish_details if publish_details is not None else [],
     )
 
 

@@ -291,10 +291,9 @@ def parse_report_details(
                 continue
             if "STATE TOTALS" in upper or "TOTALS:" in upper:
                 continue
-            if " - RETAIL" in upper or " - MOBILE" in upper:
-                month_match = ROW_MONTH_RE.search(line)
-                if month_match:
-                    current_operator = clean_operator_name(line[:month_match.start()])
+            month_match = ROW_MONTH_RE.search(line)
+            if month_match and _CHANNEL_SUFFIX_RE.search(line[:month_match.start()]):
+                current_operator = clean_operator_name(line[:month_match.start()])
             inline = parse_licensee_line(line, month_token)
             if inline is not None:
                 current_operator = inline[0]

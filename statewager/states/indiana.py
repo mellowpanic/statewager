@@ -92,7 +92,22 @@ def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
         return {}
     rows: dict[str, tuple[float, float]] = {}
     saw_location_rows = False
+    handle_col: int | None = None
+    agr_col: int | None = None
     for row in sheet.iter_rows(values_only=True):
+        if handle_col is None or agr_col is None:
+            h_idx: int | None = None
+            a_idx: int | None = None
+            for index, cell in enumerate(row):
+                text = str(cell or "").strip().lower()
+                if h_idx is None and text == "handle":
+                    h_idx = index
+                if a_idx is None and "taxable agr" in text:
+                    a_idx = index
+            if h_idx is not None and a_idx is not None:
+                handle_col = h_idx
+                agr_col = a_idx
+                continue
         label = str(row[0] if row else "").strip()
         if not label:
             continue
@@ -102,18 +117,15 @@ def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
             continue
         if label.startswith("*"):
             continue
-        if not (
-            len(row) > 5
-            and str(row[3] if len(row) > 3 else "").strip().lower() == "handle"
-            and "taxable agr" in str(row[5] if len(row) > 5 else "").strip().lower()
-        ):
+        if handle_col is not None and agr_col is not None:
+            handle = row[handle_col] if handle_col < len(row) else None
+            revenue = row[agr_col] if agr_col < len(row) else None
+        else:
             handle = row[1] if len(row) > 1 else None
             revenue = row[2] if len(row) > 2 else None
-        else:
-            continue
-        if not (is_number(handle) and is_number(revenue)) and len(row) > 5:
-            handle = row[3] if len(row) > 3 else None
-            revenue = row[5] if len(row) > 5 else None
+            if not (is_number(handle) and is_number(revenue)) and len(row) > 5:
+                handle = row[3] if len(row) > 3 else None
+                revenue = row[5] if len(row) > 5 else None
         if is_number(handle) and is_number(revenue):
             saw_location_rows = True
             rows[label] = (float(handle), float(revenue))
@@ -134,7 +146,9 @@ def allocate_adjustments(retail_revenue: float, mobile_revenue: float, adjustmen
     return retail_revenue + retail_adjustment, mobile_revenue + (adjustments - retail_adjustment)
 
 
-def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, float]] | None:
+def _parse_detail_sheet_blocks(
+    workbook,
+) -> dict[str, tuple[float, float, list[tuple[str, float, float]], float]] | None:
     detail_sheet = next(
         (
             ws
@@ -146,7 +160,7 @@ def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, flo
     )
     if detail_sheet is None:
         return None
-    breakdowns: dict[str, tuple[float, float, float, float]] = {}
+    blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]] = {}
     rows = [tuple(r) for r in detail_sheet.iter_rows(values_only=True)]
     for row_index, row in enumerate(rows):
         values = list(row)
@@ -161,8 +175,7 @@ def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, flo
             location_name = header
             block_retail_handle = 0.0
             block_retail_revenue = 0.0
-            block_mobile_handle = 0.0
-            block_mobile_revenue = 0.0
+            skins: list[tuple[str, float, float]] = []
             block_adjustments = 0.0
             for detail_row in rows[row_index + 1:]:
                 label = str((detail_row[offset] if offset < len(detail_row) else "") or "").strip()
@@ -179,32 +192,115 @@ def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, flo
                         block_adjustments += float(revenue)
                     continue
                 if lower == "taxable agr":
-                    block_retail_revenue, block_mobile_revenue = allocate_adjustments(
-                        block_retail_revenue,
-                        block_mobile_revenue,
-                        block_adjustments,
-                    )
-                    breakdowns[location_name] = (
+                    blocks[location_name] = (
                         block_retail_handle,
                         block_retail_revenue,
-                        block_mobile_handle,
-                        block_mobile_revenue,
+                        skins,
+                        block_adjustments,
                     )
                     break
+                h_val = float(handle) if is_number(handle) else 0.0
+                r_val = float(revenue) if is_number(revenue) else 0.0
                 if is_retail_detail_label(label):
-                    if is_number(handle):
-                        block_retail_handle += float(handle)
-                    if is_number(revenue):
-                        block_retail_revenue += float(revenue)
+                    block_retail_handle += h_val
+                    block_retail_revenue += r_val
                 else:
-                    if is_number(handle):
-                        block_mobile_handle += float(handle)
-                    if is_number(revenue):
-                        block_mobile_revenue += float(revenue)
+                    skins.append((label, h_val, r_val))
+    return blocks
+
+
+def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, float]] | None:
+    blocks = _parse_detail_sheet_blocks(workbook)
+    if blocks is None:
+        return None
+    breakdowns: dict[str, tuple[float, float, float, float]] = {}
+    for location_name, (ret_h, ret_raw_r, skins, adjustments) in blocks.items():
+        mob_h = sum(sh for _, sh, _ in skins)
+        mob_raw_r = sum(sr for _, _, sr in skins)
+        adj_ret_r, adj_mob_r = allocate_adjustments(ret_raw_r, mob_raw_r, adjustments)
+        breakdowns[location_name] = (ret_h, adj_ret_r, mob_h, adj_mob_r)
     return breakdowns
 
 
-def parse_state_totals(
+def _format_skin_operator_name(location_name: str, skin_label: str) -> str:
+    low = skin_label.strip().lower()
+    if "bet365" in low:
+        return f"{location_name} - bet365"
+    if "betrivers" in low:
+        return f"{location_name} - BetRivers"
+    if "fanatics" in low:
+        return f"{location_name} - Fanatics"
+    if "espnbet" in low or "espn bet" in low:
+        return f"{location_name} - ESPN Bet"
+    if "thescore" in low:
+        return f"{location_name} - theScore Bet"
+    return f"{location_name} - {skin_label.strip()}"
+
+
+def _allocate_component_adjustments(raw_revenues: list[float], adjustments: float) -> list[float]:
+    if not raw_revenues:
+        return []
+    total_raw = sum(raw_revenues)
+    if total_raw == 0:
+        allocated = list(raw_revenues)
+        allocated[0] += adjustments
+        return allocated
+    allocated: list[float] = []
+    used = 0.0
+    for idx, rev in enumerate(raw_revenues):
+        if idx == len(raw_revenues) - 1:
+            adj = adjustments - used
+        else:
+            adj = adjustments * (rev / total_raw) if rev else 0.0
+            used += adj
+        allocated.append(rev + adj)
+    return allocated
+
+
+def _build_publish_detail_rows(
+    locations: dict[str, tuple[float, float]],
+    blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]],
+) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
+    publish_rows: list[tuple[str, float, float, float | None, float | None, float | None, float | None]] = []
+    for location_name, (loc_h, loc_r) in locations.items():
+        block = blocks.get(location_name)
+        if block is None:
+            publish_rows.append((location_name, loc_h, loc_r, None, None, None, None))
+            continue
+        ret_h, ret_raw_r, skins, adjustments = block
+        active_skins = [(lbl, sh, sr) for lbl, sh, sr in skins if sh != 0 or sr != 0]
+        if len(active_skins) < 2:
+            mob_h = sum(sh for _, sh, _ in skins)
+            mob_raw_r = sum(sr for _, _, sr in skins)
+            adj_ret_r, adj_mob_r = allocate_adjustments(ret_raw_r, mob_raw_r, adjustments)
+            publish_rows.append((location_name, loc_h, loc_r, ret_h, adj_ret_r, mob_h, adj_mob_r))
+            continue
+        has_retail = ret_h != 0 or ret_raw_r != 0
+        raw_revs: list[float] = ([ret_raw_r] if has_retail else []) + [sr for _, _, sr in active_skins]
+        adj_revs = _allocate_component_adjustments(raw_revs, adjustments)
+        pos = 0
+        if has_retail:
+            adj_ret_r = adj_revs[pos]
+            pos += 1
+            publish_rows.append((f"{location_name} (Retail)", ret_h, adj_ret_r, ret_h, adj_ret_r, None, None))
+        for skin_label, skin_h, _skin_raw_r in active_skins:
+            adj_skin_r = adj_revs[pos]
+            pos += 1
+            publish_rows.append(
+                (
+                    _format_skin_operator_name(location_name, skin_label),
+                    skin_h,
+                    adj_skin_r,
+                    None,
+                    None,
+                    skin_h,
+                    adj_skin_r,
+                )
+            )
+    return publish_rows
+
+
+def _parse_workbook_with_skins(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> tuple[
@@ -214,6 +310,7 @@ def parse_state_totals(
     float,
     float,
     float,
+    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
     list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
 ] | None:
     if openpyxl is None:
@@ -228,12 +325,16 @@ def parse_state_totals(
         if totals is None:
             log("WARN Indiana workbook missing statewide summary totals")
             return None
-        breakdown = parse_detail_breakdown(workbook)
-        if not breakdown:
+        blocks = _parse_detail_sheet_blocks(workbook)
+        if not blocks:
             log("WARN Indiana workbook missing operator retail/mobile breakdown")
             return None
         locations = parse_location_totals(workbook)
         handle, revenue = totals
+        breakdown = {
+            loc: (ret_h, *allocate_adjustments(ret_raw_r, sum(sr for _, _, sr in skins), adj)[:1], sum(sh for _, sh, _ in skins), allocate_adjustments(ret_raw_r, sum(sr for _, _, sr in skins), adj)[1])
+            for loc, (ret_h, ret_raw_r, skins, adj) in blocks.items()
+        }
         retail_handle = sum(values[0] for values in breakdown.values())
         retail_revenue = sum(values[1] for values in breakdown.values())
         mobile_handle = handle - retail_handle
@@ -255,9 +356,28 @@ def parse_state_totals(
                     split[3],
                 )
             )
-        return handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, detail_rows
+        publish_rows = _build_publish_detail_rows(locations, blocks)
+        return handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, detail_rows, publish_rows
     finally:
         workbook.close()
+
+
+def parse_state_totals(
+    data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
+] | None:
+    parsed = _parse_workbook_with_skins(data, log=log)
+    if parsed is None:
+        return None
+    return parsed[:7]
 
 
 def parse_local_file(local_dir: str, yyyy: str, mm: str) -> bytes | None:
@@ -323,11 +443,20 @@ def fetch(
             if data is None:
                 log_skip(logger, label, "workbook unavailable")
                 continue
-            parsed = parse_state_totals(data, log=logger)
+            parsed = _parse_workbook_with_skins(data, log=logger)
             if parsed is None:
                 log_skip(logger, label, "could not parse statewide totals")
                 continue
-            handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, locations = parsed
+            (
+                handle,
+                revenue,
+                retail_handle,
+                retail_revenue,
+                mobile_handle,
+                mobile_revenue,
+                locations,
+                publish_rows,
+            ) = parsed
             valid_locations: list[tuple[object, ...]] = []
             for (
                 location_name,
@@ -360,6 +489,11 @@ def fetch(
                     )
                 )
             operator_details = build_operator_results(iso_month, valid_locations)
+            valid_publish_rows = [
+                row for row in publish_rows
+                if row[1] != 0 or row[2] != 0
+            ]
+            publish_operator_details = build_operator_results(iso_month, valid_publish_rows)
             item = finalize_state_month(
                 state=STATE_NAME,
                 iso_month=iso_month,
@@ -371,6 +505,7 @@ def fetch(
                 mobile_revenue=mobile_revenue,
                 source_url=source_url,
                 details=operator_details,
+                publish_details=publish_operator_details,
                 log=logger,
                 label=label,
             )

@@ -14,10 +14,16 @@ from statewager.model import StateMonthResult, month_starts, parse_month_spec
 from statewager.states import ALL_STATES, load_state_module
 
 from .csv_writer import (
+    PublishedDetailRow,
+    extract_published_details,
+    merge_detail_results,
     merge_state_results,
+    read_detail_csv,
     read_state_csv,
     write_combined_csv,
+    write_combined_detail_csv,
     write_state_csv,
+    write_state_detail_csv,
 )
 from .site import write_index_html
 
@@ -95,7 +101,9 @@ def publish_all(
 ) -> dict[str, list[StateMonthResult]]:
     """Run ``statewager`` for ``states`` and write ``docs/data/*.csv`` + ``docs/index.html``."""
     data_dir = os.path.join(docs_dir, "data")
+    details_dir = os.path.join(data_dir, "details")
     by_state: dict[str, list[StateMonthResult]] = {}
+    details_by_state: dict[str, list[PublishedDetailRow]] = {}
 
     modules = []
     seen_slugs: set[str] = set()
@@ -135,7 +143,18 @@ def publish_all(
         write_state_csv(data_dir, slug, merged)
         by_state[slug] = merged
 
+        if getattr(mod, "HAS_DETAILS", False):
+            fresh_details = extract_published_details(results)
+            detail_csv_path = os.path.join(details_dir, f"{slug}.csv")
+            if merge_existing:
+                merged_details = merge_detail_results(read_detail_csv(detail_csv_path), fresh_details)
+            else:
+                merged_details = sorted(fresh_details, key=lambda r: (r.month, r.operator))
+            write_state_detail_csv(details_dir, slug, merged_details)
+            details_by_state[slug] = merged_details
+
     combined: list[StateMonthResult] = []
+    combined_details: list[PublishedDetailRow] = []
     state_options: list[tuple[str, str]] = []
     if merge_existing:
         for slug in ALL_STATES:
@@ -148,12 +167,22 @@ def publish_all(
                 if os.path.isfile(existing_path):
                     combined.extend(read_state_csv(existing_path))
                     state_options.append((slug, mod.STATE_NAME))
+            if getattr(mod, "HAS_DETAILS", False):
+                if slug in details_by_state:
+                    combined_details.extend(details_by_state[slug])
+                else:
+                    existing_detail_path = os.path.join(details_dir, f"{slug}.csv")
+                    if os.path.isfile(existing_detail_path):
+                        combined_details.extend(read_detail_csv(existing_detail_path))
     else:
         for slug, mod in modules:
             combined.extend(by_state[slug])
             state_options.append((slug, mod.STATE_NAME))
+            if slug in details_by_state:
+                combined_details.extend(details_by_state[slug])
 
     write_combined_csv(data_dir, combined)
+    write_combined_detail_csv(details_dir, combined_details)
     write_index_html(docs_dir, state_options)
     return by_state
 
