@@ -324,8 +324,8 @@ __STATE_OPTIONS__
         <table>
           <thead>
             <tr>
-              <th data-col="state">State</th>
               <th data-col="month">Month</th>
+              <th data-col="state">State</th>
               <th data-col="handle">Handle</th>
               <th data-col="revenue">Revenue</th>
               <th data-col="hold">Hold %</th>
@@ -669,7 +669,7 @@ __STATE_OPTIONS__
         const sorted = [...rows].sort((a, b) => {
           const av = a[sortCol];
           const bv = b[sortCol];
-          if (av === bv) return a.state.localeCompare(b.state) || a.month.localeCompare(b.month);
+          if (av === bv) return a.state.localeCompare(b.state) || b.month.localeCompare(a.month);
           if (av === null) return 1;
           if (bv === null) return -1;
           const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
@@ -682,8 +682,8 @@ __STATE_OPTIONS__
         sorted.forEach((r) => {
           const tr = document.createElement("tr");
           const cells = [
-            [r.state, false],
             [r.month, false],
+            [r.state, false],
             [fmtMoney(r.handle), false],
             [fmtMoney(r.revenue), r.revenue !== null && r.revenue < 0],
             [fmtPct(r.hold), r.hold !== null && r.hold < 0],

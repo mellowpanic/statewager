@@ -313,6 +313,7 @@ def test_render_index_html_has_partial_month_controls() -> None:
     html_text = render_index_html()
     assert "includePartial" in html_text
     assert "expectedStatesForMonth" in html_text
+    assert html_text.index('<th data-col="month">Month</th>') < html_text.index('<th data-col="state">State</th>')
 
 
 def test_missouri_pdf_name_re_matches_underscores_and_revised() -> None:
