@@ -12,7 +12,12 @@ from dateutil.relativedelta import relativedelta
 from statewager.model import StateMonthResult, month_starts, parse_month_spec
 from statewager.states import ALL_STATES, load_state_module
 
-from .csv_writer import write_combined_csv, write_state_csv
+from .csv_writer import (
+    merge_state_results,
+    read_state_csv,
+    write_combined_csv,
+    write_state_csv,
+)
 from .site import write_index_html
 
 
@@ -57,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read from --cache-dir only and make zero network requests.",
     )
     parser.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="Overwrite existing per-state CSV rows instead of merging by month.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-month statewager progress logs.",
@@ -73,6 +83,7 @@ def publish_all(
     docs_dir: str = "docs",
     offline: bool = False,
     quiet: bool = False,
+    merge_existing: bool = True,
 ) -> dict[str, list[StateMonthResult]]:
     """Run ``statewager`` for ``states`` and write ``docs/data/*.csv`` + ``docs/index.html``."""
     data_dir = os.path.join(docs_dir, "data")
@@ -91,9 +102,14 @@ def publish_all(
             offline=offline,
             log=silent_log,
         )
-        write_state_csv(data_dir, slug, results)
-        by_state[slug] = results
-        combined.extend(results)
+        csv_path = os.path.join(data_dir, f"{slug}.csv")
+        if merge_existing:
+            merged = merge_state_results(read_state_csv(csv_path), results)
+        else:
+            merged = sorted(results, key=lambda r: r.month)
+        write_state_csv(data_dir, slug, merged)
+        by_state[slug] = merged
+        combined.extend(merged)
         state_options.append((slug, mod.STATE_NAME))
 
     write_combined_csv(data_dir, combined)
@@ -123,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         docs_dir=args.docs_dir,
         offline=args.offline,
         quiet=args.quiet,
+        merge_existing=not args.no_merge,
     )
     total_rows = sum(len(rows) for rows in by_state.values())
     populated_states = sum(1 for rows in by_state.values() if rows)

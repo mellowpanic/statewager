@@ -103,6 +103,27 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       letter-spacing: 0.04em;
       color: var(--muted);
     }
+    .field-check {
+      min-width: auto;
+      justify-content: flex-end;
+      padding-bottom: 0.45rem;
+    }
+    .checkbox-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.85rem !important;
+      font-weight: 500 !important;
+      text-transform: none !important;
+      letter-spacing: normal !important;
+      color: var(--text) !important;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .chart-note {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
     select, input[type="month"] {
       padding: 0.45rem 0.65rem;
       border: 1px solid var(--border);
@@ -269,6 +290,12 @@ __STATE_OPTIONS__
         <label for="toMonth">To Month</label>
         <input id="toMonth" type="month">
       </div>
+      <div class="field field-check" id="partialField">
+        <label class="checkbox-label" for="includePartial">
+          <input id="includePartial" type="checkbox">
+          Include partial months
+        </label>
+      </div>
     </section>
 
     <section class="kpis">
@@ -282,6 +309,7 @@ __STATE_OPTIONS__
     <section class="card">
       <div class="card-header">
         <h2 class="card-title" id="chartTitle">Monthly Total Handle</h2>
+        <span class="chart-note" id="chartNote"></span>
       </div>
       <div class="chart-wrap">
         <svg id="chartSvg" class="chart" viewBox="0 0 960 290" preserveAspectRatio="none"></svg>
@@ -322,6 +350,9 @@ __STATE_OPTIONS__
     (function () {
       const csvCache = new Map();
       let activeRows = [];
+      let allStatesCount = 10;
+      let hasMissouri = true;
+      let userChangedDates = false;
       let sortCol = "month";
       let sortAsc = false;
 
@@ -329,6 +360,9 @@ __STATE_OPTIONS__
       const metricSelect = document.getElementById("metricSelect");
       const fromMonthInput = document.getElementById("fromMonth");
       const toMonthInput = document.getElementById("toMonth");
+      const includePartialInput = document.getElementById("includePartial");
+      const partialField = document.getElementById("partialField");
+      const chartNote = document.getElementById("chartNote");
       const statusBanner = document.getElementById("statusBanner");
       const stateCsvLink = document.getElementById("stateCsvLink");
       const chartSvg = document.getElementById("chartSvg");
@@ -460,18 +494,23 @@ __STATE_OPTIONS__
         document.getElementById("kpiRows").textContent = String(rows.length);
       }
 
+      function expectedStatesForMonth(month) {
+        if (stateSelect.value !== "__ALL__") return 1;
+        return Math.max(1, allStatesCount - (hasMissouri && month < "2025-12" ? 1 : 0));
+      }
+
       function aggregateByMonth(rows, metric) {
         const byMonth = new Map();
         rows.forEach((r) => {
           if (!byMonth.has(r.month)) {
-            byMonth.set(r.month, { handle: 0, revenue: 0, mobile_handle: 0, retail_handle: 0, count: 0 });
+            byMonth.set(r.month, { handle: 0, revenue: 0, mobile_handle: 0, retail_handle: 0, states: new Set() });
           }
           const agg = byMonth.get(r.month);
           if (r.handle !== null) agg.handle += r.handle;
           if (r.revenue !== null) agg.revenue += r.revenue;
           if (r.mobile_handle !== null) agg.mobile_handle += r.mobile_handle;
           if (r.retail_handle !== null) agg.retail_handle += r.retail_handle;
-          agg.count += 1;
+          agg.states.add(r.state);
         });
         return Array.from(byMonth.entries())
           .sort((a, b) => a[0].localeCompare(b[0]))
@@ -482,17 +521,46 @@ __STATE_OPTIONS__
             } else {
               value = agg[metric] || 0;
             }
-            return { month, value };
+            const count = agg.states.size;
+            const expected = expectedStatesForMonth(month);
+            const complete = count >= Math.max(1, expected - 1);
+            const partial = count < expected;
+            return { month, value, count, expected, complete, partial };
           });
       }
 
       function renderChart(rows) {
+        const isAll = stateSelect.value === "__ALL__";
         const metric = metricSelect.value;
         const metricLabel = metricSelect.options[metricSelect.selectedIndex].text;
         const stateLabel = stateSelect.options[stateSelect.selectedIndex].text;
         document.getElementById("chartTitle").textContent = `${stateLabel} — ${metricLabel}`;
 
-        const series = aggregateByMonth(rows, metric);
+        const rawSeries = aggregateByMonth(rows, metric);
+        let series = rawSeries;
+        let hiddenPartial = 0;
+        let fallbackToPartial = false;
+        if (isAll && !includePartialInput.checked) {
+          const completeOnly = rawSeries.filter((pt) => pt.complete);
+          if (completeOnly.length) {
+            hiddenPartial = rawSeries.length - completeOnly.length;
+            series = completeOnly;
+          } else if (rawSeries.length) {
+            fallbackToPartial = true;
+          }
+        }
+        if (!isAll) {
+          chartNote.textContent = "";
+        } else if (hiddenPartial > 0) {
+          chartNote.textContent = `Showing ${series.length} full-panel months (${hiddenPartial} partial month${hiddenPartial === 1 ? "" : "s"} hidden)`;
+        } else if (fallbackToPartial) {
+          chartNote.textContent = "All months in selected range have partial state coverage (dashed bars)";
+        } else {
+          const partialVisible = series.filter((pt) => pt.partial).length;
+          chartNote.textContent = partialVisible
+            ? `${partialVisible} partial-coverage month${partialVisible === 1 ? "" : "s"} shown with dashed outline`
+            : "";
+        }
         chartSvg.innerHTML = "";
         if (!series.length) return;
 
@@ -548,19 +616,41 @@ __STATE_OPTIONS__
           rect.setAttribute("width", String(barW));
           rect.setAttribute("height", String(rectH));
           rect.setAttribute("rx", "3");
-          rect.setAttribute("fill", pt.value < 0 ? "#dc2626" : "#2563eb");
+          const isNeg = pt.value < 0;
+          if (pt.partial && isAll) {
+            rect.setAttribute("fill", isNeg ? "#fca5a5" : "#93c5fd");
+            rect.setAttribute("stroke", isNeg ? "#dc2626" : "#2563eb");
+            rect.setAttribute("stroke-width", "1.5");
+            rect.setAttribute("stroke-dasharray", "4 2");
+          } else {
+            rect.setAttribute("fill", isNeg ? "#dc2626" : "#2563eb");
+          }
 
           const formatted = metric === "hold" ? fmtPct(pt.value) : fmtMoney(pt.value);
+          const countInfo = isAll
+            ? ` (${pt.count}/${pt.expected} states${pt.partial ? " — partial" : ""})`
+            : "";
           rect.addEventListener("mousemove", (ev) => {
             tooltip.style.display = "block";
             tooltip.style.left = `${ev.clientX + 12}px`;
             tooltip.style.top = `${ev.clientY - 28}px`;
-            tooltip.textContent = `${pt.month}: ${formatted}`;
+            tooltip.textContent = `${pt.month}: ${formatted}${countInfo}`;
           });
           rect.addEventListener("mouseleave", () => {
             tooltip.style.display = "none";
           });
           chartSvg.appendChild(rect);
+
+          if (pt.partial && isAll && barW >= 14) {
+            const ptxt = document.createElementNS(ns, "text");
+            ptxt.setAttribute("x", String(x + barW / 2));
+            ptxt.setAttribute("y", String(Math.max(12, rectY - 4)));
+            ptxt.setAttribute("text-anchor", "middle");
+            ptxt.setAttribute("fill", "#64748b");
+            ptxt.setAttribute("font-size", "9");
+            ptxt.textContent = `${pt.count}/${pt.expected}`;
+            chartSvg.appendChild(ptxt);
+          }
 
           if (idx % labelEvery === 0 || idx === series.length - 1) {
             const tx = document.createElementNS(ns, "text");
@@ -635,6 +725,22 @@ __STATE_OPTIONS__
         renderTable(rows);
       }
 
+      function applyDefaultDateBounds() {
+        if ((userChangedDates && fromMonthInput.value) || !activeRows.length) return;
+        const months = activeRows.map((r) => r.month).sort();
+        if (stateSelect.value === "__ALL__" && !includePartialInput.checked) {
+          const aggAll = aggregateByMonth(activeRows, metricSelect.value);
+          const completeMonths = aggAll.filter((pt) => pt.complete).map((pt) => pt.month);
+          if (completeMonths.length) {
+            fromMonthInput.value = completeMonths[0];
+            toMonthInput.value = completeMonths[completeMonths.length - 1];
+            return;
+          }
+        }
+        fromMonthInput.value = months[0];
+        toMonthInput.value = months[months.length - 1];
+      }
+
       async function loadSelection() {
         const slug = stateSelect.value;
         try {
@@ -643,18 +749,19 @@ __STATE_OPTIONS__
           statusBanner.textContent = `Loading ${slug === "__ALL__" ? "data/all.csv" : "data/" + slug + ".csv"}…`;
           activeRows = await fetchCsvRows(slug);
           statusBanner.style.display = "none";
-          if (slug === "__ALL__") {
+          const isAll = slug === "__ALL__";
+          partialField.style.display = isAll ? "" : "none";
+          if (isAll) {
+            const distinctStates = new Set(activeRows.map((r) => r.state));
+            allStatesCount = distinctStates.size || 1;
+            hasMissouri = distinctStates.has("Missouri");
             stateCsvLink.style.display = "none";
           } else {
             stateCsvLink.href = `data/${slug}.csv`;
             stateCsvLink.textContent = `Download ${slug}.csv`;
             stateCsvLink.style.display = "inline-flex";
           }
-          if (!fromMonthInput.value && activeRows.length) {
-            const months = activeRows.map((r) => r.month).sort();
-            fromMonthInput.value = months[0];
-            toMonthInput.value = months[months.length - 1];
-          }
+          applyDefaultDateBounds();
           refreshView();
         } catch (err) {
           statusBanner.className = "status error";
@@ -678,8 +785,18 @@ __STATE_OPTIONS__
 
       stateSelect.addEventListener("change", loadSelection);
       metricSelect.addEventListener("change", refreshView);
-      fromMonthInput.addEventListener("change", refreshView);
-      toMonthInput.addEventListener("change", refreshView);
+      fromMonthInput.addEventListener("change", () => {
+        userChangedDates = true;
+        refreshView();
+      });
+      toMonthInput.addEventListener("change", () => {
+        userChangedDates = true;
+        refreshView();
+      });
+      includePartialInput.addEventListener("change", () => {
+        applyDefaultDateBounds();
+        refreshView();
+      });
 
       loadSelection();
     })();

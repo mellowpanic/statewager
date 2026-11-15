@@ -7,6 +7,7 @@ name = "statewager"
 version = "0.1.0"
 description = "Standalone US state sports wagering regulatory fetcher and parser"
 readme = "statewager/README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.28",

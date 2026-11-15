@@ -11,7 +11,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from ..cache import cache_path, load_cached_or_fetch
+from ..cache import cache_path, load_cached_or_fetch, save_cache
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
@@ -296,6 +296,7 @@ def fetch(
             parsed = parse_local_files(local_dir, year, year_months, log=logger) if local_dir else {}
             if not parsed:
                 path = _resolve_ohio_cache_path(cache_dir, year)
+                was_cached = bool(path and os.path.isfile(path))
                 data = load_cached_or_fetch(
                     cache_file=path,
                     fetcher=lambda y=year, lrn=latest_report_number: download_cumulative_workbook(
@@ -310,6 +311,13 @@ def fetch(
                 )
                 if data:
                     parsed = parse_cumulative_xlsx(data, year_months, log=logger)
+                if was_cached and not offline and path and len(parsed) < len(year_months):
+                    fresh_data = download_cumulative_workbook(
+                        year, latest_report_number, report=report, log=logger,
+                    )
+                    if fresh_data and fresh_data.startswith(b"PK") and fresh_data != data:
+                        save_cache(path, fresh_data)
+                        parsed = parse_cumulative_xlsx(fresh_data, year_months, log=logger)
             parsed_by_label.update(parsed)
         except Exception as exc:
             logger(f"WARN failed Ohio workbook processing for {year}: {exc}")

@@ -16,13 +16,13 @@ except ImportError:
 
 from dateutil.relativedelta import relativedelta
 
-from ..cache import cache_path, load_cached_or_fetch
+from ..cache import cache_path, load_cached_or_fetch, save_cache
 from ..discover import (
     DiscoveryReport,
     classify_sportsbook_filename,
     crawl_anchors,
 )
-from ..http import fetch_bytes, fetch_with_wayback_fallback
+from ..http import fetch_bytes, fetch_text, fetch_with_wayback_fallback
 from ..model import (
     OperatorMonthResult,
     StateMonthResult,
@@ -45,7 +45,11 @@ HTTP_TIMEOUT = 30
 HTTP_RETRIES = 3
 PGCB_BASE = "https://gamingcontrolboard.pa.gov"
 REVENUE_PAGE = f"{PGCB_BASE}/news-and-transparency/revenue"
-FILTER_IDS = {(2025, 2026): 285, (2024, 2025): 252, (2023, 2024): 115}
+FILTER_IDS = {(2026, 2027): 292, (2025, 2026): 285, (2024, 2025): 252, (2023, 2024): 115}
+_FY_OPTION_RE = re.compile(
+    r'<option[^>]*value=["\'](\d+)["\'][^>]*>\s*FY\s*(20\d{2})\s*/\s*(20\d{2})\s*</option>',
+    re.IGNORECASE,
+)
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 _DEFAULT_LOG = build_state_logger("PA")
@@ -63,13 +67,30 @@ def _absolute_url(href: str) -> str:
     return urljoin(PGCB_BASE + "/", href.lstrip("/"))
 
 
+def parse_filter_options(html: str) -> dict[tuple[int, int], int]:
+    """Parse PGCB fiscal-year select options into ``{(fy_start, fy_end): filter_id}``."""
+    discovered: dict[tuple[int, int], int] = {}
+    for match in _FY_OPTION_RE.finditer(html):
+        filter_id, fy_start, fy_end = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        discovered[(fy_start, fy_end)] = filter_id
+    return discovered
+
+
 def crawl_revenue_index(
     report: DiscoveryReport | None = None,
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> list[dict[str, str]]:
     """Crawl PGCB revenue page once, optionally across FY filter views."""
+    filter_ids = dict(FILTER_IDS)
+    try:
+        index_html = fetch_text(REVENUE_PAGE, timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES)
+    except Exception:
+        index_html = None
+    if index_html:
+        for fy_key, fid in parse_filter_options(index_html).items():
+            filter_ids.setdefault(fy_key, fid)
     indices = [REVENUE_PAGE]
-    for (_fy_start, _fy_end), filter_id in FILTER_IDS.items():
+    for (_fy_start, _fy_end), filter_id in sorted(filter_ids.items(), reverse=True):
         indices.append(f"{REVENUE_PAGE}?field_gaming_revenue_fiscal_year_target_id={filter_id}")
     seen_hrefs: set[str] = set()
     aggregated: list[dict[str, str]] = []
@@ -550,8 +571,11 @@ def fetch(
             data = parse_local_file(local_dir, fy_start, fy_end) if local_dir else None
             if data:
                 logger(f"INFO loaded local FY workbook FY{fy_start % 100:02d}-{fy_end % 100:02d}")
+            path: str | None = None
+            was_cached = False
             if data is None:
                 path = cache_path(cache_dir, f"pennsylvania_fy_{fy_start}_{fy_end}.xlsx")
+                was_cached = bool(path and os.path.isfile(path))
                 data = load_cached_or_fetch(
                     cache_file=path,
                     fetcher=lambda fs=fy_start, fe=fy_end: download_fy_workbook(
@@ -566,7 +590,21 @@ def fetch(
             if data is None:
                 logger(f"WARN could not find FY workbook for {fy_start}-{fy_end}")
                 continue
-            all_data.update(parse_fy_xlsx(data, fy_start, fy_end, log=logger))
+            fy_parsed = parse_fy_xlsx(data, fy_start, fy_end, log=logger)
+            fy_labels = [label for month, year, label in months if get_fy(month, year) == (fy_start, fy_end)]
+            if (
+                was_cached
+                and not offline
+                and path is not None
+                and any(lbl not in fy_parsed or fy_parsed[lbl][0] <= 0 for lbl in fy_labels)
+            ):
+                fresh_data = download_fy_workbook(
+                    fy_start, fy_end, anchors=_ensure_anchors(), report=report, log=logger,
+                )
+                if fresh_data and fresh_data.startswith(b"PK") and fresh_data != data:
+                    save_cache(path, fresh_data)
+                    fy_parsed = parse_fy_xlsx(fresh_data, fy_start, fy_end, log=logger)
+            all_data.update(fy_parsed)
         except Exception as exc:
             logger(f"WARN failed Pennsylvania FY workbook processing for {fy_start}-{fy_end}: {exc}")
 

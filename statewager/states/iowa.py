@@ -29,6 +29,9 @@ HAS_DETAILS = False
 
 USER_AGENT = "Mozilla/5.0"
 PUBLICATIONS_URL = "https://irgc.iowa.gov/publications-reports/sports-wagering-revenue"
+ARCHIVED_PUBLICATIONS_URL = (
+    "https://irgc.iowa.gov/publications-reports/sports-wagering-revenue/archived-sports-revenue"
+)
 MEDIA_IDS = {
     "Jul 2025": 428,
     "Aug 2025": 436,
@@ -45,6 +48,7 @@ MEDIA_IDS = {
 FY_MEDIA_IDS = {
     (2023, 2024): 335,
     (2024, 2025): 425,
+    (2025, 2026): 508,
 }
 _DEFAULT_LOG = build_state_logger("IA")
 
@@ -90,10 +94,51 @@ _LABEL_MONTH_RE = re.compile(
     r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",
     re.IGNORECASE,
 )
+_MEDIA_HREF_RE = re.compile(r"/media/(\d+)/download", re.IGNORECASE)
+_FY_RANGE_RE = re.compile(r"(20\d{2})\s*[-/]\s*(20\d{2})")
+_FY_SINGLE_RE = re.compile(r"(?:Fiscal\s+Year|FY)\s*(20\d{2})\b", re.IGNORECASE)
 
 
 def media_download_url(media_id: int) -> str:
     return f"https://irgc.iowa.gov/media/{media_id}/download?inline"
+
+
+def _parse_fy_media_links(links: list[dict[str, str]]) -> dict[tuple[int, int], int]:
+    discovered: dict[tuple[int, int], int] = {}
+    for link in links:
+        href = link.get("href", "")
+        id_match = _MEDIA_HREF_RE.search(href)
+        if not id_match:
+            continue
+        label = link.get("text") or link.get("title") or ""
+        fy_key: tuple[int, int] | None = None
+        range_match = _FY_RANGE_RE.search(label)
+        if range_match:
+            fy_start, fy_end = int(range_match.group(1)), int(range_match.group(2))
+            if fy_end == fy_start + 1:
+                fy_key = (fy_start, fy_end)
+        if fy_key is None:
+            single_match = _FY_SINGLE_RE.search(label)
+            if single_match:
+                fy_end = int(single_match.group(1))
+                fy_key = (fy_end - 1, fy_end)
+        if fy_key is not None and fy_key not in discovered:
+            discovered[fy_key] = int(id_match.group(1))
+    return discovered
+
+
+def discover_fy_media_ids(
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> dict[tuple[int, int], int]:
+    """Discover FY archive media IDs from IRGC archive and publications pages."""
+    discovered: dict[tuple[int, int], int] = {}
+    for index_url in (ARCHIVED_PUBLICATIONS_URL, PUBLICATIONS_URL):
+        links = crawl_anchors(index_url, log=log)
+        for fy_key, media_id in _parse_fy_media_links(links).items():
+            discovered.setdefault(fy_key, media_id)
+    if discovered:
+        log(f"INFO discovered {len(discovered)} FY archive media ID(s) on IRGC")
+    return discovered
 
 
 def download_pdf(
@@ -422,12 +467,14 @@ def build_archive_lookup(
     *,
     offline: bool = False,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    fy_lookup: dict[tuple[int, int], int] | None = None,
 ) -> dict[str, ParsedIowaMetrics]:
+    fy_map = fy_lookup if fy_lookup is not None else FY_MEDIA_IDS
     archive_lookup: dict[str, ParsedIowaMetrics] = {}
-    needed_fys = sorted({get_fy(month, year) for month, year, _ in months if get_fy(month, year) in FY_MEDIA_IDS})
+    needed_fys = sorted({get_fy(month, year) for month, year, _ in months if get_fy(month, year) in fy_map})
     for fy in needed_fys:
         try:
-            media_id = FY_MEDIA_IDS[fy]
+            media_id = fy_map[fy]
             archive_path = cache_path(cache_dir, f"iowa_fy_{fy[0]}_{fy[1]}_archive.pdf")
             data = load_cached_or_fetch(
                 cache_file=archive_path,
@@ -471,7 +518,14 @@ def fetch(
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
     months = [(mdate.month, mdate.year, mdate.strftime("%b %Y")) for mdate in target_dates]
-    archive_lookup = build_archive_lookup(months, cache_dir, offline=offline, log=logger)
+    fy_lookup = dict(FY_MEDIA_IDS)
+    if not offline:
+        requested_fys = {get_fy(month, year) for month, year, _ in months}
+        if requested_fys - fy_lookup.keys():
+            fy_lookup.update(discover_fy_media_ids(log=logger))
+    archive_lookup = build_archive_lookup(
+        months, cache_dir, offline=offline, log=logger, fy_lookup=fy_lookup,
+    )
     media_lookup: dict[str, int] = dict(MEDIA_IDS)
     requested_labels = {label for _, _, label in months}
     missing_labels = requested_labels - media_lookup.keys()
@@ -504,7 +558,7 @@ def fetch(
                 parsed_result = archive_lookup[label]
                 logger(f"INFO parsed FY archive for {label} ({parsed_result.layout})")
                 fy_key = get_fy(month, year)
-                source_url = media_download_url(FY_MEDIA_IDS[fy_key]) if fy_key in FY_MEDIA_IDS else PUBLICATIONS_URL
+                source_url = media_download_url(fy_lookup[fy_key]) if fy_key in fy_lookup else PUBLICATIONS_URL
             if parsed_result is None:
                 data = _fetch_monthly_pdf_with_lookup(
                     year, month, label, media_lookup, cache_dir, offline=offline, log=logger,

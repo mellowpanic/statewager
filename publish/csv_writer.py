@@ -25,6 +25,56 @@ def _format_pct(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def _parse_opt_float(value: str | None) -> float | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def read_state_csv(csv_path: str) -> list[StateMonthResult]:
+    """Load previously published rows from a per-state CSV if it exists."""
+    if not os.path.isfile(csv_path):
+        return []
+    rows: list[StateMonthResult] = []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        for raw in csv.DictReader(fh):
+            state = (raw.get("state") or "").strip()
+            month = (raw.get("month") or "").strip()
+            if not state or not month:
+                continue
+            rows.append(
+                StateMonthResult(
+                    state=state,
+                    month=month,
+                    handle=_parse_opt_float(raw.get("handle")) or 0.0,
+                    revenue=_parse_opt_float(raw.get("revenue")) or 0.0,
+                    hold=_parse_opt_float(raw.get("hold")) or 0.0,
+                    retail_handle=_parse_opt_float(raw.get("retail_handle")),
+                    retail_revenue=_parse_opt_float(raw.get("retail_revenue")),
+                    retail_hold=_parse_opt_float(raw.get("retail_hold")),
+                    mobile_handle=_parse_opt_float(raw.get("mobile_handle")),
+                    mobile_revenue=_parse_opt_float(raw.get("mobile_revenue")),
+                    mobile_hold=_parse_opt_float(raw.get("mobile_hold")),
+                    source_url=(raw.get("source_url") or "").strip() or None,
+                )
+            )
+    return rows
+
+
+def merge_state_results(
+    existing: Iterable[StateMonthResult],
+    fresh: Iterable[StateMonthResult],
+) -> list[StateMonthResult]:
+    """Merge ``fresh`` results onto ``existing`` rows keyed by ``(state, month)``."""
+    by_key: dict[tuple[str, str], StateMonthResult] = {}
+    for item in existing:
+        by_key[(item.state, item.month)] = item
+    for item in fresh:
+        by_key[(item.state, item.month)] = item
+    return sorted(by_key.values(), key=lambda r: r.month)
+
+
 def result_to_csv_row(item: StateMonthResult) -> list[str]:
     """Serialize a ``StateMonthResult`` into the 12-column CSV row schema."""
     return [

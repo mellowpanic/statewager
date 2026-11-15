@@ -5,7 +5,15 @@ import csv
 import inspect
 import pathlib
 
-from publish import CSV_HEADERS, write_combined_csv, write_index_html, write_state_csv
+from publish import (
+    CSV_HEADERS,
+    merge_state_results,
+    read_state_csv,
+    render_index_html,
+    write_combined_csv,
+    write_index_html,
+    write_state_csv,
+)
 from statewager import StateMonthResult
 from statewager.discover import (
     classify_cumulative_filename,
@@ -20,7 +28,7 @@ from statewager.model import (
     hold_pct,
     label_to_iso_month,
 )
-from statewager.states import ALL_STATES, load_state_module
+from statewager.states import ALL_STATES, iowa, load_state_module, missouri, pennsylvania
 
 
 def test_all_ten_state_modules_expose_fetch_signature() -> None:
@@ -260,3 +268,55 @@ class TestFindStaleMonths:
 
     def test_empty_input(self) -> None:
         assert find_stale_months({}, min_peers=1) == []
+
+
+def test_publish_incremental_merge_preserves_older_months(tmp_path: pathlib.Path) -> None:
+    data_dir = tmp_path / "data"
+    old_dec = StateMonthResult("Ohio", "2024-12", 500.0, 50.0, 10.0, None, None, None, None, None, None, "u0")
+    old_mar = StateMonthResult("Ohio", "2025-03", 600.0, 60.0, 10.0, None, None, None, None, None, None, "u1")
+    csv_path = write_state_csv(str(data_dir), "ohio", [old_dec, old_mar])
+
+    existing = read_state_csv(csv_path)
+    fresh_mar = StateMonthResult("Ohio", "2025-03", 750.0, 75.0, 10.0, None, None, None, None, None, None, "u2")
+    fresh_apr = StateMonthResult("Ohio", "2025-04", 700.0, 70.0, 10.0, None, None, None, None, None, None, "u3")
+    merged = merge_state_results(existing, [fresh_mar, fresh_apr])
+    assert [r.month for r in merged] == ["2024-12", "2025-03", "2025-04"]
+    assert merged[0].handle == 500.0
+    assert merged[1].handle == 750.0
+    assert merged[2].handle == 700.0
+
+
+def test_iowa_fy26_archive_and_link_discovery() -> None:
+    assert iowa.FY_MEDIA_IDS[(2025, 2026)] == 508
+    parsed = iowa._parse_fy_media_links(
+        [
+            {"href": "/media/508/download?inline", "text": "Fiscal Year 2026 Sports Wagering Revenue"},
+            {"href": "/media/555/download", "text": "2026-2027 Sports Wagering Revenue"},
+            {"href": "/other/link", "text": "Fiscal Year 2028 Sports Wagering Revenue"},
+        ]
+    )
+    assert parsed == {(2025, 2026): 508, (2026, 2027): 555}
+
+
+def test_pennsylvania_fy27_filter_and_option_parsing() -> None:
+    assert pennsylvania.FILTER_IDS[(2026, 2027)] == 292
+    html = (
+        '<select name="field_gaming_revenue_fiscal_year_target_id">'
+        '<option value="292">FY 2026/2027</option>'
+        '<option value="310">FY 2027/2028</option>'
+        "</select>"
+    )
+    assert pennsylvania.parse_filter_options(html) == {(2026, 2027): 292, (2027, 2028): 310}
+
+
+def test_render_index_html_has_partial_month_controls() -> None:
+    html_text = render_index_html()
+    assert "includePartial" in html_text
+    assert "expectedStatesForMonth" in html_text
+
+
+def test_missouri_pdf_name_re_matches_underscores_and_revised() -> None:
+    m1 = missouri.PDF_NAME_RE.search("FY26_SWFinReport/03_Mar/SW_Monthly_Financials_0326_revised.pdf")
+    m2 = missouri.PDF_NAME_RE.search("FY27_SWFinReport/09_Sep/SW Monthly Financials 0926.pdf")
+    assert m1 is not None and m1.group(1) == "0326"
+    assert m2 is not None and m2.group(1) == "0926"

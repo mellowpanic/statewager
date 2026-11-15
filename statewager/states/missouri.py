@@ -48,7 +48,7 @@ BASE_URL = (
 _DEFAULT_LOG = build_state_logger("MO")
 
 PDF_NAME_RE = re.compile(
-    r"SW(?:%20|\s)+Monthly(?:%20|\s)+Financials?(?:%20|\s)+(\d{4})(?:%20|\s)*\.pdf",
+    r"SW(?:%20|[\s_])+Monthly(?:%20|[\s_])+Financials?(?:%20|[\s_])+(\d{4})(?:(?:%20|[\s_])*[a-z0-9_-]*)?\.pdf",
     re.IGNORECASE,
 )
 TEXT_MONTH_RE = re.compile(
