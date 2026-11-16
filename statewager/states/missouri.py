@@ -1,7 +1,6 @@
 """Missouri sports wagering regulatory fetcher and parser (MGC)."""
 from __future__ import annotations
 
-from collections import OrderedDict
 from datetime import date, datetime
 from html import unescape
 import io
@@ -15,8 +14,8 @@ try:
 except ImportError:
     pdfplumber = None
 
-from ..cache import cache_path, load_cached_or_fetch
-from ..discover import MONTH_NAMES, TEXT_MONTH_RE, DiscoveryReport, crawl_anchors
+from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_cache_ttl
+from ..discover import DiscoveryReport, crawl_anchors, parse_text_month
 from ..http import fetch_with_wayback_fallback
 from ..model import (
     StateMonthResult,
@@ -25,10 +24,11 @@ from ..model import (
     finalize_state_month,
     fiscal_year_july,
     format_iso_month,
+    log_month_result,
     log_skip,
     resolve_fetch_months,
 )
-from ..parse import parse_dollar
+from ..parse import PDFPLUMBER_LOCK, parse_dollar
 
 STATE_NAME = "Missouri"
 LAUNCH_DATE: date | None = date(2025, 12, 1)
@@ -58,13 +58,9 @@ _CHANNEL_SUFFIX_RE = re.compile(r"\s*-\s*(retail|mobile)\s*$", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
-def fiscal_year(year: int, month: int) -> int:
-    return fiscal_year_july(year, month)[1] % 100
-
-
 def build_pdf_url(year: int, month: int) -> str:
     return BASE_URL.format(
-        fy=fiscal_year(year, month),
+        fy=fiscal_year_july(year, month)[1] % 100,
         mm=f"{month:02d}",
         mon=date(year, month, 1).strftime("%b"),
         mmyy=f"{month:02d}{year % 100:02d}",
@@ -93,20 +89,19 @@ def _fetch_reports_page(
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> tuple[str, list[dict[str, str]]] | None:
     """Crawl the SW reports page directly; fall back to discovery via casino index."""
-    candidates: list[str] = [MGC_SW_REPORTS_PAGE]
-    for page in candidates:
+    pages: list[str] = [MGC_SW_REPORTS_PAGE]
+    fallback = None
+    for idx in range(2):
+        page = pages[idx] if idx < len(pages) else fallback
+        if not page or (idx == 1 and page == MGC_SW_REPORTS_PAGE):
+            break
         links = crawl_anchors(page, log=log)
         if links:
             if report is not None:
                 report.add_index(page, anchor_count=len(links))
             return page, links
-    fallback = discover_sw_reports_page_from_fallback(log=log)
-    if fallback and fallback not in candidates:
-        links = crawl_anchors(fallback, log=log)
-        if links:
-            if report is not None:
-                report.add_index(fallback, anchor_count=len(links))
-            return fallback, links
+        if idx == 0:
+            fallback = discover_sw_reports_page_from_fallback(log=log)
     return None
 
 
@@ -142,19 +137,16 @@ def scrape_pdf_urls(
             month_num = int(mmyy[:2])
             if not (1 <= month_num <= 12):
                 continue
-            year = 2000 + int(mmyy[2:])
+            label = datetime(2000 + int(mmyy[2:]), month_num, 1).strftime("%b %Y")
         else:
             meta = " ".join(unescape(link.get(key, "")) for key in ("title", "text"))
-            text_match = TEXT_MONTH_RE.search(meta)
-            if not text_match:
+            label = parse_text_month(meta)
+            if not label:
                 if report is not None:
                     report.add_classification(
                         href, title=link.get("title", ""), text=link.get("text", ""), reason="no-month-token",
                     )
                 continue
-            month_num = MONTH_NAMES[text_match.group(1).lower()]
-            year = int(text_match.group(2))
-        label = datetime(year, month_num, 1).strftime("%b %Y")
         full_url = urljoin(reports_page, href)
         if label not in urls:
             urls[label] = full_url
@@ -191,26 +183,18 @@ def parse_section_rows(lines: list[str], month_token: str) -> tuple[float, float
     return handle, revenue
 
 
-def parse_state_totals_line(line: str) -> tuple[float, float] | None:
-    if not line.strip().startswith("STATE TOTALS MTD:"):
-        return None
-    return extract_amounts(line)
-
-
 def parse_report_state_totals(page_texts: list[str], report_name: str) -> tuple[float, float] | None:
     in_report = False
     for text in page_texts:
         for raw_line in text.splitlines():
             line = raw_line.strip()
-            upper = line.upper()
-            if report_name in upper:
+            if report_name in line.upper():
                 in_report = True
                 continue
-            if not in_report:
-                continue
-            parsed = parse_state_totals_line(line)
-            if parsed is not None:
-                return parsed
+            if in_report and line.startswith("STATE TOTALS MTD:"):
+                parsed = extract_amounts(line)
+                if parsed is not None:
+                    return parsed
     return None
 
 
@@ -251,7 +235,7 @@ def parse_report_details(
     month: int,
 ) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
     month_token = date(year, month, 1).strftime("%b-%y")
-    details: OrderedDict[str, dict[str, float | str | None]] = OrderedDict()
+    details: dict[str, dict[str, float | str | None]] = {}
     section = None
     current_operator = None
 
@@ -473,7 +457,7 @@ def _parse_pdf_with_fiscal(
         raise RuntimeError("pdfplumber is required to parse Missouri PDFs")
     month_token = date(year, month, 1).strftime("%b-%y")
     try:
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
+        with PDFPLUMBER_LOCK, pdfplumber.open(io.BytesIO(data)) as pdf:
             page_texts = [page.extract_text() or "" for page in pdf.pages]
             retail = parse_report_state_totals(page_texts, "SPORTS WAGERING RETAIL STATISTICAL REPORT")
             mobile = parse_report_state_totals(page_texts, "SPORTS WAGERING MOBILE STATISTICAL REPORT")
@@ -529,24 +513,6 @@ def _parse_pdf_with_fiscal(
     return core, None, None, {}, {}
 
 
-def parse_pdf(
-    data: bytes,
-    year: int,
-    month: int,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[
-    float,
-    float,
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
-] | None:
-    parsed = _parse_pdf_with_fiscal(data, year, month, log=log)
-    return parsed[0] if parsed is not None else None
-
-
 def _parse_local_file_with_fiscal(
     local_dir: str,
     year: int,
@@ -555,32 +521,12 @@ def _parse_local_file_with_fiscal(
 ):
     month_token = f"{month:02d}{year % 100:02d}"
     month_name = date(year, month, 1).strftime("%b").lower()
-    for entry in sorted(os.listdir(local_dir)):
-        if not entry.lower().endswith(".pdf"):
-            continue
-        lower = entry.lower()
-        if month_token in lower or (month_name in lower and str(year) in lower):
-            with open(os.path.join(local_dir, entry), "rb") as file_handle:
-                return _parse_pdf_with_fiscal(file_handle.read(), year, month, log=log)
-    return None
-
-
-def parse_local_file(
-    local_dir: str,
-    year: int,
-    month: int,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[
-    float,
-    float,
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
-] | None:
-    parsed = _parse_local_file_with_fiscal(local_dir, year, month, log=log)
-    return parsed[0] if parsed is not None else None
+    matched = find_local_file(
+        local_dir,
+        lambda entry: entry.lower().endswith(".pdf")
+        and (month_token in entry.lower() or (month_name in entry.lower() and str(year) in entry.lower())),
+    )
+    return _parse_pdf_with_fiscal(matched[1], year, month, log=log) if matched is not None else None
 
 
 def fetch(
@@ -631,11 +577,13 @@ def fetch(
                             if report is not None:
                                 report.add_probe(f"{label}:summary", "(none)", reason="not-on-index")
                             continue
+                        if not url:
+                            url = build_pdf_url(year, month)
                     else:
                         url = build_pdf_url(year, month)
                         if not cached:
                             logger(f"INFO {label}: scraped URL missing; falling back to constructed URL")
-                timestamp = datetime(year, month, 1).strftime("%Y%m")
+                timestamp = f"{year:04d}{month:02d}"
                 data = load_cached_or_fetch(
                     cache_file=path,
                     fetcher=lambda u=url, ts=timestamp: fetch_with_wayback_fallback(
@@ -646,6 +594,7 @@ def fetch(
                     fetch_success_message=f"INFO {label}: downloaded from {url}",
                     fetch_error_message=f"{label}: failed to download {url}",
                     validate=lambda payload: payload.startswith(b"%PDF"),
+                    cache_ttl_seconds=recent_cache_ttl(year, month),
                     offline=offline,
                 )
                 if report is not None and url:
@@ -666,9 +615,9 @@ def fetch(
             enriched_details = [
                 (
                     *op_tuple,
-                    op_gross.get(_fiscal_operator_key(op_tuple[0])),
+                    op_gross.get(fkey := _fiscal_operator_key(op_tuple[0])),
                     None,
-                    op_taxes.get(_fiscal_operator_key(op_tuple[0])),
+                    op_taxes.get(fkey),
                 )
                 for op_tuple in details
             ]
@@ -692,12 +641,7 @@ def fetch(
             if item is None:
                 continue
             results.append(item)
-            logger(
-                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
-                f"retail_handle={item.retail_handle if item.retail_handle is not None else 'n/a'} "
-                f"mobile_handle={item.mobile_handle if item.mobile_handle is not None else 'n/a'} "
-                f"hold={(item.hold or 0.0):.1f}%"
-            )
+            log_month_result(logger, label, item)
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")
     return results

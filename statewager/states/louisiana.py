@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from html import unescape
-import io
 import os
 import re
 from typing import Callable
@@ -14,7 +13,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from ..cache import cache_path, load_cached_or_fetch
+from ..cache import cache_path, load_cached_or_fetch, recent_fy_cache_ttl
 from ..discover import (
     DiscoveryReport,
     classify_cumulative_filename,
@@ -26,12 +25,16 @@ from ..model import (
     StateMonthResult,
     build_state_logger,
     finalize_state_month,
+    fiscal_year_july,
     format_iso_month,
+    log_month_result,
     log_skip,
+    month_yyyymm,
     parse_month_spec,
     resolve_fetch_months,
+    sum_optional,
 )
-from ..parse import is_number
+from ..parse import is_number, open_xlsx_workbook
 
 STATE_NAME = "Louisiana"
 LAUNCH_DATE: date | None = None
@@ -108,14 +111,11 @@ def _parse_workbook_all_months_core(
     """Return ``({label: (handle, revenue)}, {label: (promo_deductions, tax)})``."""
     if openpyxl is None:
         raise RuntimeError("openpyxl is required to parse Louisiana workbooks")
-    try:
-        workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    except Exception as exc:
-        log(f"WARN could not open Louisiana workbook: {exc}")
-        return {}, {}
     results: dict[str, tuple[float, float]] = {}
     fiscal_results: dict[str, tuple[float | None, float | None]] = {}
-    try:
+    with open_xlsx_workbook(data, openpyxl_mod=openpyxl, log=log, error_prefix="could not open Louisiana workbook") as workbook:
+        if workbook is None:
+            return {}, {}
         ordered_sheets = sorted(
             workbook.worksheets,
             key=lambda sheet: 0 if any(token in sheet.title.lower() for token in ("current", "mobile", "retail")) else 1,
@@ -127,9 +127,7 @@ def _parse_workbook_all_months_core(
                 revenue = row[4] if len(row) > 4 else None
                 if not isinstance(month_cell, (datetime, date)):
                     continue
-                if not is_number(handle) or not is_number(revenue):
-                    continue
-                if handle == 0 or handle == -1:
+                if not is_number(handle) or not is_number(revenue) or handle in (0, -1):
                     continue
                 label = month_cell.strftime("%b %Y")
                 if label not in results:
@@ -137,18 +135,7 @@ def _parse_workbook_all_months_core(
                     promo = abs(float(row[3])) if len(row) > 3 and is_number(row[3]) else None
                     tax = float(row[5]) if len(row) > 5 and is_number(row[5]) else None
                     fiscal_results[label] = (promo, tax)
-    finally:
-        workbook.close()
     return results, fiscal_results
-
-
-def parse_workbook_all_months(
-    data: bytes,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> dict[str, tuple[float, float]]:
-    """Return ``{ "Mon YYYY": (handle, revenue) }`` for every populated row."""
-    results, _ = _parse_workbook_all_months_core(data, log=log)
-    return results
 
 
 def parse_workbook_fiscal_all_months(
@@ -177,54 +164,59 @@ def _load_one(
             return None
     cache_filename = _CACHE_SAFE_RE.sub("_", f"{label_hint}_{os.path.basename(urlparse(url_or_path).path)}")
     cache_file = cache_path(cache_dir, cache_filename)
-
-    timestamp = None
     label_match = _LABEL_HINT_RE.search(label_hint)
-    if label_match:
-        try:
-            timestamp = datetime.strptime(
-                label_match.group(0).replace("_", " ").replace("-", " "), "%b %Y",
-            ).strftime("%Y%m")
-        except ValueError:
-            timestamp = None
+    timestamp = month_yyyymm(label_match.group(0).replace("_", " ").replace("-", " ")) if label_match else None
+    ttl_seconds = (
+        recent_fy_cache_ttl(fiscal_year_july(int(timestamp[:4]), int(timestamp[4:6]))[1])
+        if timestamp
+        else None
+    )
 
-    def _fetcher() -> bytes | None:
-        return fetch_with_wayback_fallback(
+    return load_cached_or_fetch(
+        cache_file=cache_file,
+        fetcher=lambda: fetch_with_wayback_fallback(
             url_or_path,
             timestamp_yyyymm=timestamp,
             signature_check=b"PK",
             log=log,
-        )
-
-    return load_cached_or_fetch(
-        cache_file=cache_file,
-        fetcher=_fetcher,
+        ),
         log=log,
         cache_hit_message=f"INFO using cached source for {label_hint}: {cache_filename}",
         fetch_success_message=f"INFO downloaded {label_hint}: {url_or_path}",
         fetch_error_message=f"could not download {label_hint} from {url_or_path}",
         validate=lambda payload: payload.startswith(b"PK"),
+        cache_ttl_seconds=ttl_seconds,
         offline=offline,
     )
+
+
+def _index_xlsx_entry(
+    entry: str,
+    full_path: str,
+    per_month: dict[str, dict[str, list[str]]],
+    cumulative: dict[str, list[str]],
+) -> tuple[str, str] | None:
+    classification = classify_sportsbook_filename(entry)
+    if classification:
+        label, channel = classification
+        per_month.setdefault(label, {}).setdefault(channel, []).append(full_path)
+        return label, channel
+    cum_class = classify_cumulative_filename(entry)
+    if cum_class:
+        months, channel = cum_class
+        for month_label in months:
+            cumulative.setdefault(f"{month_label}:{channel}", []).append(full_path)
+    return None
 
 
 def _scan_local_dir(local_dir: str) -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]]]:
     per_month: dict[str, dict[str, list[str]]] = {}
     cumulative: dict[str, list[str]] = {}
+    if not os.path.isdir(local_dir):
+        return per_month, cumulative
     for entry in sorted(os.listdir(local_dir)):
-        if not entry.lower().endswith(".xlsx"):
-            continue
-        full_path = os.path.join(local_dir, entry)
-        classification = classify_sportsbook_filename(entry)
-        if classification:
-            label, channel = classification
-            per_month.setdefault(label, {}).setdefault(channel, []).append(full_path)
-            continue
-        cum_class = classify_cumulative_filename(entry)
-        if cum_class:
-            months, channel = cum_class
-            for month_label in months:
-                cumulative.setdefault(f"{month_label}:{channel}", []).append(full_path)
+        if entry.lower().endswith(".xlsx"):
+            _index_xlsx_entry(entry, os.path.join(local_dir, entry), per_month, cumulative)
     return per_month, cumulative
 
 
@@ -232,12 +224,7 @@ def _scan_cache_dir(
     cache_dir: str,
     target_labels: set[str],
 ) -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]]]:
-    """Discover cached Louisiana workbooks without crawling remote indices.
-
-    Per-month ``louisiana_YYYY_MM_{channel}.xlsx`` files match their exact month
-    first, and are also indexed newest-first as cumulative fallbacks for older
-    months present inside the rolling FY workbooks.
-    """
+    """Discover cached Louisiana workbooks without crawling remote indices."""
     per_month: dict[str, dict[str, list[str]]] = {}
     cumulative: dict[str, list[str]] = {}
     if not os.path.isdir(cache_dir):
@@ -249,28 +236,20 @@ def _scan_cache_dir(
         full_path = os.path.join(cache_dir, entry)
         la_match = _LA_CACHE_FILE_RE.match(entry)
         if la_match:
-            year = int(la_match.group(1))
-            month_num = int(la_match.group(2))
+            year, month_num = int(la_match.group(1)), int(la_match.group(2))
             channel = la_match.group(3).lower()
             label = datetime(year, month_num, 1).strftime("%b %Y")
             per_month.setdefault(label, {}).setdefault(channel, []).append(full_path)
             dated_channel_files.setdefault(channel, []).append(((year, month_num), full_path))
             continue
-        classification = classify_sportsbook_filename(entry)
-        if classification:
-            label, channel = classification
-            per_month.setdefault(label, {}).setdefault(channel, []).append(full_path)
+        cls = _index_xlsx_entry(entry, full_path, per_month, cumulative)
+        if cls is not None:
+            label, channel = cls
             try:
                 month_dt = parse_month_spec(label)
                 dated_channel_files.setdefault(channel, []).append(((month_dt.year, month_dt.month), full_path))
             except ValueError:
                 pass
-            continue
-        cum_class = classify_cumulative_filename(entry)
-        if cum_class:
-            months, channel = cum_class
-            for month_label in months:
-                cumulative.setdefault(f"{month_label}:{channel}", []).append(full_path)
 
     for channel, items in dated_channel_files.items():
         newest_first = [path for _, path in sorted(items, key=lambda pair: pair[0], reverse=True)]
@@ -337,7 +316,7 @@ def _resolve_month_data_with_fiscal(
         workbook_cache[source] = (parsed, fiscal)
         return parsed, fiscal
 
-    for label in sorted(target_labels):
+    for label in sorted(target_labels, key=parse_month_spec):
         for channel in ("mobile", "retail"):
             sources: list[str] = []
             sources.extend(local_per_month.get(label, {}).get(channel, []))
@@ -385,22 +364,6 @@ def _resolve_month_data_with_fiscal(
     return resolved, resolved_sources, resolved_fiscal
 
 
-def resolve_month_data(
-    target_labels: set[str],
-    local_dir: str | None,
-    cache_dir: str | None,
-    *,
-    offline: bool = False,
-    report: DiscoveryReport | None = None,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[tuple[str, str], str]]:
-    """Return ``({(label, channel): (handle, revenue)}, {(label, channel): source})``."""
-    resolved, resolved_sources, _ = _resolve_month_data_with_fiscal(
-        target_labels, local_dir, cache_dir, offline=offline, report=report, log=log,
-    )
-    return resolved, resolved_sources
-
-
 def fetch(
     month_start: str | date | datetime | tuple[int, int],
     month_end: str | date | datetime | tuple[int, int] | None = None,
@@ -436,17 +399,9 @@ def fetch(
             total_revenue = mobile_revenue + retail_revenue
             m_promo, m_tax = resolved_fiscal.get((label, "mobile"), (None, None))
             r_promo, r_tax = resolved_fiscal.get((label, "retail"), (None, None))
-            total_promo = (
-                (m_promo or 0.0) + (r_promo or 0.0)
-                if (m_promo is not None or r_promo is not None)
-                else None
-            )
+            total_promo = sum_optional(m_promo, r_promo)
             total_gross = (total_revenue + total_promo) if total_promo is not None else None
-            total_tax = (
-                (m_tax or 0.0) + (r_tax or 0.0)
-                if (m_tax is not None or r_tax is not None)
-                else None
-            )
+            total_tax = sum_optional(m_tax, r_tax)
             m_src = resolved_sources.get((label, "mobile"), "")
             source_url = m_src if m_src.startswith("http") else REPORTS_URL
             item = finalize_state_month(
@@ -469,10 +424,7 @@ def fetch(
             if item is None:
                 continue
             results.append(item)
-            logger(
-                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
-                f"retail_handle={retail_handle:,.0f} mobile_handle={mobile_handle:,.0f} hold={item.hold:.1f}%"
-            )
+            log_month_result(logger, label, item)
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")
     return results

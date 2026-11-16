@@ -4,6 +4,8 @@ from __future__ import annotations
 import functools
 import re
 
+from .parse import clean_lower, collapse_ws, strip_superscripts
+
 BRAND_ORDER: tuple[str, ...] = (
     "DraftKings",
     "FanDuel",
@@ -21,8 +23,6 @@ BRAND_ORDER: tuple[str, ...] = (
     "Other / Retail Venue",
 )
 
-_SUPERSCRIPT_RE = re.compile(r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+")
-_WS_RE = re.compile(r"\s+")
 _SEPARATOR_HYPHEN_RE = re.compile(r"(?:\s+-\s*|-\s+)")
 _WRAP_TOKEN_RE = re.compile(r"^([(\[\"']*)(.*?)([)\],.;:!?\"]*)$")
 
@@ -112,24 +112,12 @@ _LOWER_CONNECTORS: frozenset[str] = frozenset({"at", "and", "of", "the", "for", 
 
 _CANONICAL_OVERRIDES: dict[str, str] = {
     "jack cleveland (betjack)": "Jack Cleveland - BetJack",
-    "jack cleveland - betjack": "Jack Cleveland - BetJack",
     "hollywood columbus - penn interactive (tsb)": "Hollywood Columbus - Penn Interactive (theScore Bet)",
-    "hollywood columbus - penn interactive (espn bet)": "Hollywood Columbus - Penn Interactive (ESPN Bet)",
-    "hollywood - espnbet": "Hollywood - ESPN Bet",
     "hollywood - thescore": "Hollywood - theScore Bet",
-    "kansas crossing - caesar's": "Kansas Crossing - Caesars",
-    "kansas star - bet365": "Kansas Star - bet365",
-    "caesar's sportsbook- horseshoe": "Caesars Sportsbook - Horseshoe",
-    "caesar's sportsbook - horseshoe": "Caesars Sportsbook - Horseshoe",
+    "hollywood - the score": "Hollywood - theScore Bet",
     "caesar's sportsbook-harrah's": "Caesars Sportsbook - Harrah's",
-    "caesar's sportsbook - harrah's": "Caesars Sportsbook - Harrah's",
-    "caesars sportsbook": "Caesars Sportsbook",
     "fanatics-ameristar kc": "Fanatics - Ameristar KC",
-    "fanatics - ameristar sc": "Fanatics - Ameristar SC",
     "fhr-illinois llc": "FHR-Illinois, LLC",
-    "walker's bluff casino resort, llc": "Walker's Bluff Casino Resort, LLC",
-    "penn sports interactive, llc.": "Penn Sports Interactive, LLC",
-    "valley forge casino": "Valley Forge Casino",
 }
 
 
@@ -145,16 +133,12 @@ def _normalize_single_part(core: str, *, allow_connector_lower: bool) -> str:
         return _SPECIAL_WORDS[low]
     if low.upper() in _UPPER_ACRONYMS:
         return low.upper()
-    if "/" in core:
-        return "/".join(
-            _normalize_single_part(sub, allow_connector_lower=idx > 0)
-            for idx, sub in enumerate(core.split("/"))
-        )
-    if "-" in core:
-        return "-".join(
-            _normalize_single_part(sub, allow_connector_lower=idx > 0)
-            for idx, sub in enumerate(core.split("-"))
-        )
+    for sep in ("/", "-"):
+        if sep in core:
+            return sep.join(
+                _normalize_single_part(sub, allow_connector_lower=idx > 0)
+                for idx, sub in enumerate(core.split(sep))
+            )
     if allow_connector_lower and low in _LOWER_CONNECTORS:
         return low
     return _cap_word(core)
@@ -178,20 +162,17 @@ def _normalize_token(token: str, *, allow_connector_lower: bool) -> str:
 
 
 @functools.lru_cache(maxsize=1024)
-def normalize_operator_name(raw: str, *, state: str | None = None) -> str:
-    """Normalize regulator operator/venue names away from ALL-CAPS into readable display names."""
-    cleaned = _SUPERSCRIPT_RE.sub("", str(raw or ""))
-    cleaned = _WS_RE.sub(" ", cleaned).strip()
+def _normalize_operator_cached(raw: str) -> str:
+    cleaned = collapse_ws(strip_superscripts(raw))
     if not cleaned:
         return ""
-    if cleaned.lower().startswith("ks crossing - "):
-        cleaned = "Kansas Crossing - " + cleaned[len("KS Crossing - "):]
+    cleaned = re.sub(r"^ks crossing\s*-\s*", "Kansas Crossing - ", cleaned, count=1, flags=re.IGNORECASE)
 
-    lookup_key = _SEPARATOR_HYPHEN_RE.sub(" - ", cleaned).lower()
+    spaced = _SEPARATOR_HYPHEN_RE.sub(" - ", cleaned)
+    lookup_key = spaced.lower()
     if lookup_key in _CANONICAL_OVERRIDES:
         return _CANONICAL_OVERRIDES[lookup_key]
 
-    spaced = _SEPARATOR_HYPHEN_RE.sub(" - ", cleaned)
     tokens = spaced.split(" ")
     out: list[str] = []
     at_segment_start = True
@@ -212,6 +193,12 @@ def normalize_operator_name(raw: str, *, state: str | None = None) -> str:
     if result.endswith("LLC."):
         result = result[:-1]
     return result
+
+
+def normalize_operator_name(raw: str, *, state: str | None = None) -> str:
+    """Normalize regulator operator/venue names away from ALL-CAPS into readable display names."""
+    del state
+    return _normalize_operator_cached(str(raw or ""))
 
 
 _STATE_PROPERTY_BRANDS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -303,7 +290,7 @@ _DIRECT_BRAND_PATTERNS: tuple[tuple[str, str], ...] = (
 @functools.lru_cache(maxsize=1024)
 def classify_operator_brand(raw: str, *, state: str | None = None) -> str:
     """Map an operator/licensee string to its canonical cross-state sportsbook brand."""
-    low = _WS_RE.sub(" ", _SUPERSCRIPT_RE.sub("", str(raw or "")).strip()).lower()
+    low = clean_lower(strip_superscripts(raw))
     if not low:
         return "Other / Retail Venue"
 

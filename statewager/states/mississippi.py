@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-import io
-import os
 from typing import Callable
 
 try:
@@ -11,7 +9,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from ..cache import cache_path, load_cached_or_fetch
+from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_cache_ttl
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
@@ -19,10 +17,11 @@ from ..model import (
     build_state_logger,
     finalize_state_month,
     format_iso_month,
+    log_month_result,
     log_skip,
     resolve_fetch_months,
 )
-from ..parse import ensure_xlsx, is_number
+from ..parse import ensure_xlsx, is_number, open_xlsx_workbook
 
 STATE_NAME = "Mississippi"
 LAUNCH_DATE: date | None = None
@@ -36,7 +35,6 @@ EXTRA_HEADERS: list[str] = [
 ]
 HAS_DETAILS = False
 
-BASE_URL = "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_sports_wagering.xlsx"
 URL_VARIANT_TEMPLATES = [
     "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_sports_wagering.xlsx",
     "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_sports_wagering.xls",
@@ -45,6 +43,7 @@ URL_VARIANT_TEMPLATES = [
     "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_sports_wagering.xlsx_.xls",
     "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_Sports_Wagering.xlsx_.xls",
 ]
+BASE_URL = URL_VARIANT_TEMPLATES[0]
 REGION_ORDER = ["Central", "Coastal", "Northern"]
 
 _DEFAULT_LOG = build_state_logger("MS")
@@ -79,14 +78,9 @@ def parse_state_totals(
     if openpyxl is None:
         raise RuntimeError("openpyxl is required to parse Mississippi workbooks")
     converted = ensure_xlsx(data, log=log)
-    if converted is None:
-        return None
-    try:
-        workbook = openpyxl.load_workbook(io.BytesIO(converted), data_only=True, read_only=True)
-    except Exception as exc:
-        log(f"WARN could not open workbook: {exc}")
-        return None
-    try:
+    with open_xlsx_workbook(converted, openpyxl_mod=openpyxl, log=log) as workbook:
+        if workbook is None:
+            return None
         state_totals: tuple[float, float] | None = None
         region_totals: list[tuple[float, float]] = []
         detail_rows: list[tuple[str, float, float]] = []
@@ -96,18 +90,18 @@ def parse_state_totals(
                 label = str(row[0] if row else "").strip().lower()
                 if region_name is None and label in {"central", "coastal", "northern"}:
                     region_name = str(row[0]).strip()
-                if "overall for state" in label:
+                if "overall for state" in label or "overall for region" in label:
                     handle = row[2] if len(row) > 2 else None
                     revenue = row[4] if len(row) > 4 else None
-                    if state_totals is None and is_number(handle) and is_number(revenue):
-                        state_totals = (float(handle), float(revenue))
-                if "overall for region" in label:
-                    handle = row[2] if len(row) > 2 else None
-                    revenue = row[4] if len(row) > 4 else None
-                    if is_number(handle) and is_number(revenue):
-                        region_totals.append((float(handle), float(revenue)))
+                    if not (is_number(handle) and is_number(revenue)):
+                        continue
+                    pair = (float(handle), float(revenue))
+                    if "overall for state" in label and state_totals is None:
+                        state_totals = pair
+                    elif "overall for region" in label:
+                        region_totals.append(pair)
                         if region_name:
-                            detail_rows.append((region_name, float(handle), float(revenue)))
+                            detail_rows.append((region_name, *pair))
         if state_totals is not None:
             return state_totals[0], state_totals[1], detail_rows
         if region_totals:
@@ -117,8 +111,6 @@ def parse_state_totals(
                 detail_rows,
             )
         return None
-    finally:
-        workbook.close()
 
 
 def parse_local_file(
@@ -128,15 +120,12 @@ def parse_local_file(
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> tuple[float, float, list[tuple[str, float, float]]] | None:
     prefix = f"{mm}{yy}".lower()
-    for entry in sorted(os.listdir(local_dir)):
-        lower = entry.lower()
-        if not lower.startswith(prefix):
-            continue
-        if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".xlsx_.xls")):
-            continue
-        with open(os.path.join(local_dir, entry), "rb") as file_handle:
-            return parse_state_totals(file_handle.read(), log=log)
-    return None
+    matched = find_local_file(
+        local_dir,
+        lambda entry: entry.lower().startswith(prefix)
+        and entry.lower().endswith((".xlsx", ".xls", ".xlsx_.xls")),
+    )
+    return parse_state_totals(matched[1], log=log) if matched is not None else None
 
 
 def fetch(
@@ -154,7 +143,6 @@ def fetch(
         raise RuntimeError("openpyxl is required to fetch Mississippi sports wagering data")
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
-    current_year = date.today().year
     results: list[StateMonthResult] = []
     for mdate in target_dates:
         mm = mdate.strftime("%m")
@@ -171,23 +159,16 @@ def fetch(
             found_urls: list[str] = []
             if parsed is None:
                 path = cache_path(cache_dir, f"mississippi_{yyyy}_{mm}.xlsx")
-
-                def _fetch_ms(m: str = mm, y: str = yy, urls: list[str] = found_urls) -> bytes | None:
-                    try:
-                        return download_xlsx(m, y, report=report, log=logger, matched_url=urls)
-                    except TypeError as exc:
-                        if "matched_url" not in str(exc):
-                            raise
-                        return download_xlsx(m, y, report=report, log=logger)
-
                 data = load_cached_or_fetch(
                     cache_file=path,
-                    fetcher=_fetch_ms,
+                    fetcher=lambda m=mm, y=yy, urls=found_urls: download_xlsx(
+                        m, y, report=report, log=logger, matched_url=urls,
+                    ),
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {label}",
                     fetch_error_message=f"could not download Mississippi workbook for {label}",
                     validate=lambda payload: payload.startswith((b"PK", b"\xd0\xcf\x11\xe0")),
-                    cache_ttl_seconds=7 * 86400 if mdate.year >= current_year else None,
+                    cache_ttl_seconds=recent_cache_ttl(mdate.year, mdate.month),
                     offline=offline,
                 )
                 if data:
@@ -223,7 +204,7 @@ def fetch(
             if item is None:
                 continue
             results.append(item)
-            logger(f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} hold={(item.hold or 0.0):.1f}%")
+            log_month_result(logger, label, item, include_splits=False)
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")
     return results

@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-import io
-import os
 from typing import Callable
 
 try:
@@ -11,7 +9,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from ..cache import cache_path, load_cached_or_fetch
+from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_cache_ttl
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
@@ -20,11 +18,12 @@ from ..model import (
     build_state_logger,
     finalize_state_month,
     format_iso_month,
+    log_month_result,
     log_skip,
     resolve_fetch_months,
     validate_result,
 )
-from ..parse import is_number
+from ..parse import is_number, open_xlsx_workbook
 
 STATE_NAME = "Indiana"
 LAUNCH_DATE: date | None = None
@@ -45,6 +44,18 @@ def normalize_sheet_title(title: str) -> str:
     return "".join(ch for ch in title.lower().strip() if ch.isalnum() or ch.isspace()).strip()
 
 
+def _find_handle_agr_cols(row: tuple[object, ...]) -> tuple[int | None, int | None]:
+    handle_col: int | None = None
+    agr_col: int | None = None
+    for index, cell in enumerate(row):
+        text = str(cell or "").strip().lower()
+        if handle_col is None and text == "handle":
+            handle_col = index
+        if agr_col is None and "taxable agr" in text:
+            agr_col = index
+    return handle_col, agr_col
+
+
 def parse_summary_totals(workbook) -> tuple[float, float] | None:
     candidate_sheets = [
         ws
@@ -59,12 +70,7 @@ def parse_summary_totals(workbook) -> tuple[float, float] | None:
             if not any(cell is not None for cell in row):
                 continue
             if handle_col is None or agr_col is None:
-                for index, cell in enumerate(row):
-                    text = str(cell or "").strip().lower()
-                    if handle_col is None and text == "handle":
-                        handle_col = index
-                    if agr_col is None and "taxable agr" in text:
-                        agr_col = index
+                handle_col, agr_col = _find_handle_agr_cols(row)
                 continue
             label = str(row[0] if row else "").strip().lower()
             if label != "total":
@@ -107,14 +113,7 @@ def _parse_tax_summary_sheet(
     for row in sheet.iter_rows(values_only=True):
         matched_header = False
         if handle_col is None or agr_col is None:
-            h_idx: int | None = None
-            a_idx: int | None = None
-            for index, cell in enumerate(row):
-                text = str(cell or "").strip().lower()
-                if h_idx is None and text == "handle":
-                    h_idx = index
-                if a_idx is None and "taxable agr" in text:
-                    a_idx = index
+            h_idx, a_idx = _find_handle_agr_cols(row)
             if h_idx is not None and a_idx is not None:
                 handle_col = h_idx
                 agr_col = a_idx
@@ -183,12 +182,8 @@ def is_retail_detail_label(label: str) -> bool:
 
 
 def allocate_adjustments(retail_revenue: float, mobile_revenue: float, adjustments: float) -> tuple[float, float]:
-    total = retail_revenue + mobile_revenue
-    if total == 0:
-        return retail_revenue + adjustments, mobile_revenue
-    retail_share = retail_revenue / total if retail_revenue else 0.0
-    retail_adjustment = adjustments * retail_share
-    return retail_revenue + retail_adjustment, mobile_revenue + (adjustments - retail_adjustment)
+    adj_ret, adj_mob = _allocate_component_adjustments([retail_revenue, mobile_revenue], adjustments)
+    return adj_ret, adj_mob
 
 
 def _parse_detail_sheet_blocks(
@@ -266,13 +261,6 @@ def _breakdown_from_blocks(
     return breakdowns
 
 
-def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, float]] | None:
-    blocks = _parse_detail_sheet_blocks(workbook)
-    if blocks is None:
-        return None
-    return _breakdown_from_blocks(blocks)
-
-
 def _format_skin_operator_name(location_name: str, skin_label: str) -> str:
     low = skin_label.strip().lower()
     if "bet365" in low:
@@ -292,7 +280,11 @@ def _allocate_component_adjustments(raw_revenues: list[float], adjustments: floa
     if not raw_revenues:
         return []
     total_raw = sum(raw_revenues)
-    if total_raw == 0:
+    abs_total = sum(abs(rev) for rev in raw_revenues)
+    # Use unsigned magnitude weights if signed sum cancels near zero to prevent blowup.
+    use_abs = abs_total > 0 and (total_raw == 0 or abs(total_raw) < 0.01 * abs_total)
+    denom = abs_total if use_abs else total_raw
+    if denom == 0:
         allocated = list(raw_revenues)
         allocated[0] += adjustments
         return allocated
@@ -302,7 +294,8 @@ def _allocate_component_adjustments(raw_revenues: list[float], adjustments: floa
         if idx == len(raw_revenues) - 1:
             adj = adjustments - used
         else:
-            adj = adjustments * (rev / total_raw) if rev else 0.0
+            weight = abs(rev) if use_abs else rev
+            adj = adjustments * (weight / denom) if weight else 0.0
             used += adj
         allocated.append(rev + adj)
     return allocated
@@ -311,6 +304,8 @@ def _allocate_component_adjustments(raw_revenues: list[float], adjustments: floa
 def _allocate_component_tax(adj_revenues: list[float], total_tax: float | None) -> list[float | None]:
     if total_tax is None or not adj_revenues:
         return [None] * len(adj_revenues)
+    if total_tax == 0.0:
+        return [0.0] * len(adj_revenues)
     weights = [max(0.0, rev) for rev in adj_revenues]
     total_w = sum(weights)
     if total_w <= 0:
@@ -327,6 +322,19 @@ def _allocate_component_tax(adj_revenues: list[float], total_tax: float | None) 
             share = round(total_tax * (w / total_w), 2)
             used += share
             allocated.append(share)
+    if total_tax > 0 and any(val is not None and val < 0 for val in allocated):
+        # Fall back to Hamilton largest-remainder cent allocation so small tails stay non-negative.
+        total_cents = round(total_tax * 100)
+        raw_cents = [total_cents * (w / total_w) for w in weights]
+        cents = [int(rc) if w > 0 else 0 for rc, w in zip(raw_cents, weights)]
+        rem = total_cents - sum(cents)
+        order = sorted(
+            (idx for idx, w in enumerate(weights) if w > 0),
+            key=lambda idx: (-(raw_cents[idx] - cents[idx]), idx),
+        )
+        for idx in order[:max(0, rem)]:
+            cents[idx] += 1
+        return [round(c / 100.0, 2) for c in cents]
     return allocated
 
 
@@ -386,30 +394,15 @@ def _build_publish_detail_rows_with_fiscal(
     return publish_rows
 
 
-def _build_publish_detail_rows(
-    locations: dict[str, tuple[float, float]],
-    blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]],
-) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
-    return [
-        row[:7]  # type: ignore[misc]
-        for row in _build_publish_detail_rows_with_fiscal(locations, blocks, {})
-    ]
-
-
 def _parse_workbook_with_skins(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
-    *,
-    include_fiscal: bool = False,
 ):
     if openpyxl is None:
         raise RuntimeError("openpyxl is required to parse Indiana workbooks")
-    try:
-        workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    except Exception as exc:
-        log(f"WARN could not open workbook: {exc}")
-        return None
-    try:
+    with open_xlsx_workbook(data, openpyxl_mod=openpyxl, log=log) as workbook:
+        if workbook is None:
+            return None
         totals = parse_summary_totals(workbook)
         if totals is None:
             log("WARN Indiana workbook missing statewide summary totals")
@@ -436,64 +429,31 @@ def _parse_workbook_with_skins(
             if split is None:
                 detail_rows.append((location_name, location_handle, location_revenue, None, None, None, None))
                 continue
-            detail_rows.append(
-                (
-                    location_name,
-                    location_handle,
-                    location_revenue,
-                    split[0],
-                    split[1],
-                    split[2],
-                    split[3],
-                )
-            )
-        if include_fiscal:
-            publish_rows = _build_publish_detail_rows_with_fiscal(locations, blocks, loc_taxes)
-            return (
-                handle,
-                revenue,
-                retail_handle,
-                retail_revenue,
-                mobile_handle,
-                mobile_revenue,
-                detail_rows,
-                publish_rows,
-                state_gross_revenue,
-                total_tax,
-                loc_gross,
-                loc_taxes,
-            )
-        publish_rows = _build_publish_detail_rows(locations, blocks)
-        return handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, detail_rows, publish_rows
-    finally:
-        workbook.close()
-
-
-def parse_state_totals(
-    data: bytes,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
-    list[tuple[str, float, float, float | None, float | None, float | None, float | None]],
-] | None:
-    parsed = _parse_workbook_with_skins(data, log=log)
-    if parsed is None:
-        return None
-    return parsed[:7]
+            detail_rows.append((location_name, location_handle, location_revenue, *split))
+        publish_rows = _build_publish_detail_rows_with_fiscal(locations, blocks, loc_taxes)
+        return (
+            handle,
+            revenue,
+            retail_handle,
+            retail_revenue,
+            mobile_handle,
+            mobile_revenue,
+            detail_rows,
+            publish_rows,
+            state_gross_revenue,
+            total_tax,
+            loc_gross,
+            loc_taxes,
+        )
 
 
 def parse_local_file(local_dir: str, yyyy: str, mm: str) -> bytes | None:
-    prefix = f"{yyyy}-{mm}-revenue"
-    for entry in sorted(os.listdir(local_dir)):
-        if entry.lower().endswith(".xlsx") and entry.lower().startswith(prefix.lower()):
-            with open(os.path.join(local_dir, entry), "rb") as file_handle:
-                return file_handle.read()
-    return None
+    prefixes = (f"{yyyy}-{mm}-revenue", f"{yyyy}_{mm}_revenue", f"{mm}-{yyyy}-revenue", f"{yyyy}{mm}_revenue")
+    matched = find_local_file(
+        local_dir,
+        lambda name: name.lower().endswith(".xlsx") and name.lower().startswith(prefixes),
+    )
+    return matched[1] if matched is not None else None
 
 
 def fetch(
@@ -511,7 +471,6 @@ def fetch(
         raise RuntimeError("openpyxl is required to fetch Indiana sports wagering data")
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
-    current_year = date.today().year
     results: list[StateMonthResult] = []
     for mdate in target_dates:
         yyyy = mdate.strftime("%Y")
@@ -542,7 +501,7 @@ def fetch(
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {label}",
                     fetch_error_message=f"could not download Indiana workbook for {label}",
-                    cache_ttl_seconds=7 * 86400 if int(yyyy) >= current_year else None,
+                    cache_ttl_seconds=recent_cache_ttl(mdate.year, mdate.month),
                     offline=offline,
                 )
             if matched:
@@ -550,7 +509,7 @@ def fetch(
             if data is None:
                 log_skip(logger, label, "workbook unavailable")
                 continue
-            parsed = _parse_workbook_with_skins(data, log=logger, include_fiscal=True)
+            parsed = _parse_workbook_with_skins(data, log=logger)
             if parsed is None:
                 log_skip(logger, label, "could not parse statewide totals")
                 continue
@@ -628,11 +587,7 @@ def fetch(
             if item is None:
                 continue
             results.append(item)
-            logger(
-                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
-                f"retail_handle={item.retail_handle:,.0f} mobile_handle={item.mobile_handle:,.0f} "
-                f"hold={item.hold:.1f}%"
-            )
+            log_month_result(logger, label, item)
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")
     return results

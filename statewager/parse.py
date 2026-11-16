@@ -1,7 +1,8 @@
 """Currency, PDF/OCR, Excel, and fuzzy label parsing helpers."""
 from __future__ import annotations
 
-import functools
+from contextlib import contextmanager
+import io
 import math
 import os
 from pathlib import Path
@@ -9,30 +10,63 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Callable
+import threading
+from typing import Callable, Iterator
 
 from .model import hold_pct, round_or_blank, safe_float
 
 _LABEL_NORM_RE = re.compile(r"[^a-z0-9 ]+")
 _MONEY_STRIP_RE = re.compile(r"[\$,\s]+")
+_SUPERSCRIPT_RE = re.compile(r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+")
 _PLACEHOLDERS = frozenset({"", "-", "—", "–", "n/a", "na", "none", "null"})
-_ORIG_SHUTIL_WHICH = shutil.which
+PDFPLUMBER_LOCK = threading.Lock()
 
 
-@functools.lru_cache(maxsize=32)
-def _cached_which(name: str, path_env: str) -> str | None:
-    return _ORIG_SHUTIL_WHICH(name)
+def collapse_ws(value: object) -> str:
+    """Collapse internal whitespace to single spaces and strip ends."""
+    return " ".join(str(value or "").split())
+
+
+def clean_lower(value: object) -> str:
+    """Collapse whitespace and lowercase a text cell or label."""
+    return collapse_ws(value).lower()
+
+
+def strip_superscripts(value: object) -> str:
+    """Remove Unicode footnote superscript digits from a text label."""
+    return _SUPERSCRIPT_RE.sub("", str(value or ""))
 
 
 def _which(*names: str) -> str | None:
-    """Resolve first available executable on PATH with safe test-mock awareness."""
-    which_fn = shutil.which
-    path_env = os.environ.get("PATH", "")
-    for name in names:
-        resolved = _cached_which(name, path_env) if which_fn is _ORIG_SHUTIL_WHICH else which_fn(name)
-        if resolved:
-            return resolved
-    return None
+    """Return the first available executable path on PATH."""
+    return next((path for name in names if (path := shutil.which(name))), None)
+
+
+@contextmanager
+def open_xlsx_workbook(
+    data: bytes | None,
+    *,
+    openpyxl_mod: object = None,
+    log: Callable[[str], None] | None = None,
+    error_prefix: str = "could not open workbook",
+) -> Iterator[object | None]:
+    """Open XLSX bytes in read-only data-only mode, yielding None on empty/corrupt input."""
+    if not data:
+        yield None
+        return
+    if openpyxl_mod is None:
+        import openpyxl as openpyxl_mod
+    try:
+        workbook = openpyxl_mod.load_workbook(io.BytesIO(data), data_only=True, read_only=True)  # type: ignore[attr-defined]
+    except Exception as exc:
+        if log:
+            log(f"WARN {error_prefix}: {exc}")
+        yield None
+        return
+    try:
+        yield workbook
+    finally:
+        workbook.close()  # type: ignore[attr-defined]
 
 MAIN_HEADERS: list[str] = [
     "Month", "Handle", "Revenue", "Hold%",
@@ -189,11 +223,13 @@ def extract_pdf_text(
     first_page: int | None = None,
     last_page: int | None = None,
     raw: bool = False,
+    layout: bool = False,
+    use_pdfplumber: bool = True,
     log: Callable[[str], None] | None = None,
 ) -> str | None:
     """Extract text from PDF bytes, trying pdfplumber then pdftotext.
 
-    - ``raw=True`` skips pdfplumber and goes straight to ``pdftotext -raw``.
+    - ``raw=True`` or ``use_pdfplumber=False`` skips pdfplumber.
     - When pdfplumber returns empty or fails, falls back to pdftotext.
     - Returns None if both methods fail or are unavailable.
     """
@@ -202,10 +238,9 @@ def extract_pdf_text(
     except ImportError:
         _pdfplumber = None
 
-    if not raw and _pdfplumber is not None:
+    if not raw and use_pdfplumber and _pdfplumber is not None:
         try:
-            import io as _io
-            with _pdfplumber.open(_io.BytesIO(data)) as pdf:
+            with PDFPLUMBER_LOCK, _pdfplumber.open(io.BytesIO(data)) as pdf:
                 pages = pdf.pages
                 if first_page is not None or last_page is not None:
                     start = (first_page or 1) - 1
@@ -232,6 +267,8 @@ def extract_pdf_text(
         args = [pdftotext_bin]
         if raw:
             args.append("-raw")
+        elif layout:
+            args.append("-layout")
         if first_page is not None:
             args.extend(["-f", str(first_page)])
         if last_page is not None:

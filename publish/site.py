@@ -4,6 +4,7 @@ from __future__ import annotations
 from html import escape
 import json
 import os
+import re
 from typing import Sequence
 
 from statewager.operators import BRAND_ORDER
@@ -42,14 +43,14 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       border-bottom: 1px solid var(--border);
       padding: 1.25rem 1.5rem;
     }
-    .container {
+    .container, header .inner {
       max-width: 1220px;
       margin: 0 auto;
+    }
+    .container {
       padding: 1.25rem 1.5rem 3rem;
     }
     header .inner {
-      max-width: 1220px;
-      margin: 0 auto;
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
@@ -87,23 +88,29 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
     }
     .btn:hover { border-color: var(--accent); color: var(--accent); }
     .btn.copied { border-color: var(--pos); color: var(--pos); }
+    .freshness-bar, .controls, .kpi, .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
     .freshness-bar {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 0.4rem;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
       padding: 0.65rem 0.9rem;
       margin-bottom: 0.85rem;
       font-size: 0.78rem;
     }
-    .freshness-label {
+    .freshness-label, .field > label:not(.checkbox-label), .kpi .label {
+      font-size: 0.75rem;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       color: var(--muted);
+    }
+    .freshness-label {
+      font-size: 0.78rem;
       margin-right: 0.25rem;
     }
     .fresh-pill {
@@ -113,7 +120,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       padding: 0.2rem 0.55rem;
       border-radius: 999px;
       border: 1px solid var(--border);
-      background: #f8fafc;
+      background: var(--bg);
       color: var(--text);
       font-size: 0.76rem;
       font-family: inherit;
@@ -140,9 +147,6 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       flex-wrap: wrap;
       gap: 0.85rem;
       align-items: end;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
       padding: 1rem 1.1rem;
       margin-bottom: 1rem;
     }
@@ -162,7 +166,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 6px;
       font-size: 0.9rem;
       font-family: inherit;
-      background: #fff;
+      background: var(--panel);
       color: var(--text);
       cursor: pointer;
       text-align: left;
@@ -200,7 +204,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
     .compare-tabs { display: inline-flex; gap: 0.25rem; }
     .compare-tab, .compare-clear {
       border: 1px solid var(--border);
-      background: #f8fafc;
+      background: var(--bg);
       color: var(--text);
       border-radius: 5px;
       padding: 0.2rem 0.5rem;
@@ -255,13 +259,6 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 2px;
       display: inline-block;
     }
-    .field label {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--muted);
-    }
     .field-check {
       min-width: auto;
       justify-content: flex-end;
@@ -271,11 +268,9 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       display: inline-flex;
       align-items: center;
       gap: 0.45rem;
-      font-size: 0.85rem !important;
-      font-weight: 500 !important;
-      text-transform: none !important;
-      letter-spacing: normal !important;
-      color: var(--text) !important;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text);
       cursor: pointer;
       white-space: nowrap;
     }
@@ -288,7 +283,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       border: 1px solid var(--border);
       border-radius: 6px;
       font-size: 0.9rem;
-      background: #fff;
+      background: var(--panel);
       color: var(--text);
     }
     select:disabled {
@@ -303,17 +298,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       margin-bottom: 1rem;
     }
     .kpi {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
       padding: 0.9rem 1rem;
-    }
-    .kpi .label {
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--muted);
-      font-weight: 600;
     }
     .kpi .value {
       font-size: 1.35rem;
@@ -322,9 +307,6 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       font-variant-numeric: tabular-nums;
     }
     .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
       padding: 1rem 1.1rem;
       margin-bottom: 1rem;
     }
@@ -353,8 +335,8 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
     .tooltip {
       position: fixed;
       pointer-events: none;
-      background: #0f172a;
-      color: #f8fafc;
+      background: var(--text);
+      color: var(--bg);
       padding: 0.45rem 0.65rem;
       border-radius: 6px;
       font-size: 0.78rem;
@@ -378,8 +360,6 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       text-align: right;
       white-space: nowrap;
     }
-    th:nth-child(1), td:nth-child(1),
-    th:nth-child(2), td:nth-child(2),
     th.col-text, td.col-text,
     th:last-child, td:last-child {
       text-align: left;
@@ -391,10 +371,11 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       cursor: pointer;
       user-select: none;
     }
+    th.no-sort { cursor: default; }
     th:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
     th[aria-sort="ascending"]::after { content: " ▲"; font-size: 0.7em; color: var(--accent); }
     th[aria-sort="descending"]::after { content: " ▼"; font-size: 0.7em; color: var(--accent); }
-    tbody tr:hover { background: #f8fafc; }
+    tbody tr:hover { background: var(--bg); }
     .pos { color: var(--pos); }
     .neg { color: var(--neg); }
     .status {
@@ -434,7 +415,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
   </header>
 
   <main class="container">
-    <div id="statusBanner" class="status">Loading CSV dataset…</div>
+    <div id="statusBanner" class="status" role="status" aria-live="polite">Loading CSV dataset…</div>
     <div id="freshnessBar" class="freshness-bar" aria-label="Regulator release freshness" style="display:none"></div>
 
     <section class="controls">
@@ -476,14 +457,14 @@ __STATE_OPTIONS__
           <option value="tax">Wagering Tax ($)</option>
         </select>
       </div>
-      <div class="field compare-wrap" id="compareWrap">
+      <div class="field compare-wrap">
         <label for="compareBtn">Compare</label>
-        <button type="button" class="compare-trigger" id="compareBtn" aria-expanded="false">Compare (0)</button>
+        <button type="button" class="compare-trigger" id="compareBtn" aria-expanded="false" aria-controls="comparePanel" aria-haspopup="dialog">Compare (0)</button>
         <div id="comparePanel" class="compare-panel" role="dialog" aria-label="Compare brands or states">
           <div class="compare-head">
-            <div class="compare-tabs">
-              <button type="button" class="compare-tab active" data-mode="brands" id="cmpModeBrands">Brands</button>
-              <button type="button" class="compare-tab" data-mode="states" id="cmpModeStates">States</button>
+            <div class="compare-tabs" role="tablist" aria-label="Compare mode">
+              <button type="button" class="compare-tab active" data-mode="brands" id="cmpModeBrands" role="tab" aria-selected="true">Brands</button>
+              <button type="button" class="compare-tab" data-mode="states" id="cmpModeStates" role="tab" aria-selected="false">States</button>
             </div>
             <button type="button" class="compare-clear" id="compareClearBtn">Clear</button>
           </div>
@@ -523,7 +504,7 @@ __STATE_OPTIONS__
       </div>
       <div id="chartLegend" class="chart-legend" style="display:none"></div>
       <div class="chart-wrap">
-        <svg id="chartSvg" class="chart" viewBox="0 0 960 290" preserveAspectRatio="none"></svg>
+        <svg id="chartSvg" class="chart" viewBox="0 0 960 290" preserveAspectRatio="none" role="img" aria-labelledby="chartTitle"></svg>
       </div>
     </section>
 
@@ -535,26 +516,26 @@ __STATE_OPTIONS__
         <table>
           <thead>
             <tr>
-              <th data-col="month">Month</th>
-              <th data-col="state">State</th>
-              <th data-col="operator" class="col-text detail-col" style="display:none">Company / Venue</th>
-              <th data-col="brand" class="col-text detail-col" style="display:none">Brand</th>
-              <th data-col="handle">Handle</th>
-              <th data-col="revenue">Revenue</th>
-              <th data-col="hold">Hold %</th>
-              <th data-col="yoy_handle" class="yoy-col" style="display:none">YoY Handle %</th>
-              <th data-col="yoy_hold_bps" class="yoy-col" style="display:none">YoY Hold Δ (bps)</th>
-              <th data-col="gross_revenue" class="gross-col" style="display:none">Gross Revenue</th>
-              <th data-col="gross_hold" class="gross-col" style="display:none">Gross Hold %</th>
-              <th data-col="promo_deductions" class="promo-col" style="display:none">Promo / Credits</th>
-              <th data-col="tax" class="tax-col" style="display:none">Wagering Tax</th>
-              <th data-col="retail_handle" class="channel-col">Retail Handle</th>
-              <th data-col="retail_revenue" class="channel-col">Retail Revenue</th>
-              <th data-col="retail_hold" class="channel-col">Retail Hold %</th>
-              <th data-col="mobile_handle" class="channel-col">Mobile Handle</th>
-              <th data-col="mobile_revenue" class="channel-col">Mobile Revenue</th>
-              <th data-col="mobile_hold" class="channel-col">Mobile Hold %</th>
-              <th>Source</th>
+              <th data-col="month" class="col-text" scope="col">Month</th>
+              <th data-col="state" class="col-text" scope="col">State</th>
+              <th data-col="operator" class="col-text detail-col" scope="col" style="display:none">Company / Venue</th>
+              <th data-col="brand" class="col-text detail-col" scope="col" style="display:none">Brand</th>
+              <th data-col="handle" scope="col">Handle</th>
+              <th data-col="revenue" scope="col">Revenue</th>
+              <th data-col="hold" scope="col">Hold %</th>
+              <th data-col="yoy_handle" class="yoy-col" scope="col" style="display:none">YoY Handle %</th>
+              <th data-col="yoy_hold_bps" class="yoy-col" scope="col" style="display:none">YoY Hold Δ (bps)</th>
+              <th data-col="gross_revenue" class="gross-col" scope="col" style="display:none">Gross Revenue</th>
+              <th data-col="gross_hold" class="gross-col" scope="col" style="display:none">Gross Hold %</th>
+              <th data-col="promo_deductions" class="promo-col" scope="col" style="display:none">Promo / Credits</th>
+              <th data-col="tax" class="tax-col" scope="col" style="display:none">Wagering Tax</th>
+              <th data-col="retail_handle" class="channel-col" scope="col">Retail Handle</th>
+              <th data-col="retail_revenue" class="channel-col" scope="col">Retail Revenue</th>
+              <th data-col="retail_hold" class="channel-col" scope="col">Retail Hold %</th>
+              <th data-col="mobile_handle" class="channel-col" scope="col">Mobile Handle</th>
+              <th data-col="mobile_revenue" class="channel-col" scope="col">Mobile Revenue</th>
+              <th data-col="mobile_hold" class="channel-col" scope="col">Mobile Hold %</th>
+              <th class="no-sort" scope="col">Source</th>
             </tr>
           </thead>
           <tbody id="tableBody"></tbody>
@@ -575,6 +556,8 @@ __STATE_OPTIONS__
       ];
       const csvCache = new Map();
       const detailCsvCache = new Map();
+      const csvInFlight = new Map();
+      const windowCache = new WeakMap();
       let activeStateRows = [];
       let activeDetailRows = [];
       let activeRows = [];
@@ -597,8 +580,11 @@ __STATE_OPTIONS__
       let compareSelected = [];
       let pendingUrlState = null;
       let hydrated = false;
+      let lastCommittedSlug = "__ALL__";
+      let copyBtnTimer = null;
       let loadSeq = 0;
       let compareSeq = 0;
+      let compareListSeq = 0;
 
       const stateSelect = document.getElementById("stateSelect");
       const entitySelect = document.getElementById("entitySelect");
@@ -609,7 +595,6 @@ __STATE_OPTIONS__
       const includePartialInput = document.getElementById("includePartial");
       const partialField = document.getElementById("partialField");
       const freshnessBar = document.getElementById("freshnessBar");
-      const compareWrap = document.getElementById("compareWrap");
       const compareBtn = document.getElementById("compareBtn");
       const comparePanel = document.getElementById("comparePanel");
       const compareList = document.getElementById("compareList");
@@ -619,6 +604,7 @@ __STATE_OPTIONS__
       const compareClearBtn = document.getElementById("compareClearBtn");
       const exportViewBtn = document.getElementById("exportViewBtn");
       const copyLinkBtn = document.getElementById("copyLinkBtn");
+      const chartTitleEl = document.getElementById("chartTitle");
       const chartNote = document.getElementById("chartNote");
       const chartLegend = document.getElementById("chartLegend");
       const statusBanner = document.getElementById("statusBanner");
@@ -628,15 +614,58 @@ __STATE_OPTIONS__
       const kpiRevenueLabel = document.getElementById("kpiRevenueLabel");
       const kpiYoyLabel = document.getElementById("kpiYoyLabel");
       const kpiRowsLabel = document.getElementById("kpiRowsLabel");
+      const kpiHandleEl = document.getElementById("kpiHandle");
+      const kpiRevenueEl = document.getElementById("kpiRevenue");
+      const kpiHoldEl = document.getElementById("kpiHold");
+      const kpiYoyHandleEl = document.getElementById("kpiYoyHandle");
+      const kpiMobileShareEl = document.getElementById("kpiMobileShare");
+      const kpiRowsEl = document.getElementById("kpiRows");
+      const tableTitle = document.getElementById("tableTitle");
+      const tableBody = document.getElementById("tableBody");
       const chartSvg = document.getElementById("chartSvg");
       const tooltip = document.getElementById("tooltip");
 
+      function calcHold(h, r) {
+        return (h !== null && h > 0 && r !== null) ? (r / h) * 100 : null;
+      }
+
+      function entityKey(r) {
+        return r._ekey || `${r.state}\\x1f${r.operator}\\x1f${r.brand}`;
+      }
+
+      function addHoldTotals(totals, r) {
+        if (r.handle !== null && r.revenue !== null) {
+          totals.holdHandle += r.handle;
+          totals.holdRevenue += r.revenue;
+        }
+      }
+
+      function inDateRange(m) {
+        const fromM = fromMonthInput.value;
+        const toM = toMonthInput.value;
+        return (!fromM || m >= fromM) && (!toM || m <= toM);
+      }
+
+      function windowLabel(winM) {
+        return winM === 3 ? "Rolling 3M" : (winM === 12 ? "TTM (12M)" : "");
+      }
+
+      function orderedBrandsFromRows(rows) {
+        const present = new Set(rows.map((r) => r.brand).filter(Boolean));
+        const ordered = BRAND_ORDER.filter((b) => present.has(b));
+        Array.from(present)
+          .filter((b) => !BRAND_ORDER.includes(b))
+          .sort((a, b) => a.localeCompare(b))
+          .forEach((b) => ordered.push(b));
+        return ordered;
+      }
+
+      const MONTH_RE = /^\\d{4}-(?:0[1-9]|1[0-2])$/;
+
       function addMonths(ym, delta) {
-        const parts = String(ym || "").split("-");
-        if (parts.length !== 2) return "";
-        const y = Number(parts[0]);
-        const m = Number(parts[1]);
-        if (!Number.isInteger(y) || !Number.isInteger(m)) return "";
+        const s = String(ym || "");
+        if (!MONTH_RE.test(s) || !Number.isInteger(delta)) return "";
+        const [y, m] = s.split("-").map(Number);
         const total = y * 12 + (m - 1) + delta;
         const ny = Math.floor(total / 12);
         const nm = ((total % 12) + 12) % 12 + 1;
@@ -644,20 +673,32 @@ __STATE_OPTIONS__
       }
 
       function monthDiff(aYm, bYm) {
-        const pa = String(aYm || "").split("-");
-        const pb = String(bYm || "").split("-");
-        if (pa.length !== 2 || pb.length !== 2) return 0;
-        return (Number(pa[0]) - Number(pb[0])) * 12 + (Number(pa[1]) - Number(pb[1]));
+        const sa = String(aYm || "");
+        const sb = String(bYm || "");
+        if (!MONTH_RE.test(sa) || !MONTH_RE.test(sb)) return 0;
+        const [ay, am] = sa.split("-").map(Number);
+        const [by, bm] = sb.split("-").map(Number);
+        return (ay - by) * 12 + (am - bm);
       }
 
-      function parseCsvLine(line) {
-        const out = [];
+      function toNum(val) {
+        if (val === undefined || val === null) return null;
+        const trimmed = val.trim();
+        if (!trimmed) return null;
+        const n = Number(trimmed);
+        return Number.isFinite(n) ? n : null;
+      }
+
+      function parseCsvRecords(text) {
+        const rows = [];
+        let row = [];
         let cur = "";
         let inQuotes = false;
-        for (let i = 0; i < line.length; i++) {
-          const ch = line[i];
+        const n = text.length;
+        for (let i = 0; i < n; i++) {
+          const ch = text[i];
           if (inQuotes) {
-            if (ch === '"' && line[i + 1] === '"') {
+            if (ch === '"' && text[i + 1] === '"') {
               cur += '"';
               i++;
             } else if (ch === '"') {
@@ -665,69 +706,74 @@ __STATE_OPTIONS__
             } else {
               cur += ch;
             }
-          } else if (ch === '"') {
+          } else if (ch === '"' && cur.length === 0) {
             inQuotes = true;
           } else if (ch === ",") {
-            out.push(cur);
+            row.push(cur);
+            cur = "";
+          } else if (ch === "\\r") {
+            if (text[i + 1] === "\\n") i++;
+            row.push(cur);
+            if (row.some((c) => c.length > 0)) rows.push(row);
+            row = [];
+            cur = "";
+          } else if (ch === "\\n") {
+            row.push(cur);
+            if (row.some((c) => c.length > 0)) rows.push(row);
+            row = [];
             cur = "";
           } else {
             cur += ch;
           }
         }
-        out.push(cur);
-        return out;
-      }
-
-      function toNum(val) {
-        if (val === undefined || val === null || val.trim() === "") return null;
-        const n = Number(val);
-        return Number.isFinite(n) ? n : null;
-      }
-
-      function parseCsvObjects(text) {
-        const lines = text.replace(/\\r/g, "").split("\\n").filter((l) => l.trim().length > 0);
-        if (lines.length <= 1) return [];
-        const headers = parseCsvLine(lines[0]);
-        return lines.slice(1).map((line) => {
-          const cols = parseCsvLine(line);
-          const raw = {};
-          headers.forEach((h, idx) => { raw[h] = cols[idx] ?? ""; });
-          return raw;
-        });
+        row.push(cur);
+        if (row.some((c) => c.length > 0)) rows.push(row);
+        return rows;
       }
 
       function parseNormalizedCsv(text) {
-        return parseCsvObjects(text).map((raw) => {
-          const state = raw.state || "";
-          const operator = raw.operator || "";
-          const brand = raw.brand || "";
-          const handle = toNum(raw.handle);
-          const grossRev = toNum(raw.gross_revenue);
-          return {
+        const table = parseCsvRecords(text);
+        if (table.length <= 1) return [];
+        const idx = new Map();
+        table[0].forEach((h, i) => idx.set(h.trim(), i));
+        const col = (cols, name) => {
+          const i = idx.get(name);
+          return i !== undefined ? (cols[i] ?? "") : "";
+        };
+        const out = [];
+        for (let r = 1; r < table.length; r++) {
+          const cols = table[r];
+          const state = col(cols, "state");
+          const operator = col(cols, "operator");
+          const brand = col(cols, "brand");
+          const handle = toNum(col(cols, "handle"));
+          const grossRev = toNum(col(cols, "gross_revenue"));
+          out.push({
             state,
-            month: raw.month || "",
+            month: col(cols, "month"),
             operator,
             brand,
             _ekey: `${state}\\x1f${operator}\\x1f${brand}`,
             handle,
-            revenue: toNum(raw.revenue),
-            hold: toNum(raw.hold),
-            retail_handle: toNum(raw.retail_handle),
-            retail_revenue: toNum(raw.retail_revenue),
-            retail_hold: toNum(raw.retail_hold),
-            mobile_handle: toNum(raw.mobile_handle),
-            mobile_revenue: toNum(raw.mobile_revenue),
-            mobile_hold: toNum(raw.mobile_hold),
+            revenue: toNum(col(cols, "revenue")),
+            hold: toNum(col(cols, "hold")),
+            retail_handle: toNum(col(cols, "retail_handle")),
+            retail_revenue: toNum(col(cols, "retail_revenue")),
+            retail_hold: toNum(col(cols, "retail_hold")),
+            mobile_handle: toNum(col(cols, "mobile_handle")),
+            mobile_revenue: toNum(col(cols, "mobile_revenue")),
+            mobile_hold: toNum(col(cols, "mobile_hold")),
             gross_revenue: grossRev,
-            gross_hold: (handle !== null && handle > 0 && grossRev !== null) ? (grossRev / handle) * 100 : null,
-            promo_deductions: toNum(raw.promo_deductions),
-            tax: toNum(raw.tax),
+            gross_hold: calcHold(handle, grossRev),
+            promo_deductions: toNum(col(cols, "promo_deductions")),
+            tax: toNum(col(cols, "tax")),
             yoy_handle: null,
             yoy_revenue: null,
             yoy_hold_bps: null,
-            source_url: raw.source_url || ""
-          };
-        });
+            source_url: col(cols, "source_url")
+          });
+        }
+        return out;
       }
 
       function sumAllOpt(slice, field) {
@@ -744,7 +790,7 @@ __STATE_OPTIONS__
         const W = Math.max(1, Number(windowMonths) || 1);
         const groups = new Map();
         rows.forEach((r) => {
-          const gKey = detailMode ? (r._ekey || `${r.state}\\x1f${r.operator}\\x1f${r.brand}`) : r.state;
+          const gKey = detailMode ? entityKey(r) : r.state;
           let g = groups.get(gKey);
           if (!g) {
             g = new Map();
@@ -783,15 +829,15 @@ __STATE_OPTIONS__
               _ekey: head._ekey,
               handle,
               revenue,
-              hold: (handle !== null && handle > 0 && revenue !== null) ? (revenue / handle) * 100 : null,
+              hold: calcHold(handle, revenue),
               retail_handle: retailHandle,
               retail_revenue: retailRev,
-              retail_hold: (retailHandle !== null && retailHandle > 0 && retailRev !== null) ? (retailRev / retailHandle) * 100 : null,
+              retail_hold: calcHold(retailHandle, retailRev),
               mobile_handle: mobileHandle,
               mobile_revenue: mobileRev,
-              mobile_hold: (mobileHandle !== null && mobileHandle > 0 && mobileRev !== null) ? (mobileRev / mobileHandle) * 100 : null,
+              mobile_hold: calcHold(mobileHandle, mobileRev),
               gross_revenue: grossRev,
-              gross_hold: (handle !== null && handle > 0 && grossRev !== null) ? (grossRev / handle) * 100 : null,
+              gross_hold: calcHold(handle, grossRev),
               promo_deductions: sumAllOpt(slice, "promo_deductions"),
               tax: sumAllOpt(slice, "tax"),
               yoy_handle: null,
@@ -820,21 +866,37 @@ __STATE_OPTIONS__
         return out;
       }
 
+      function getCachedWindowed(rows, winM, detailMode) {
+        const W = Math.max(1, Number(winM) || 1);
+        const key = `${W}:${detailMode ? 1 : 0}`;
+        let byKey = windowCache.get(rows);
+        if (!byKey) {
+          byKey = new Map();
+          windowCache.set(rows, byKey);
+        }
+        if (byKey.has(key)) return byKey.get(key);
+        const built = buildWindowedRows(rows, W, detailMode);
+        byKey.set(key, built);
+        return built;
+      }
+
       function computeSameStoreYoY(currRows, lookupRows, detailMode) {
         const lookupMap = new Map();
         lookupRows.forEach((r) => {
-          const eKey = detailMode ? (r._ekey || `${r.state}\\x1f${r.operator}\\x1f${r.brand}`) : r.state;
+          const eKey = detailMode ? entityKey(r) : r.state;
           lookupMap.set(`${eKey}\\x1f${r.month}`, r);
         });
         let currH = 0, prevH = 0, hasH = false;
         let currR = 0, prevR = 0, hasR = false;
         let currHoldH = 0, currHoldR = 0, prevHoldH = 0, prevHoldR = 0;
         let matched = 0;
+        const matchedStates = new Set();
         currRows.forEach((c) => {
-          const eKey = detailMode ? (c._ekey || `${c.state}\\x1f${c.operator}\\x1f${c.brand}`) : c.state;
+          const eKey = detailMode ? entityKey(c) : c.state;
           const p = lookupMap.get(`${eKey}\\x1f${addMonths(c.month, -12)}`);
           if (!p) return;
           matched += 1;
+          matchedStates.add(c.state);
           if (c.handle !== null && p.handle !== null) {
             currH += c.handle;
             prevH += p.handle;
@@ -858,7 +920,7 @@ __STATE_OPTIONS__
         if (currHoldH > 0 && prevHoldH > 0) {
           yoy_hold_bps = ((currHoldR / currHoldH) - (prevHoldR / prevHoldH)) * 10000;
         }
-        return { yoy_handle, yoy_revenue, yoy_hold_bps, matched };
+        return { yoy_handle, yoy_revenue, yoy_hold_bps, matched, matchedStatesCount: matchedStates.size };
       }
 
       function stateNameToSlugMap() {
@@ -903,10 +965,13 @@ __STATE_OPTIONS__
           const slug = nameToSlug.get(stName) || "";
           const btn = document.createElement("button");
           btn.type = "button";
-          btn.className = "fresh-pill" + (stateSelect.value === slug && slug ? " active" : "");
+          const isAct = stateSelect.value === slug && Boolean(slug);
+          btn.className = "fresh-pill" + (isAct ? " active" : "");
+          btn.setAttribute("aria-pressed", isAct ? "true" : "false");
           btn.title = `${stName}: latest published month ${stMonth}`;
           const dot = document.createElement("span");
           dot.className = `fresh-dot ${dotCls}`;
+          dot.setAttribute("aria-hidden", "true");
           btn.appendChild(dot);
           btn.appendChild(document.createTextNode(`${stName} ${stMonth}`));
           btn.addEventListener("click", () => {
@@ -919,29 +984,35 @@ __STATE_OPTIONS__
         freshnessBar.style.display = "flex";
       }
 
-      async function fetchCsvRows(slug) {
-        const url = slug === "__ALL__" ? "data/all.csv" : `data/${slug}.csv`;
-        if (csvCache.has(url)) return csvCache.get(url);
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
-        const rows = parseNormalizedCsv(await resp.text());
-        csvCache.set(url, rows);
-        return rows;
+      async function fetchCachedCsv(cache, url, allow404) {
+        if (cache.has(url)) return cache.get(url);
+        if (csvInFlight.has(url)) return csvInFlight.get(url);
+        const promise = (async () => {
+          const resp = await fetch(url);
+          if (allow404 && resp.status === 404) return [];
+          if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
+          return parseNormalizedCsv(await resp.text());
+        })().then((rows) => {
+          cache.set(url, rows);
+          csvInFlight.delete(url);
+          return rows;
+        }, (err) => {
+          csvInFlight.delete(url);
+          throw err;
+        });
+        csvInFlight.set(url, promise);
+        return promise;
       }
 
-      async function fetchDetailRows(slug) {
-        if (slug !== "__ALL__" && !DETAIL_STATES.has(slug)) return [];
+      function fetchCsvRows(slug) {
+        const url = slug === "__ALL__" ? "data/all.csv" : `data/${slug}.csv`;
+        return fetchCachedCsv(csvCache, url, false);
+      }
+
+      function fetchDetailRows(slug) {
+        if (slug !== "__ALL__" && !DETAIL_STATES.has(slug)) return Promise.resolve([]);
         const url = slug === "__ALL__" ? "data/details/all.csv" : `data/details/${slug}.csv`;
-        if (detailCsvCache.has(url)) return detailCsvCache.get(url);
-        const resp = await fetch(url);
-        if (resp.status === 404) {
-          detailCsvCache.set(url, []);
-          return [];
-        }
-        if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
-        const rows = parseNormalizedCsv(await resp.text());
-        detailCsvCache.set(url, rows);
-        return rows;
+        return fetchCachedCsv(detailCsvCache, url, true);
       }
 
       function isDetailView() {
@@ -1005,28 +1076,23 @@ __STATE_OPTIONS__
       }
 
       function filteredRows() {
-        const fromM = fromMonthInput.value;
-        const toM = toMonthInput.value;
-        return windowedActiveRows.filter((r) => {
-          if (fromM && r.month < fromM) return false;
-          if (toM && r.month > toM) return false;
-          return true;
-        });
+        return windowedActiveRows.filter((r) => inDateRange(r.month));
       }
 
       function refreshWindowedRows() {
         const winM = Number(windowSelect.value) || 1;
         const detailMode = isDetailView();
-        windowedActiveRows = buildWindowedRows(activeRows, winM, detailMode);
+        windowedActiveRows = getCachedWindowed(activeRows, winM, detailMode);
         windowedDetailRows = activeDetailRows.length
-          ? (entitySelect.value === "__ALL_DETAILS__" ? windowedActiveRows : buildWindowedRows(activeDetailRows, winM, true))
+          ? (entitySelect.value === "__ALL_DETAILS__" ? windowedActiveRows : getCachedWindowed(activeDetailRows, winM, true))
           : [];
+        refreshDetailStateBounds();
       }
 
       function updateKpis(rows) {
         const winM = Number(windowSelect.value) || 1;
         let kpiRows = rows;
-        let suffix = "";
+        const suffix = windowLabel(winM);
         if (winM > 1 && rows.length) {
           let latestM = rows.reduce((mx, r) => (r.month > mx ? r.month : mx), rows[0].month);
           if (isMultiStateView() && !includePartialInput.checked) {
@@ -1034,71 +1100,68 @@ __STATE_OPTIONS__
             if (completeM.length) latestM = completeM[completeM.length - 1];
           }
           kpiRows = rows.filter((r) => r.month === latestM);
-          suffix = winM === 3 ? "3M" : "TTM";
         }
-        kpiHandleLabel.textContent = winM > 1 ? `Latest ${suffix} Handle` : "Total Handle";
-        kpiRevenueLabel.textContent = winM > 1 ? `Latest ${suffix} Revenue` : "Total Revenue";
-        kpiYoyLabel.textContent = winM > 1 ? `${suffix} Same-Store YoY` : "Same-Store YoY Handle";
+        const kpiWinTag = winM === 3 ? "3M" : suffix;
+        kpiHandleLabel.textContent = winM > 1 ? `Latest ${kpiWinTag} Handle` : "Total Handle";
+        kpiRevenueLabel.textContent = winM > 1 ? `Latest ${kpiWinTag} Revenue` : "Total Revenue";
+        kpiYoyLabel.textContent = winM > 1 ? `${kpiWinTag} Same-Store YoY` : "Same-Store YoY Handle";
         kpiRowsLabel.textContent = winM > 1
-          ? `${suffix} Windows`
+          ? `${kpiWinTag} Windows`
           : (isDetailView() ? "Operator-Months" : "State-Months");
 
         let totalHandle = 0;
         let totalRevenue = 0;
-        let holdHandle = 0;
-        let holdRevenue = 0;
+        const holdTotals = { holdHandle: 0, holdRevenue: 0 };
         let mobileHandle = 0;
         let splitHandleDenom = 0;
         kpiRows.forEach((r) => {
           if (r.handle !== null) totalHandle += r.handle;
           if (r.revenue !== null) totalRevenue += r.revenue;
-          if (r.handle !== null && r.revenue !== null) {
-            holdHandle += r.handle;
-            holdRevenue += r.revenue;
-          }
+          addHoldTotals(holdTotals, r);
           if (r.mobile_handle !== null && r.handle !== null) {
             mobileHandle += r.mobile_handle;
             splitHandleDenom += r.handle;
           }
         });
-        const blendedHold = holdHandle > 0 ? (holdRevenue / holdHandle) * 100 : null;
+        const blendedHold = holdTotals.holdHandle > 0 ? (holdTotals.holdRevenue / holdTotals.holdHandle) * 100 : null;
         const mobileShare = splitHandleDenom > 0 ? (mobileHandle / splitHandleDenom) * 100 : null;
         const yoy = kpiRows.length
           ? computeSameStoreYoY(kpiRows, windowedActiveRows, isDetailView())
           : { yoy_handle: null };
 
-        document.getElementById("kpiHandle").textContent = kpiRows.length ? fmtCompactMoney(totalHandle) : "—";
-        document.getElementById("kpiRevenue").textContent = kpiRows.length ? fmtCompactMoney(totalRevenue) : "—";
-        document.getElementById("kpiHold").textContent = fmtPct(blendedHold);
-        const yoyEl = document.getElementById("kpiYoyHandle");
-        yoyEl.textContent = fmtSignedPct(yoy.yoy_handle);
-        yoyEl.className = "value" + (yoy.yoy_handle === null ? "" : (yoy.yoy_handle >= 0 ? " pos" : " neg"));
-        document.getElementById("kpiMobileShare").textContent = fmtPct(mobileShare);
-        document.getElementById("kpiRows").textContent = String(rows.length);
+        kpiHandleEl.textContent = kpiRows.length ? fmtCompactMoney(totalHandle) : "—";
+        kpiRevenueEl.textContent = kpiRows.length ? fmtCompactMoney(totalRevenue) : "—";
+        kpiHoldEl.textContent = fmtPct(blendedHold);
+        kpiYoyHandleEl.textContent = fmtSignedPct(yoy.yoy_handle);
+        kpiYoyHandleEl.className = "value" + (yoy.yoy_handle === null ? "" : (yoy.yoy_handle >= 0 ? " pos" : " neg"));
+        kpiMobileShareEl.textContent = fmtPct(mobileShare);
+        kpiRowsEl.textContent = String(rows.length);
+      }
+
+      function computeStateMonthBounds(rows) {
+        const minMap = new Map();
+        const maxMap = new Map();
+        rows.forEach((r) => {
+          if (!r.state || !r.month) return;
+          const minM = minMap.get(r.state);
+          if (!minM || r.month < minM) minMap.set(r.state, r.month);
+          const maxM = maxMap.get(r.state);
+          if (!maxM || r.month > maxM) maxMap.set(r.state, r.month);
+        });
+        return { minMap, maxMap };
       }
 
       function refreshDetailStateBounds() {
-        stateMinDetailMonth = new Map();
-        stateLatestDetailMonth = new Map();
-        activeDetailRows.forEach((r) => {
-          const minM = stateMinDetailMonth.get(r.state);
-          if (!minM || r.month < minM) stateMinDetailMonth.set(r.state, r.month);
-          const maxM = stateLatestDetailMonth.get(r.state);
-          if (!maxM || r.month > maxM) stateLatestDetailMonth.set(r.state, r.month);
-        });
-        detailDisclosingStates = Array.from(stateMinDetailMonth.keys());
+        const { minMap, maxMap } = computeStateMonthBounds(windowedDetailRows);
+        stateMinDetailMonth = minMap;
+        stateLatestDetailMonth = maxMap;
+        detailDisclosingStates = Array.from(minMap.keys());
       }
 
       function updateDetailCompletenessMeta(entityRows) {
-        refreshDetailStateBounds();
-        brandFirstMonth = new Map();
-        brandLastMonth = new Map();
-        entityRows.forEach((r) => {
-          const firstM = brandFirstMonth.get(r.state);
-          if (!firstM || r.month < firstM) brandFirstMonth.set(r.state, r.month);
-          const lastM = brandLastMonth.get(r.state);
-          if (!lastM || r.month > lastM) brandLastMonth.set(r.state, r.month);
-        });
+        const { minMap, maxMap } = computeStateMonthBounds(entityRows);
+        brandFirstMonth = minMap;
+        brandLastMonth = maxMap;
       }
 
       function expectedDetailStatesCountFromSet(month, stateCollection) {
@@ -1135,8 +1198,8 @@ __STATE_OPTIONS__
         return Math.max(1, exp);
       }
 
-      function isMonthComplete(month, count) {
-        const expected = expectedStatesForMonth(month);
+      function isMonthComplete(month, count, expectedOverride) {
+        const expected = expectedOverride !== undefined ? expectedOverride : expectedStatesForMonth(month);
         if (isDetailView()) {
           return count >= expected;
         }
@@ -1219,10 +1282,7 @@ __STATE_OPTIONS__
           const agg = byMonth.get(r.month);
           if (r.handle !== null) agg.handle += r.handle;
           if (r.revenue !== null) agg.revenue += r.revenue;
-          if (r.handle !== null && r.revenue !== null) {
-            agg.holdHandle += r.handle;
-            agg.holdRevenue += r.revenue;
-          }
+          addHoldTotals(agg, r);
           if (r.mobile_handle !== null) agg.mobile_handle += r.mobile_handle;
           if (r.retail_handle !== null) agg.retail_handle += r.retail_handle;
           if (r.promo_deductions !== null) {
@@ -1251,6 +1311,7 @@ __STATE_OPTIONS__
           .forEach(([month, agg]) => {
             let value = 0;
             let sameStoreMatched = null;
+            let yoyStatesCount = null;
             if (isYoy) {
               const currSlice = fullByMonth.get(month) || [];
               const prevSlice = fullByMonth.get(addMonths(month, -12)) || [];
@@ -1258,6 +1319,7 @@ __STATE_OPTIONS__
               value = yoy[metric];
               if (value === null) return;
               sameStoreMatched = yoy.matched;
+              yoyStatesCount = yoy.matchedStatesCount;
             } else if (metric === "hold") {
               if (agg.holdHandle <= 0) return;
               value = (agg.holdRevenue / agg.holdHandle) * 100;
@@ -1267,58 +1329,103 @@ __STATE_OPTIONS__
             } else {
               value = agg[metric] || 0;
             }
-            const count = agg.states.size;
-            const expected = expectedStatesForMonth(month);
-            const complete = isMonthComplete(month, count);
+            const count = isYoy ? yoyStatesCount : agg.states.size;
+            const expected = isYoy
+              ? Math.min(expectedStatesForMonth(month), expectedStatesForMonth(addMonths(month, -12)))
+              : expectedStatesForMonth(month);
+            const complete = isMonthComplete(month, count, expected);
             const partial = count < expected;
             out.push({ month, value, count, expected, complete, partial, sameStoreMatched });
           });
         return out;
       }
 
-      function renderBarChart(series, metric, multi, detail) {
+      function chartLayout(padLeft) {
         const W = 960, H = 290;
-        const pad = { top: 20, right: 24, bottom: 44, left: 76 };
-        const plotW = W - pad.left - pad.right;
-        const plotH = H - pad.top - pad.bottom;
+        const pad = { top: 20, right: 24, bottom: 44, left: padLeft };
+        return { W, H, pad, plotW: W - pad.left - pad.right, plotH: H - pad.top - pad.bottom };
+      }
 
-        const vals = series.map((d) => d.value);
-        const minVal = Math.min(0, ...vals);
-        const maxVal = Math.max(0, ...vals);
+      function drawYGrid(layout, minVal, maxVal, ticks, tickFmt) {
+        const { W, pad, plotH } = layout;
         const span = maxVal - minVal || 1;
-
         const yScale = (v) => pad.top + plotH - ((v - minVal) / span) * plotH;
-        const zeroY = yScale(0);
-
-        const ticks = 4;
         for (let i = 0; i <= ticks; i++) {
           const tv = minVal + (span * i) / ticks;
           const y = yScale(tv);
           chartSvg.appendChild(svgEl("line", {
-            x1: pad.left,
-            x2: W - pad.right,
-            y1: y,
-            y2: y,
-            stroke: "#e2e8f0"
+            x1: pad.left, x2: W - pad.right, y1: y, y2: y, stroke: "#e2e8f0"
           }));
           chartSvg.appendChild(svgEl("text", {
-            x: pad.left - 8,
-            y: y + 4,
-            "text-anchor": "end",
-            fill: "#64748b",
-            "font-size": 11
-          }, formatAxisTick(metric, tv)));
+            x: pad.left - 8, y: y + 4, "text-anchor": "end", fill: "#64748b", "font-size": 11
+          }, tickFmt(tv)));
         }
+        return yScale;
+      }
 
-        const step = plotW / series.length;
+      function drawXLabels(labels, xAt, H) {
+        if (!labels.length) return;
+        const labelEvery = Math.max(1, Math.ceil(labels.length / 12));
+        const lastIdx = labels.length - 1;
+        const lastX = xAt(lastIdx);
+        let prevDrawnX = -Infinity;
+        labels.forEach((m, idx) => {
+          const x = xAt(idx);
+          const drawMid = idx > 0 && idx < lastIdx && idx % labelEvery === 0
+            && (x - prevDrawnX) >= 52 && (lastX - x) >= 52;
+          if (idx === 0 || idx === lastIdx || drawMid) {
+            chartSvg.appendChild(svgEl("text", {
+              x, y: H - 16, "text-anchor": "middle", fill: "#64748b", "font-size": 11
+            }, m));
+            prevDrawnX = x;
+          }
+        });
+      }
+
+      function ensureNonZeroRange(minVal, maxVal, metric) {
+        if (minVal !== maxVal) return [minVal, maxVal];
+        const isPctOrBps = metric === "hold" || metric === "handle_share" || metric === "revenue_share"
+          || metric.startsWith("yoy_");
+        if (minVal === 0) return [0, isPctOrBps ? 10 : 100];
+        const pad = Math.max(Math.abs(minVal) * 0.2, isPctOrBps ? 5 : 50);
+        return [minVal < 0 ? minVal - pad : 0, maxVal > 0 ? maxVal + pad : 0];
+      }
+
+      function drawZeroLine(layout, minVal, maxVal, yScale) {
+        if (minVal < 0 && maxVal > 0) {
+          const zY = yScale(0);
+          chartSvg.appendChild(svgEl("line", {
+            x1: layout.pad.left, x2: layout.W - layout.pad.right,
+            y1: zY, y2: zY, stroke: "#94a3b8", "stroke-dasharray": "4 3"
+          }));
+        }
+      }
+
+      function barGeometry(layout, count) {
+        const step = layout.plotW / count;
         const barW = Math.max(4, Math.min(38, step * 0.68));
-        const labelEvery = Math.max(1, Math.ceil(series.length / 12));
+        return {
+          barW,
+          barX: (idx) => layout.pad.left + idx * step + (step - barW) / 2,
+          barCenterX: (idx) => layout.pad.left + idx * step + step / 2
+        };
+      }
+
+      function renderBarChart(series, metric, multi, detail) {
+        const layout = chartLayout(76);
+        const { H } = layout;
+        const vals = series.map((d) => d.value);
+        const [minVal, maxVal] = ensureNonZeroRange(Math.min(0, ...vals), Math.max(0, ...vals), metric);
+        const yScale = drawYGrid(layout, minVal, maxVal, 4, (tv) => formatAxisTick(metric, tv));
+        drawZeroLine(layout, minVal, maxVal, yScale);
+        const zeroY = yScale(0);
+        const { barW, barX, barCenterX } = barGeometry(layout, series.length);
 
         series.forEach((pt, idx) => {
-          const x = pad.left + idx * step + (step - barW) / 2;
+          const x = barX(idx);
           const yVal = yScale(pt.value);
-          const rectY = Math.min(yVal, zeroY);
           const rectH = Math.max(2, Math.abs(zeroY - yVal));
+          const rectY = pt.value < 0 ? zeroY : Math.min(yVal, zeroY - rectH);
           const isNeg = pt.value < 0;
           const attrs = { x, y: rectY, width: barW, height: rectH, rx: 3 };
           if (pt.partial && multi) {
@@ -1330,14 +1437,11 @@ __STATE_OPTIONS__
             attrs.fill = isNeg ? "#dc2626" : "#2563eb";
           }
           const rect = svgEl("rect", attrs);
-
           const formatted = formatMetricValue(metric, pt.value);
           const countInfo = multi
             ? ` (${pt.count}/${pt.expected} ${detail ? "disclosing states" : "states"}${pt.partial ? " — partial" : ""}${pt.sameStoreMatched ? `, ${pt.sameStoreMatched} same-store` : ""})`
             : "";
-          rect.addEventListener("mousemove", (ev) => {
-            showTooltip(ev, `${pt.month}: ${formatted}${countInfo}`);
-          });
+          rect.addEventListener("mousemove", (ev) => showTooltip(ev, `${pt.month}: ${formatted}${countInfo}`));
           rect.addEventListener("mouseleave", hideTooltip);
           chartSvg.appendChild(rect);
 
@@ -1346,83 +1450,84 @@ __STATE_OPTIONS__
               ? Math.min(H - 28, rectY + rectH + 11)
               : Math.max(12, rectY - 4);
             chartSvg.appendChild(svgEl("text", {
-              x: x + barW / 2,
-              y: badgeY,
-              "text-anchor": "middle",
-              fill: "#64748b",
-              "font-size": 9
+              x: x + barW / 2, y: badgeY, "text-anchor": "middle", fill: "#64748b", "font-size": 9
             }, `${pt.count}/${pt.expected}`));
           }
-
-          if (idx % labelEvery === 0 || idx === series.length - 1) {
-            chartSvg.appendChild(svgEl("text", {
-              x: x + barW / 2,
-              y: H - 16,
-              "text-anchor": "middle",
-              fill: "#64748b",
-              "font-size": 11
-            }, pt.month));
-          }
         });
+        drawXLabels(series.map((p) => p.month), barCenterX, H);
+      }
+
+      function filterSeriesCompleteness(rawSeries, applyFilter) {
+        if (!applyFilter || includePartialInput.checked) {
+          return { series: rawSeries, hiddenPartial: 0, fallbackToPartial: false };
+        }
+        const completeOnly = rawSeries.filter((pt) => pt.complete);
+        if (completeOnly.length) {
+          return {
+            series: completeOnly,
+            hiddenPartial: rawSeries.length - completeOnly.length,
+            fallbackToPartial: false
+          };
+        }
+        return { series: rawSeries, hiddenPartial: 0, fallbackToPartial: rawSeries.length > 0 };
       }
 
       function renderBrandShareChart(metric, stateLabel, windowSuffix) {
         const valField = metric === "revenue_share" ? "revenue" : "handle";
-        const fromM = fromMonthInput.value;
-        const toM = toMonthInput.value;
         const multiDetail = stateSelect.value === "__ALL__";
         const titlePrefix = windowSuffix ? `${windowSuffix} ` : "";
-        document.getElementById("chartTitle").textContent =
+        chartTitleEl.textContent =
           `${stateLabel} — ${titlePrefix}${metric === "revenue_share" ? "Brand Revenue Share (%)" : "Brand Handle Share (%)"}`;
 
-        const winDetail = windowedDetailRows.filter((r) => {
-          if (fromM && r.month < fromM) return false;
-          if (toM && r.month > toM) return false;
-          return true;
-        });
-
+        const winDetail = windowedDetailRows.filter((r) => inDateRange(r.month));
         const byMonth = new Map();
-        const brandTotals = new Map();
         winDetail.forEach((r) => {
           const v = r[valField];
           if (v === null || v === undefined) return;
-          const posVal = Math.max(0, v);
           if (!byMonth.has(r.month)) {
-            byMonth.set(r.month, { total: 0, brands: new Map(), states: new Set() });
+            byMonth.set(r.month, { rawBrands: new Map(), states: new Set() });
           }
           const mRec = byMonth.get(r.month);
           mRec.states.add(r.state);
-          if (posVal > 0) {
-            mRec.total += posVal;
-            const bName = r.brand || "Other / Retail Venue";
-            mRec.brands.set(bName, (mRec.brands.get(bName) || 0) + posVal);
-            brandTotals.set(bName, (brandTotals.get(bName) || 0) + posVal);
-          }
+          const bName = r.brand || "Other / Retail Venue";
+          mRec.rawBrands.set(bName, (mRec.rawBrands.get(bName) || 0) + v);
         });
 
-        const rawMonths = Array.from(byMonth.entries())
+        const rawMonths = [];
+        Array.from(byMonth.entries())
           .sort((a, b) => a[0].localeCompare(b[0]))
-          .filter(([_m, rec]) => rec.total > 0)
-          .map(([month, rec]) => {
+          .forEach(([month, rec]) => {
+            let total = 0;
+            const brands = new Map();
+            rec.rawBrands.forEach((netVal, bName) => {
+              const posVal = Math.max(0, netVal);
+              if (posVal > 0) {
+                brands.set(bName, posVal);
+                total += posVal;
+              }
+            });
+            if (total <= 0) return;
             const count = rec.states.size;
             const expected = multiDetail ? expectedDetailStatesCount(month) : 1;
-            return { month, total: rec.total, brands: rec.brands, count, expected, complete: !multiDetail || count >= expected };
+            rawMonths.push({ month, total, brands, count, expected, complete: !multiDetail || count >= expected });
           });
 
-        let series = rawMonths;
-        let hiddenPartial = 0;
-        if (multiDetail && !includePartialInput.checked) {
-          const completeOnly = rawMonths.filter((pt) => pt.complete);
-          if (completeOnly.length) {
-            hiddenPartial = rawMonths.length - completeOnly.length;
-            series = completeOnly;
-          }
+        const { series, hiddenPartial, fallbackToPartial } = filterSeriesCompleteness(rawMonths, multiDetail);
+        const brandTotals = new Map();
+        series.forEach((pt) => {
+          pt.brands.forEach((bVal, bName) => {
+            brandTotals.set(bName, (brandTotals.get(bName) || 0) + bVal);
+          });
+        });
+        if (!multiDetail) {
+          chartNote.textContent = "Normalized brand mix from state regulator disclosures";
+        } else if (hiddenPartial > 0) {
+          chartNote.textContent = `Showing ${series.length} full disclosing-panel months (${hiddenPartial} partial hidden)`;
+        } else if (fallbackToPartial) {
+          chartNote.textContent = "All months in selected range have partial disclosing-state coverage";
+        } else {
+          chartNote.textContent = "Across disclosing states (LA, MS, NV do not disclose operators)";
         }
-        chartNote.textContent = multiDetail
-          ? (hiddenPartial > 0
-            ? `Showing ${series.length} full disclosing-panel months (${hiddenPartial} partial hidden)`
-            : "Across disclosing states (LA, MS, NV do not disclose operators)")
-          : "Normalized brand mix from state regulator disclosures";
 
         if (!series.length) {
           renderEmptyChart();
@@ -1431,9 +1536,7 @@ __STATE_OPTIONS__
         }
         chartSvg.innerHTML = "";
 
-        const rankedBrands = Array.from(brandTotals.entries())
-          .sort((a, b) => b[1] - a[1])
-          .map(([b]) => b);
+        const rankedBrands = Array.from(brandTotals.entries()).sort((a, b) => b[1] - a[1]).map(([b]) => b);
         const topBrands = rankedBrands.slice(0, 7);
         const topBrandSet = new Set(topBrands);
         const hasOtherBucket = rankedBrands.length > 7;
@@ -1441,34 +1544,19 @@ __STATE_OPTIONS__
         const segColors = segments.map((_b, idx) => SERIES_COLORS[idx % SERIES_COLORS.length]);
         setChartLegend(segments.map((label, idx) => ({ label, color: segColors[idx] })));
 
-        const W = 960, H = 290;
-        const pad = { top: 20, right: 24, bottom: 44, left: 56 };
-        const plotW = W - pad.left - pad.right;
-        const plotH = H - pad.top - pad.bottom;
-        const yScale = (pct) => pad.top + plotH - (pct / 100) * plotH;
-
-        for (let pct = 0; pct <= 100; pct += 25) {
-          const y = yScale(pct);
-          chartSvg.appendChild(svgEl("line", { x1: pad.left, x2: W - pad.right, y1: y, y2: y, stroke: "#e2e8f0" }));
-          chartSvg.appendChild(svgEl("text", {
-            x: pad.left - 8, y: y + 4, "text-anchor": "end", fill: "#64748b", "font-size": 11
-          }, `${pct}%`));
-        }
-
-        const step = plotW / series.length;
-        const barW = Math.max(4, Math.min(38, step * 0.68));
-        const labelEvery = Math.max(1, Math.ceil(series.length / 12));
+        const layout = chartLayout(56);
+        const { H, pad, plotH } = layout;
+        const yScale = drawYGrid(layout, 0, 100, 4, (tv) => `${Math.round(tv)}%`);
+        const { barW, barX, barCenterX } = barGeometry(layout, series.length);
 
         series.forEach((pt, idx) => {
-          const x = pad.left + idx * step + (step - barW) / 2;
+          const x = barX(idx);
           let cumPct = 0;
           const breakdown = [];
           segments.forEach((segName, sIdx) => {
             let amt = 0;
             if (hasOtherBucket && segName === "Other Brands") {
-              pt.brands.forEach((bAmt, bKey) => {
-                if (!topBrandSet.has(bKey)) amt += bAmt;
-              });
+              pt.brands.forEach((bAmt, bKey) => { if (!topBrandSet.has(bKey)) amt += bAmt; });
             } else {
               amt = pt.brands.get(segName) || 0;
             }
@@ -1478,56 +1566,106 @@ __STATE_OPTIONS__
             const yTop = yScale(nextPct);
             const yBot = yScale(cumPct);
             chartSvg.appendChild(svgEl("rect", {
-              x, y: yTop, width: barW, height: Math.max(1, yBot - yTop),
-              fill: segColors[sIdx]
+              x, y: yTop, width: barW, height: Math.max(1, yBot - yTop), fill: segColors[sIdx]
             }));
             cumPct = nextPct;
             breakdown.push(`${segName}: ${sharePct.toFixed(1)}%`);
           });
 
-          const hit = svgEl("rect", {
-            x, y: pad.top, width: barW, height: plotH, fill: "transparent", cursor: "crosshair"
-          });
+          const hit = svgEl("rect", { x, y: pad.top, width: barW, height: plotH, fill: "transparent", cursor: "crosshair" });
           hit.addEventListener("mousemove", (ev) => {
             showTooltip(ev, `${pt.month} (${fmtCompactMoney(pt.total)}) — ${breakdown.slice(0, 5).join(" | ")}`);
           });
           hit.addEventListener("mouseleave", hideTooltip);
           chartSvg.appendChild(hit);
+        });
+        drawXLabels(series.map((p) => p.month), barCenterX, H);
+      }
 
-          if (idx % labelEvery === 0 || idx === series.length - 1) {
-            chartSvg.appendChild(svgEl("text", {
-              x: x + barW / 2, y: H - 16, "text-anchor": "middle", fill: "#64748b", "font-size": 11
-            }, pt.month));
+      function computeSliceMetric(slice, mMap, m, metric, marketTotalByMonth) {
+        const isShare = metric === "handle_share" || metric === "revenue_share";
+        const isYoy = metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
+        const baseShareField = metric === "revenue_share" ? "revenue" : "handle";
+        if (isYoy) {
+          return computeSameStoreYoY(slice, mMap.get(addMonths(m, -12)) || [], true)[metric];
+        }
+        if (metric === "hold") {
+          const totals = { holdHandle: 0, holdRevenue: 0 };
+          slice.forEach((r) => addHoldTotals(totals, r));
+          return totals.holdHandle > 0 ? (totals.holdRevenue / totals.holdHandle) * 100 : null;
+        }
+        if (isShare) {
+          const tot = marketTotalByMonth.get(m) || 0;
+          let hasAny = false;
+          let rawSum = 0;
+          slice.forEach((r) => {
+            const v = r[baseShareField];
+            if (v !== null && v !== undefined) {
+              rawSum += v;
+              hasAny = true;
+            }
+          });
+          return (tot > 0 && hasAny) ? (Math.max(0, rawSum) / tot) * 100 : null;
+        }
+        let hasAny = false;
+        let sum = 0;
+        slice.forEach((r) => {
+          if (r[metric] !== null && r[metric] !== undefined) {
+            sum += r[metric];
+            hasAny = true;
           }
         });
+        return hasAny ? sum : null;
+      }
+
+      function filterCompleteMonthSet(months, isCompleteFn) {
+        if (includePartialInput.checked) return { allowed: null, hiddenPartial: 0, fallbackToPartial: false };
+        const complete = new Set(months.filter(isCompleteFn));
+        if (complete.size > 0 && complete.size < months.length) {
+          return { allowed: complete, hiddenPartial: months.length - complete.size, fallbackToPartial: false };
+        }
+        if (complete.size === 0 && months.length > 0) {
+          return { allowed: null, hiddenPartial: 0, fallbackToPartial: true };
+        }
+        return { allowed: null, hiddenPartial: 0, fallbackToPartial: false };
+      }
+
+      function completeStateCountCheck(statesByMonth, allCount, hasMo) {
+        return (m) => {
+          const exp = Math.max(1, allCount - (hasMo && m < "2025-12" ? 1 : 0));
+          return statesByMonth.get(m).size >= Math.max(1, exp - 1);
+        };
       }
 
       async function renderCompareChart(metric, metricLabel, windowSuffix) {
         const mySeq = ++compareSeq;
         const winM = Number(windowSelect.value) || 1;
-        const fromM = fromMonthInput.value;
-        const toM = toMonthInput.value;
+        const selSeries = [...compareSelected];
+        const mode = compareMode;
+        const selectedSlug = stateSelect.value;
+        const selectedStateText = stateSelect.options[stateSelect.selectedIndex]?.text || "";
         const isShare = metric === "handle_share" || metric === "revenue_share";
         const isYoy = metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
         const baseShareField = metric === "revenue_share" ? "revenue" : "handle";
 
         let seriesList = [];
-        let marketTotalByMonth = new Map();
+        const marketTotalByMonth = new Map();
         let hiddenPartial = 0;
+        let fallbackToPartial = false;
         const winTitle = windowSuffix ? `${windowSuffix} ` : "";
-        const scopeTitle = compareMode === "brands"
-          ? ((stateSelect.value === "__ALL__" || !DETAIL_STATES.has(stateSelect.value))
+        const scopeTitle = mode === "brands"
+          ? ((selectedSlug === "__ALL__" || !DETAIL_STATES.has(selectedSlug))
             ? "All Disclosing States — "
-            : `${stateSelect.options[stateSelect.selectedIndex]?.text || ""} — `)
+            : `${selectedStateText} — `)
           : "";
-        document.getElementById("chartTitle").textContent =
-          `${scopeTitle}Compare (${compareSelected.length} ${compareMode === "brands" ? "Brands" : "States"}) — ${winTitle}${metricLabel}`;
+        chartTitleEl.textContent =
+          `${scopeTitle}Compare (${selSeries.length} ${mode === "brands" ? "Brands" : "States"}) — ${winTitle}${metricLabel}`;
 
         try {
-          if (compareMode === "states") {
+          if (mode === "states") {
             const allStateRaw = await fetchCsvRows("__ALL__");
             if (mySeq !== compareSeq) return;
-            const winAll = buildWindowedRows(allStateRaw, winM, false);
+            const winAll = getCachedWindowed(allStateRaw, winM, false);
             const allStateSet = new Set(allStateRaw.map((r) => r.state));
             const allCount = allStateSet.size || 1;
             const hasMo = allStateSet.has("Missouri");
@@ -1537,64 +1675,60 @@ __STATE_OPTIONS__
               statesByMonth.get(r.month).add(r.state);
               if (isShare) {
                 const v = r[baseShareField];
-                if (v !== null && v > 0) {
-                  marketTotalByMonth.set(r.month, (marketTotalByMonth.get(r.month) || 0) + v);
-                }
+                if (v !== null && v > 0) marketTotalByMonth.set(r.month, (marketTotalByMonth.get(r.month) || 0) + v);
               }
             });
             let allowedShareMonths = null;
-            if (isShare && !includePartialInput.checked) {
-              const candidateMonths = Array.from(statesByMonth.keys()).filter((m) => (!fromM || m >= fromM) && (!toM || m <= toM));
-              const completeSet = new Set(candidateMonths.filter((m) => {
-                const exp = Math.max(1, allCount - (hasMo && m < "2025-12" ? 1 : 0));
-                return statesByMonth.get(m).size >= Math.max(1, exp - 1);
-              }));
-              if (completeSet.size > 0 && completeSet.size < candidateMonths.length) {
-                allowedShareMonths = completeSet;
-                hiddenPartial = candidateMonths.length - completeSet.size;
-              }
+            if (isShare) {
+              const candidateMonths = Array.from(statesByMonth.keys()).filter(inDateRange);
+              const res = filterCompleteMonthSet(candidateMonths, completeStateCountCheck(statesByMonth, allCount, hasMo));
+              allowedShareMonths = res.allowed;
+              hiddenPartial = res.hiddenPartial;
+              fallbackToPartial = res.fallbackToPartial;
             }
-            seriesList = compareSelected.map((stName, idx) => {
+            seriesList = selSeries.map((stName, idx) => {
               const stRows = winAll.filter((r) => r.state === stName).sort((a, b) => a.month.localeCompare(b.month));
               const pts = new Map();
               stRows.forEach((r) => {
-                if ((fromM && r.month < fromM) || (toM && r.month > toM)) return;
+                if (!inDateRange(r.month)) return;
                 if (allowedShareMonths && !allowedShareMonths.has(r.month)) return;
                 let v = r[metric];
                 if (isShare) {
                   const tot = marketTotalByMonth.get(r.month) || 0;
                   const rawV = r[baseShareField];
-                  v = (tot > 0 && rawV !== null && rawV >= 0) ? (rawV / tot) * 100 : null;
+                  v = (tot > 0 && rawV !== null) ? (Math.max(0, rawV) / tot) * 100 : null;
                 }
                 if (v !== null && v !== undefined) pts.set(r.month, v);
               });
               return { label: stName, color: SERIES_COLORS[idx % SERIES_COLORS.length], pts };
             });
           } else {
-            const needAllDetails = stateSelect.value === "__ALL__" || !DETAIL_STATES.has(stateSelect.value);
-            let winDet;
-            if (needAllDetails) {
-              const rawDet = await fetchDetailRows("__ALL__");
-              if (mySeq !== compareSeq) return;
-              winDet = buildWindowedRows(rawDet, winM, true);
-            } else {
-              winDet = windowedDetailRows;
-            }
+            const needAllDetails = selectedSlug === "__ALL__" || !DETAIL_STATES.has(selectedSlug);
+            const winDet = needAllDetails
+              ? getCachedWindowed(await fetchDetailRows("__ALL__"), winM, true)
+              : windowedDetailRows;
+            if (mySeq !== compareSeq) return;
             const discStatesInDet = new Set();
             const discByMonth = new Map();
             const detByMonthBrand = new Map();
+            const rawShareByMonth = new Map();
             winDet.forEach((r) => {
               const m = r.month;
               discStatesInDet.add(r.state);
               if (!discByMonth.has(m)) discByMonth.set(m, new Set());
               discByMonth.get(m).add(r.state);
+              const b = r.brand || "Other / Retail Venue";
               if (isShare) {
                 const v = r[baseShareField];
-                if (v !== null && v > 0) {
-                  marketTotalByMonth.set(m, (marketTotalByMonth.get(m) || 0) + v);
+                if (v !== null && v !== undefined) {
+                  let bMap = rawShareByMonth.get(m);
+                  if (!bMap) {
+                    bMap = new Map();
+                    rawShareByMonth.set(m, bMap);
+                  }
+                  bMap.set(b, (bMap.get(b) || 0) + v);
                 }
               }
-              const b = r.brand || "Other / Retail Venue";
               let mMap = detByMonthBrand.get(b);
               if (!mMap) {
                 mMap = new Map();
@@ -1603,59 +1737,41 @@ __STATE_OPTIONS__
               if (!mMap.has(m)) mMap.set(m, []);
               mMap.get(m).push(r);
             });
-            let allowedBrandMonths = null;
-            if (needAllDetails && !includePartialInput.checked) {
-              const candidateMonths = Array.from(discByMonth.keys()).filter((m) => (!fromM || m >= fromM) && (!toM || m <= toM));
-              const completeSet = new Set(candidateMonths.filter((m) => (
-                discByMonth.get(m).size >= expectedDetailStatesCountFromSet(m, discStatesInDet)
-              )));
-              if (completeSet.size > 0 && completeSet.size < candidateMonths.length) {
-                allowedBrandMonths = completeSet;
-                hiddenPartial = candidateMonths.length - completeSet.size;
-              }
+            if (isShare) {
+              rawShareByMonth.forEach((bMap, m) => {
+                let tot = 0;
+                bMap.forEach((netVal) => { tot += Math.max(0, netVal); });
+                if (tot > 0) marketTotalByMonth.set(m, tot);
+              });
             }
-            seriesList = compareSelected.map((brandName, idx) => {
+            let allowedBrandMonths = null;
+            if (needAllDetails) {
+              const candidateMonths = Array.from(discByMonth.keys()).filter(inDateRange);
+              const res = filterCompleteMonthSet(
+                candidateMonths,
+                (m) => discByMonth.get(m).size >= expectedDetailStatesCountFromSet(m, discStatesInDet)
+              );
+              allowedBrandMonths = res.allowed;
+              hiddenPartial = res.hiddenPartial;
+              fallbackToPartial = res.fallbackToPartial;
+            }
+            seriesList = selSeries.map((brandName, idx) => {
               const mMap = detByMonthBrand.get(brandName) || new Map();
               const pts = new Map();
               Array.from(mMap.keys()).sort().forEach((m) => {
-                if ((fromM && m < fromM) || (toM && m > toM)) return;
+                if (!inDateRange(m)) return;
                 if (allowedBrandMonths && !allowedBrandMonths.has(m)) return;
-                const slice = mMap.get(m);
-                let v = null;
-                if (isYoy) {
-                  const prevSlice = mMap.get(addMonths(m, -12)) || [];
-                  v = computeSameStoreYoY(slice, prevSlice, true)[metric];
-                } else if (metric === "hold") {
-                  let h = 0, rev = 0;
-                  slice.forEach((r) => {
-                    if (r.handle !== null && r.revenue !== null) {
-                      h += r.handle;
-                      rev += r.revenue;
-                    }
-                  });
-                  v = h > 0 ? (rev / h) * 100 : null;
-                } else if (isShare) {
-                  const tot = marketTotalByMonth.get(m) || 0;
-                  const bSum = slice.reduce((s, r) => s + (r[baseShareField] !== null && r[baseShareField] > 0 ? r[baseShareField] : 0), 0);
-                  v = tot > 0 ? (bSum / tot) * 100 : null;
-                } else {
-                  let hasAny = false;
-                  let sum = 0;
-                  slice.forEach((r) => {
-                    if (r[metric] !== null && r[metric] !== undefined) {
-                      sum += r[metric];
-                      hasAny = true;
-                    }
-                  });
-                  v = hasAny ? sum : null;
-                }
+                const v = computeSliceMetric(mMap.get(m), mMap, m, metric, marketTotalByMonth);
                 if (v !== null && v !== undefined) pts.set(m, v);
               });
               return { label: brandName, color: SERIES_COLORS[idx % SERIES_COLORS.length], pts };
             });
           }
         } catch (err) {
+          if (mySeq !== compareSeq) return;
           chartNote.textContent = `Compare load error: ${err.message}`;
+          setChartLegend([]);
+          renderEmptyChart("Unable to load comparison data");
           return;
         }
 
@@ -1663,8 +1779,10 @@ __STATE_OPTIONS__
         seriesList.forEach((s) => s.pts.forEach((_v, m) => monthSet.add(m)));
         const months = Array.from(monthSet).sort();
         setChartLegend(seriesList.map((s) => ({ label: s.label, color: s.color })));
-        const partialMsg = hiddenPartial > 0 ? `; ${hiddenPartial} partial hidden` : "";
-        chartNote.textContent = `Overlaying ${seriesList.length} ${compareMode} (${winTitle || "Monthly"}${partialMsg})`;
+        const partialMsg = hiddenPartial > 0
+          ? `; ${hiddenPartial} partial hidden`
+          : (fallbackToPartial ? "; all months have partial coverage" : "");
+        chartNote.textContent = `Overlaying ${seriesList.length} ${mode} (${winTitle || "Monthly"}${partialMsg})`;
         if (!months.length) {
           renderEmptyChart();
           return;
@@ -1673,38 +1791,15 @@ __STATE_OPTIONS__
 
         const allVals = [];
         seriesList.forEach((s) => s.pts.forEach((v) => allVals.push(v)));
-        let minVal = Math.min(...allVals);
-        let maxVal = Math.max(...allVals);
-        if (!isYoy) {
-          minVal = Math.min(0, minVal);
-        }
-        if (minVal === maxVal) {
-          minVal -= 1;
-          maxVal += 1;
-        }
-        const span = maxVal - minVal || 1;
-        const W = 960, H = 290;
-        const pad = { top: 20, right: 24, bottom: 44, left: 76 };
-        const plotW = W - pad.left - pad.right;
-        const plotH = H - pad.top - pad.bottom;
+        let rawMin = Math.min(...allVals);
+        let rawMax = Math.max(...allVals);
+        if (!isYoy) rawMin = Math.min(0, rawMin);
+        const [minVal, maxVal] = ensureNonZeroRange(rawMin, rawMax, metric);
+        const layout = chartLayout(76);
+        const { H, pad, plotW } = layout;
         const xScale = (idx) => months.length === 1 ? pad.left + plotW / 2 : pad.left + (idx * plotW) / (months.length - 1);
-        const yScale = (v) => pad.top + plotH - ((v - minVal) / span) * plotH;
-
-        for (let i = 0; i <= 4; i++) {
-          const tv = minVal + (span * i) / 4;
-          const y = yScale(tv);
-          chartSvg.appendChild(svgEl("line", { x1: pad.left, x2: W - pad.right, y1: y, y2: y, stroke: "#e2e8f0" }));
-          chartSvg.appendChild(svgEl("text", {
-            x: pad.left - 8, y: y + 4, "text-anchor": "end", fill: "#64748b", "font-size": 11
-          }, formatAxisTick(metric, tv)));
-        }
-
-        if (minVal < 0 && maxVal > 0) {
-          const zY = yScale(0);
-          chartSvg.appendChild(svgEl("line", {
-            x1: pad.left, x2: W - pad.right, y1: zY, y2: zY, stroke: "#94a3b8", "stroke-dasharray": "4 3"
-          }));
-        }
+        const yScale = drawYGrid(layout, minVal, maxVal, 4, (tv) => formatAxisTick(metric, tv));
+        drawZeroLine(layout, minVal, maxVal, yScale);
 
         seriesList.forEach((s) => {
           let d = "";
@@ -1715,9 +1810,7 @@ __STATE_OPTIONS__
               open = false;
               return;
             }
-            const x = xScale(idx);
-            const y = yScale(v);
-            d += `${open ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)} `;
+            d += `${open ? "L" : "M"}${xScale(idx).toFixed(1)},${yScale(v).toFixed(1)} `;
             open = true;
           });
           if (d) {
@@ -1731,22 +1824,13 @@ __STATE_OPTIONS__
             const dot = svgEl("circle", {
               cx: xScale(idx), cy: yScale(v), r: months.length > 30 ? 2.5 : 3.5, fill: s.color, stroke: "#fff", "stroke-width": 1
             });
-            dot.addEventListener("mousemove", (ev) => {
-              showTooltip(ev, `${s.label} (${m}): ${formatMetricValue(metric, v)}`);
-            });
+            dot.addEventListener("mousemove", (ev) => showTooltip(ev, `${s.label} (${m}): ${formatMetricValue(metric, v)}`));
             dot.addEventListener("mouseleave", hideTooltip);
             chartSvg.appendChild(dot);
           });
         });
 
-        const labelEvery = Math.max(1, Math.ceil(months.length / 12));
-        months.forEach((m, idx) => {
-          if (idx % labelEvery === 0 || idx === months.length - 1) {
-            chartSvg.appendChild(svgEl("text", {
-              x: xScale(idx), y: H - 16, "text-anchor": "middle", fill: "#64748b", "font-size": 11
-            }, m));
-          }
-        });
+        drawXLabels(months, xScale, H);
       }
 
       function renderChart(rows) {
@@ -1754,7 +1838,7 @@ __STATE_OPTIONS__
         const detail = isDetailView();
         const metric = metricSelect.value;
         const winM = Number(windowSelect.value) || 1;
-        const windowSuffix = winM === 3 ? "Rolling 3M" : (winM === 12 ? "TTM (12M)" : "");
+        const windowSuffix = windowLabel(winM);
         const metricLabel = metricSelect.options[metricSelect.selectedIndex].text;
         const stateLabel = stateSelect.options[stateSelect.selectedIndex].text;
         const entityLabel = entitySelect.options[entitySelect.selectedIndex]?.text || "";
@@ -1763,6 +1847,7 @@ __STATE_OPTIONS__
           renderCompareChart(metric, metricLabel, windowSuffix);
           return;
         }
+        compareSeq += 1;
         if (metric === "handle_share" || metric === "revenue_share") {
           renderBrandShareChart(metric, stateLabel, windowSuffix);
           return;
@@ -1770,23 +1855,12 @@ __STATE_OPTIONS__
 
         setChartLegend([]);
         const titlePrefix = windowSuffix ? `${windowSuffix} ` : "";
-        document.getElementById("chartTitle").textContent = detail
+        chartTitleEl.textContent = detail
           ? `${stateLabel} — ${entityLabel} — ${titlePrefix}${metricLabel}`
           : `${stateLabel} — ${titlePrefix}${metricLabel}`;
 
         const rawSeries = aggregateByMonth(rows, metric);
-        let series = rawSeries;
-        let hiddenPartial = 0;
-        let fallbackToPartial = false;
-        if (multi && !includePartialInput.checked) {
-          const completeOnly = rawSeries.filter((pt) => pt.complete);
-          if (completeOnly.length) {
-            hiddenPartial = rawSeries.length - completeOnly.length;
-            series = completeOnly;
-          } else if (rawSeries.length) {
-            fallbackToPartial = true;
-          }
-        }
+        const { series, hiddenPartial, fallbackToPartial } = filterSeriesCompleteness(rawSeries, multi);
         if (!multi) {
           chartNote.textContent = detail && stateSelect.value !== "__ALL__"
             ? (entitySelect.value.startsWith("brand:") ? "Normalized brand rollup from state regulator disclosures" : "")
@@ -1819,12 +1893,16 @@ __STATE_OPTIONS__
         }
       }
 
+      function activeHasChannel(prefix) {
+        return activeRows.some((r) => r[`${prefix}handle`] !== null || r[`${prefix}revenue`] !== null);
+      }
+
       function activeHasRetail() {
-        return activeRows.some((r) => r.retail_handle !== null || r.retail_revenue !== null);
+        return activeHasChannel("retail_");
       }
 
       function activeHasMobile() {
-        return activeRows.some((r) => r.mobile_handle !== null || r.mobile_revenue !== null);
+        return activeHasChannel("mobile_");
       }
 
       function activeShowChannels() {
@@ -1842,34 +1920,63 @@ __STATE_OPTIONS__
         };
       }
 
+      const negTone = (k) => (r) => (r[k] !== null && r[k] < 0 ? "neg" : "");
+      const signedTone = (k) => (r) => (r[k] === null ? "" : (r[k] >= 0 ? "pos" : "neg"));
+      const pctCsv = (k) => (r) => (r[k] !== null ? r[k].toFixed(2) : null);
+      const TABLE_COLUMNS = [
+        { key: "month", group: "base", isText: true, csvName: "month", csvVal: (r) => r.month, text: (r) => r.month },
+        { key: "state", group: "base", isText: true, csvName: "state", csvVal: (r) => r.state, text: (r) => r.state },
+        { key: "operator", group: "detail", isText: true, csvName: "operator", csvVal: (r) => r.operator, text: (r) => r.operator || "—" },
+        { key: "brand", group: "detail", isText: true, csvName: "brand", csvVal: (r) => r.brand, text: (r) => r.brand || "—" },
+        { key: "handle", group: "base", csvName: "handle", csvVal: (r) => r.handle, text: (r) => fmtMoney(r.handle) },
+        { key: "revenue", group: "base", csvName: "revenue", csvVal: (r) => r.revenue, text: (r) => fmtMoney(r.revenue), tone: negTone("revenue") },
+        { key: "hold", group: "base", csvName: "hold", csvVal: pctCsv("hold"), text: (r) => fmtPct(r.hold), tone: negTone("hold") },
+        { key: "yoy_handle", group: "showYoy", csvName: "yoy_handle_pct", csvVal: pctCsv("yoy_handle"), text: (r) => fmtSignedPct(r.yoy_handle), tone: signedTone("yoy_handle") },
+        { key: "yoy_hold_bps", group: "showYoy", csvName: "yoy_hold_bps", csvVal: (r) => (r.yoy_hold_bps !== null ? Math.round(r.yoy_hold_bps) : null), text: (r) => fmtBps(r.yoy_hold_bps), tone: signedTone("yoy_hold_bps") },
+        { key: "gross_revenue", group: "showGross", csvName: "gross_revenue", csvVal: (r) => r.gross_revenue, text: (r) => fmtMoney(r.gross_revenue), tone: negTone("gross_revenue") },
+        { key: "gross_hold", group: "showGross", csvName: "gross_hold", csvVal: pctCsv("gross_hold"), text: (r) => fmtPct(r.gross_hold), tone: negTone("gross_hold") },
+        { key: "promo_deductions", group: "showPromo", csvName: "promo_deductions", csvVal: (r) => r.promo_deductions, text: (r) => fmtMoney(r.promo_deductions) },
+        { key: "tax", group: "showTax", csvName: "tax", csvVal: (r) => r.tax, text: (r) => fmtMoney(r.tax), tone: negTone("tax") },
+        { key: "retail_handle", group: "showChannels", csvName: "retail_handle", csvVal: (r) => r.retail_handle, text: (r) => fmtMoney(r.retail_handle) },
+        { key: "retail_revenue", group: "showChannels", csvName: "retail_revenue", csvVal: (r) => r.retail_revenue, text: (r) => fmtMoney(r.retail_revenue), tone: negTone("retail_revenue") },
+        { key: "retail_hold", group: "showChannels", csvName: "retail_hold", csvVal: pctCsv("retail_hold"), text: (r) => fmtPct(r.retail_hold), tone: negTone("retail_hold") },
+        { key: "mobile_handle", group: "showChannels", csvName: "mobile_handle", csvVal: (r) => r.mobile_handle, text: (r) => fmtMoney(r.mobile_handle) },
+        { key: "mobile_revenue", group: "showChannels", csvName: "mobile_revenue", csvVal: (r) => r.mobile_revenue, text: (r) => fmtMoney(r.mobile_revenue), tone: negTone("mobile_revenue") },
+        { key: "mobile_hold", group: "showChannels", csvName: "mobile_hold", csvVal: pctCsv("mobile_hold"), text: (r) => fmtPct(r.mobile_hold), tone: negTone("mobile_hold") }
+      ];
+
+      function colVisible(col, flags) {
+        return col.group === "base" || Boolean(flags[col.group]);
+      }
+
       function applyTableHeaderVisibility(flags) {
-        document.querySelectorAll("th.detail-col").forEach((th) => { th.style.display = flags.detail ? "" : "none"; });
-        document.querySelectorAll("th.yoy-col").forEach((th) => { th.style.display = flags.showYoy ? "" : "none"; });
-        document.querySelectorAll("th.gross-col").forEach((th) => { th.style.display = flags.showGross ? "" : "none"; });
-        document.querySelectorAll("th.promo-col").forEach((th) => { th.style.display = flags.showPromo ? "" : "none"; });
-        document.querySelectorAll("th.tax-col").forEach((th) => { th.style.display = flags.showTax ? "" : "none"; });
-        document.querySelectorAll("th.channel-col").forEach((th) => { th.style.display = flags.showChannels ? "" : "none"; });
+        const clsGroups = [
+          ["detail-col", flags.detail],
+          ["yoy-col", flags.showYoy],
+          ["gross-col", flags.showGross],
+          ["promo-col", flags.showPromo],
+          ["tax-col", flags.showTax],
+          ["channel-col", flags.showChannels]
+        ];
+        clsGroups.forEach(([cls, vis]) => {
+          document.querySelectorAll(`th.${cls}`).forEach((th) => { th.style.display = vis ? "" : "none"; });
+        });
       }
 
       function renderTable(rows) {
         const flags = getTableColFlags(rows);
-        if (
-          (!flags.detail && (sortCol === "operator" || sortCol === "brand"))
-          || (!flags.showYoy && (sortCol === "yoy_handle" || sortCol === "yoy_hold_bps"))
-          || (!flags.showGross && (sortCol === "gross_revenue" || sortCol === "gross_hold"))
-          || (!flags.showPromo && sortCol === "promo_deductions")
-          || (!flags.showTax && sortCol === "tax")
-          || (!flags.showChannels && (sortCol.startsWith("retail_") || sortCol.startsWith("mobile_")))
-        ) {
+        const sortMeta = TABLE_COLUMNS.find((c) => c.key === sortCol);
+        if (!sortMeta || !colVisible(sortMeta, flags)) {
           sortCol = "month";
           sortAsc = false;
         }
         applyTableHeaderVisibility(flags);
 
         const winM = Number(windowSelect.value) || 1;
-        document.getElementById("tableTitle").textContent = winM === 1
-          ? "Monthly Regulatory Records"
-          : `${winM === 3 ? "Rolling 3M" : "TTM (12M)"} Regulatory Records`;
+        const winTitle = windowLabel(winM);
+        tableTitle.textContent = winTitle
+          ? `${winTitle} Regulatory Records`
+          : "Monthly Regulatory Records";
 
         const sorted = [...rows].sort((a, b) => {
           const av = a[sortCol];
@@ -1895,57 +2002,17 @@ __STATE_OPTIONS__
           }
         });
 
-        const tbody = document.getElementById("tableBody");
-        tbody.innerHTML = "";
+        const visibleCols = TABLE_COLUMNS.filter((c) => colVisible(c, flags));
+        tableBody.innerHTML = "";
         const frag = document.createDocumentFragment();
         sorted.forEach((r) => {
           const tr = document.createElement("tr");
-          const cells = [
-            [r.month, "", true],
-            [r.state, "", true]
-          ];
-          if (flags.detail) {
-            cells.push([r.operator || "—", "", true]);
-            cells.push([r.brand || "—", "", true]);
-          }
-          cells.push(
-            [fmtMoney(r.handle), "", false],
-            [fmtMoney(r.revenue), r.revenue !== null && r.revenue < 0 ? "neg" : "", false],
-            [fmtPct(r.hold), r.hold !== null && r.hold < 0 ? "neg" : "", false]
-          );
-          if (flags.showYoy) {
-            cells.push(
-              [fmtSignedPct(r.yoy_handle), r.yoy_handle === null ? "" : (r.yoy_handle >= 0 ? "pos" : "neg"), false],
-              [fmtBps(r.yoy_hold_bps), r.yoy_hold_bps === null ? "" : (r.yoy_hold_bps >= 0 ? "pos" : "neg"), false]
-            );
-          }
-          if (flags.showGross) {
-            cells.push(
-              [fmtMoney(r.gross_revenue), r.gross_revenue !== null && r.gross_revenue < 0 ? "neg" : "", false],
-              [fmtPct(r.gross_hold), r.gross_hold !== null && r.gross_hold < 0 ? "neg" : "", false]
-            );
-          }
-          if (flags.showPromo) {
-            cells.push([fmtMoney(r.promo_deductions), "", false]);
-          }
-          if (flags.showTax) {
-            cells.push([fmtMoney(r.tax), r.tax !== null && r.tax < 0 ? "neg" : "", false]);
-          }
-          if (flags.showChannels) {
-            cells.push(
-              [fmtMoney(r.retail_handle), "", false],
-              [fmtMoney(r.retail_revenue), r.retail_revenue !== null && r.retail_revenue < 0 ? "neg" : "", false],
-              [fmtPct(r.retail_hold), r.retail_hold !== null && r.retail_hold < 0 ? "neg" : "", false],
-              [fmtMoney(r.mobile_handle), "", false],
-              [fmtMoney(r.mobile_revenue), r.mobile_revenue !== null && r.mobile_revenue < 0 ? "neg" : "", false],
-              [fmtPct(r.mobile_hold), r.mobile_hold !== null && r.mobile_hold < 0 ? "neg" : "", false]
-            );
-          }
-          cells.forEach(([text, toneCls, isTextCol]) => {
+          visibleCols.forEach((col) => {
             const td = document.createElement("td");
-            td.textContent = text;
+            td.textContent = col.text(r);
             const classes = [];
-            if (isTextCol) classes.push("col-text");
+            if (col.isText) classes.push("col-text");
+            const toneCls = col.tone ? col.tone(r) : "";
             if (toneCls) classes.push(toneCls);
             if (classes.length) td.className = classes.join(" ");
             tr.appendChild(td);
@@ -1966,52 +2033,26 @@ __STATE_OPTIONS__
           tr.appendChild(srcTd);
           frag.appendChild(tr);
         });
-        tbody.appendChild(frag);
+        tableBody.appendChild(frag);
       }
 
       function csvCell(val) {
         let s = val === null || val === undefined ? "" : String(val);
-        if (typeof val === "string" && s.trim() !== "" && !Number.isFinite(Number(s)) && /^[\\t\\r]*[=+@-]/.test(s)) {
-          s = "'" + s;
+        if (typeof val === "string" && s !== "") {
+          const isPlainNegNum = /^-(?:\\d+\\.?\\d*|\\.\\d+)$/.test(s);
+          if (!isPlainNegNum) {
+            if (/^[\\s\\u0000-\\u001f\\u007f\\u200b-\\u200f\\u2028\\u2029\\ufeff]*[=+@\\t\\r-]/.test(s)) {
+              s = "'" + s;
+            }
+            s = s.replace(/([\\r\\n]+)([\\u0000-\\u0020\\u200b-\\u200f\\ufeff]*[=+@-])/g, "$1'$2");
+          }
         }
         return /["\\r\\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
       }
 
       function exportViewCsv() {
         const flags = lastColFlags || getTableColFlags(lastRenderedRows);
-        const cols = [["month", (r) => r.month], ["state", (r) => r.state]];
-        if (flags.detail) {
-          cols.push(["operator", (r) => r.operator], ["brand", (r) => r.brand]);
-        }
-        cols.push(
-          ["handle", (r) => r.handle],
-          ["revenue", (r) => r.revenue],
-          ["hold", (r) => r.hold !== null ? r.hold.toFixed(2) : null]
-        );
-        if (flags.showYoy) {
-          cols.push(
-            ["yoy_handle_pct", (r) => r.yoy_handle !== null ? r.yoy_handle.toFixed(2) : null],
-            ["yoy_hold_bps", (r) => r.yoy_hold_bps !== null ? Math.round(r.yoy_hold_bps) : null]
-          );
-        }
-        if (flags.showGross) {
-          cols.push(
-            ["gross_revenue", (r) => r.gross_revenue],
-            ["gross_hold", (r) => r.gross_hold !== null ? r.gross_hold.toFixed(2) : null]
-          );
-        }
-        if (flags.showPromo) cols.push(["promo_deductions", (r) => r.promo_deductions]);
-        if (flags.showTax) cols.push(["tax", (r) => r.tax]);
-        if (flags.showChannels) {
-          cols.push(
-            ["retail_handle", (r) => r.retail_handle],
-            ["retail_revenue", (r) => r.retail_revenue],
-            ["retail_hold", (r) => r.retail_hold !== null ? r.retail_hold.toFixed(2) : null],
-            ["mobile_handle", (r) => r.mobile_handle],
-            ["mobile_revenue", (r) => r.mobile_revenue],
-            ["mobile_hold", (r) => r.mobile_hold !== null ? r.mobile_hold.toFixed(2) : null]
-          );
-        }
+        const cols = TABLE_COLUMNS.filter((c) => colVisible(c, flags)).map((c) => [c.csvName, c.csvVal]);
         cols.push(["source_url", (r) => r.source_url]);
 
         const lines = [cols.map(([h]) => csvCell(h)).join(",")];
@@ -2028,7 +2069,7 @@ __STATE_OPTIONS__
         document.body.appendChild(a);
         a.click();
         a.remove();
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
 
       function refreshView() {
@@ -2105,12 +2146,7 @@ __STATE_OPTIONS__
         entitySelect.appendChild(allDetailOpt);
 
         const stateLabel = stateSelect.options[stateSelect.selectedIndex]?.text || "";
-        const presentBrands = new Set(detailRows.map((r) => r.brand).filter(Boolean));
-        const orderedBrands = BRAND_ORDER.filter((b) => presentBrands.has(b));
-        Array.from(presentBrands)
-          .filter((b) => !BRAND_ORDER.includes(b))
-          .sort((a, b) => a.localeCompare(b))
-          .forEach((b) => orderedBrands.push(b));
+        const orderedBrands = orderedBrandsFromRows(detailRows);
 
         if (orderedBrands.length) {
           const brandGroup = document.createElement("optgroup");
@@ -2208,11 +2244,15 @@ __STATE_OPTIONS__
           detailCsvLink.style.display = "none";
         }
 
-        const allowMobile = !detail || activeHasMobile();
-        const allowRetail = !detail || activeHasRetail();
+        const allowMobile = compareSelected.length > 0 || !detail || activeHasMobile();
+        const allowRetail = compareSelected.length > 0 || !detail || activeHasRetail();
         const allowShare = compareSelected.length > 0 || activeDetailRows.length > 0;
-        const allowPromo = compareSelected.length > 0 || windowedActiveRows.some((r) => r.promo_deductions !== null);
-        const allowTax = compareSelected.length > 0 || windowedActiveRows.some((r) => r.tax !== null);
+        const allowPromo = compareSelected.length > 0
+          || windowedActiveRows.some((r) => r.promo_deductions !== null)
+          || activeRows.some((r) => r.promo_deductions !== null);
+        const allowTax = compareSelected.length > 0
+          || windowedActiveRows.some((r) => r.tax !== null)
+          || activeRows.some((r) => r.tax !== null);
 
         Array.from(metricSelect.options).forEach((opt) => {
           if (opt.value === "mobile_handle") opt.disabled = !allowMobile;
@@ -2233,16 +2273,49 @@ __STATE_OPTIONS__
         compareBtn.textContent = `Compare (${compareSelected.length})`;
         compareBtn.classList.toggle("has-items", compareSelected.length > 0);
         cmpModeBrands.classList.toggle("active", compareMode === "brands");
+        cmpModeBrands.setAttribute("aria-selected", compareMode === "brands" ? "true" : "false");
         cmpModeStates.classList.toggle("active", compareMode === "states");
+        cmpModeStates.setAttribute("aria-selected", compareMode === "states" ? "true" : "false");
         compareHint.textContent = compareSelected.length >= 5
           ? "Maximum 5 series selected"
           : "Select 1–5 series to overlay as trend lines";
       }
 
+      function normalizeUrlCompareSelection(detailRows) {
+        if (!compareSelected.length) return;
+        if (compareMode === "states") {
+          const valid = new Map();
+          Array.from(stateSelect.options).forEach((o) => {
+            if (o.value && o.value !== "__ALL__") {
+              valid.set(o.value.toLowerCase(), o.text);
+              valid.set(o.text.toLowerCase(), o.text);
+            }
+          });
+          compareSelected = Array.from(new Set(
+            compareSelected.map((item) => valid.get(item.toLowerCase())).filter(Boolean)
+          )).slice(0, 5);
+        } else {
+          const src = detailRows.length ? detailRows : (detailCsvCache.get("data/details/all.csv") || []);
+          if (!src.length) return;
+          const valid = new Map(orderedBrandsFromRows(src).map((b) => [b.toLowerCase(), b]));
+          compareSelected = Array.from(new Set(
+            compareSelected.map((item) => valid.get(item.toLowerCase())).filter(Boolean)
+          )).slice(0, 5);
+        }
+      }
+
+      function applyCompareSelectionChange() {
+        renderCompareList();
+        syncControlsAndSelection();
+        refreshView();
+      }
+
       async function renderCompareList() {
+        const myListSeq = ++compareListSeq;
+        const modeAtCall = compareMode;
         updateCompareUi();
         let candidates = [];
-        if (compareMode === "states") {
+        if (modeAtCall === "states") {
           candidates = Array.from(stateSelect.options)
             .filter((o) => o.value && o.value !== "__ALL__")
             .map((o) => o.text)
@@ -2256,23 +2329,25 @@ __STATE_OPTIONS__
               srcDet = [];
             }
           }
-          const present = new Set(srcDet.map((r) => r.brand).filter(Boolean));
-          candidates = BRAND_ORDER.filter((b) => present.has(b));
-          Array.from(present)
-            .filter((b) => !BRAND_ORDER.includes(b))
-            .sort((a, b) => a.localeCompare(b))
-            .forEach((b) => candidates.push(b));
+          if (myListSeq !== compareListSeq || modeAtCall !== compareMode) return;
+          candidates = orderedBrandsFromRows(srcDet);
         }
 
+        const activeName = (document.activeElement && compareList.contains(document.activeElement))
+          ? document.activeElement.getAttribute("data-name")
+          : null;
         compareList.innerHTML = "";
+        let focusTarget = null;
         candidates.forEach((name) => {
           const checked = compareSelected.includes(name);
           const lbl = document.createElement("label");
           lbl.className = "compare-opt";
           const cb = document.createElement("input");
           cb.type = "checkbox";
+          cb.setAttribute("data-name", name);
           cb.checked = checked;
           cb.disabled = !checked && compareSelected.length >= 5;
+          if (activeName === name) focusTarget = cb;
           cb.addEventListener("change", () => {
             if (cb.checked) {
               if (!compareSelected.includes(name) && compareSelected.length < 5) {
@@ -2281,14 +2356,13 @@ __STATE_OPTIONS__
             } else {
               compareSelected = compareSelected.filter((x) => x !== name);
             }
-            renderCompareList();
-            syncControlsAndSelection();
-            refreshView();
+            applyCompareSelectionChange();
           });
           lbl.appendChild(cb);
           lbl.appendChild(document.createTextNode(name));
           compareList.appendChild(lbl);
         });
+        if (focusTarget && !focusTarget.disabled) focusTarget.focus();
       }
 
       function readInitialUrlState() {
@@ -2297,6 +2371,7 @@ __STATE_OPTIONS__
         if (st && Array.from(stateSelect.options).some((o) => o.value === st)) {
           stateSelect.value = st;
         }
+        lastCommittedSlug = stateSelect.value || "__ALL__";
         const win = params.get("window");
         if (win === "1" || win === "3" || win === "12") {
           windowSelect.value = win;
@@ -2305,19 +2380,19 @@ __STATE_OPTIONS__
           includePartialInput.checked = true;
         }
         const from = params.get("from");
-        if (from && /^\\d{4}-\\d{2}$/.test(from)) {
+        if (from && MONTH_RE.test(from)) {
           fromMonthInput.value = from;
           userChangedFrom = true;
         }
         const to = params.get("to");
-        if (to && /^\\d{4}-\\d{2}$/.test(to)) {
+        if (to && MONTH_RE.test(to)) {
           toMonthInput.value = to;
           userChangedTo = true;
         }
         const sort = params.get("sort");
         if (sort && sort.includes(":")) {
           const [sc, sd] = sort.split(":");
-          if (document.querySelector(`th[data-col="${sc}"]`)) {
+          if (TABLE_COLUMNS.some((c) => c.key === sc)) {
             sortCol = sc;
             sortAsc = sd === "asc";
           }
@@ -2398,19 +2473,38 @@ __STATE_OPTIONS__
           }
           populateEntitySelect(slug, activeDetailRows, prevEntity);
           resolveActiveRows();
+          if (compareSelected.length && (pendingUrlState || compareMode === "states")) {
+            if (compareMode === "brands" && !activeDetailRows.length) {
+              try {
+                await fetchDetailRows("__ALL__");
+              } catch (_e) {
+                // Keep existing compare selection if background fetch fails.
+              }
+              if (mySeq !== loadSeq) return;
+            }
+            const normRows = compareMode === "brands"
+              ? (detailCsvCache.get("data/details/all.csv") || activeDetailRows)
+              : activeDetailRows;
+            normalizeUrlCompareSelection(normRows);
+          }
           syncControlsAndSelection();
           if (pendingUrlState && pendingUrlState.metric) {
             const mOpt = Array.from(metricSelect.options).find((o) => o.value === pendingUrlState.metric);
             if (mOpt && !mOpt.disabled) {
               metricSelect.value = pendingUrlState.metric;
+              syncControlsAndSelection();
             }
           }
+          lastCommittedSlug = slug;
           pendingUrlState = null;
           hydrated = true;
           applyDefaultDateBounds();
           refreshView();
         } catch (err) {
           if (mySeq !== loadSeq) return;
+          if (hydrated && stateSelect.value !== lastCommittedSlug) {
+            stateSelect.value = lastCommittedSlug;
+          }
           statusBanner.className = "status error";
           statusBanner.style.display = "block";
           statusBanner.textContent = `Could not load CSV data (${err.message}). Serve docs/ over HTTP (e.g. python3 -m http.server -d docs 8000).`;
@@ -2429,8 +2523,15 @@ __STATE_OPTIONS__
         syncUrlState();
       }
 
+      function setCompareOpen(open) {
+        comparePanel.classList.toggle("open", open);
+        compareBtn.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) renderCompareList();
+      }
+
       document.querySelectorAll("th[data-col]").forEach((th) => {
         th.setAttribute("tabindex", "0");
+        th.setAttribute("role", "button");
         th.addEventListener("click", () => toggleSort(th));
         th.addEventListener("keydown", (ev) => {
           if (ev.key === "Enter" || ev.key === " ") {
@@ -2442,10 +2543,7 @@ __STATE_OPTIONS__
 
       compareBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        const nextOpen = !comparePanel.classList.contains("open");
-        comparePanel.classList.toggle("open", nextOpen);
-        compareBtn.setAttribute("aria-expanded", nextOpen ? "true" : "false");
-        if (nextOpen) renderCompareList();
+        setCompareOpen(!comparePanel.classList.contains("open"));
       });
 
       comparePanel.addEventListener("click", (ev) => {
@@ -2453,16 +2551,13 @@ __STATE_OPTIONS__
       });
 
       document.addEventListener("click", () => {
-        if (comparePanel.classList.contains("open")) {
-          comparePanel.classList.remove("open");
-          compareBtn.setAttribute("aria-expanded", "false");
-        }
+        if (comparePanel.classList.contains("open")) setCompareOpen(false);
       });
 
       document.addEventListener("keydown", (ev) => {
         if (ev.key === "Escape" && comparePanel.classList.contains("open")) {
-          comparePanel.classList.remove("open");
-          compareBtn.setAttribute("aria-expanded", "false");
+          setCompareOpen(false);
+          compareBtn.focus();
         }
       });
 
@@ -2472,37 +2567,35 @@ __STATE_OPTIONS__
           if (mode === compareMode) return;
           compareMode = mode;
           compareSelected = [];
-          renderCompareList();
-          syncControlsAndSelection();
-          refreshView();
+          applyCompareSelectionChange();
         });
       });
 
       compareClearBtn.addEventListener("click", () => {
         compareSelected = [];
-        renderCompareList();
-        syncControlsAndSelection();
-        refreshView();
+        applyCompareSelectionChange();
       });
 
       exportViewBtn.addEventListener("click", exportViewCsv);
 
       copyLinkBtn.addEventListener("click", async () => {
         syncUrlState();
+        let copied = false;
         try {
           if (navigator.clipboard && navigator.clipboard.writeText) {
             await navigator.clipboard.writeText(window.location.href);
+            copied = true;
           }
-          copyLinkBtn.textContent = "Link Copied!";
-          copyLinkBtn.classList.add("copied");
-          setTimeout(() => {
-            copyLinkBtn.textContent = "Copy Share Link";
-            copyLinkBtn.classList.remove("copied");
-          }, 1800);
         } catch (_e) {
-          copyLinkBtn.textContent = "URL Updated";
-          setTimeout(() => { copyLinkBtn.textContent = "Copy Share Link"; }, 1800);
+          copied = false;
         }
+        copyLinkBtn.textContent = copied ? "Link Copied!" : "URL Updated";
+        copyLinkBtn.classList.toggle("copied", copied);
+        clearTimeout(copyBtnTimer);
+        copyBtnTimer = setTimeout(() => {
+          copyLinkBtn.textContent = "Copy Share Link";
+          copyLinkBtn.classList.remove("copied");
+        }, 1800);
       });
 
       stateSelect.addEventListener("change", loadSelection);
@@ -2528,6 +2621,9 @@ __STATE_OPTIONS__
       includePartialInput.addEventListener("change", () => {
         userChangedTo = false;
         applyDefaultDateBounds(true);
+        if (fromMonthInput.value && toMonthInput.value && fromMonthInput.value > toMonthInput.value) {
+          fromMonthInput.value = toMonthInput.value;
+        }
         refreshView();
       });
 
@@ -2541,7 +2637,14 @@ __STATE_OPTIONS__
 
 
 def _safe_inline_json(value: object) -> str:
-    return json.dumps(value).replace("</", "<\\/")
+    return (
+        json.dumps(value)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def render_index_html(states: Sequence[tuple[str, str]] | None = None) -> str:
@@ -2555,11 +2658,15 @@ def render_index_html(states: Sequence[tuple[str, str]] | None = None) -> str:
     detail_states = [
         slug for slug in ALL_STATES if getattr(load_state_module(slug), "HAS_DETAILS", False)
     ]
-    return (
-        INDEX_HTML_TEMPLATE
-        .replace("__STATE_OPTIONS__", options_html)
-        .replace("__DETAIL_STATES_JSON__", _safe_inline_json(detail_states))
-        .replace("__BRAND_ORDER_JSON__", _safe_inline_json(list(BRAND_ORDER)))
+    replacements = {
+        "__STATE_OPTIONS__": options_html,
+        "__DETAIL_STATES_JSON__": _safe_inline_json(detail_states),
+        "__BRAND_ORDER_JSON__": _safe_inline_json(list(BRAND_ORDER)),
+    }
+    return re.sub(
+        r"__(?:STATE_OPTIONS|DETAIL_STATES_JSON|BRAND_ORDER_JSON)__",
+        lambda m: replacements[m.group(0)],
+        INDEX_HTML_TEMPLATE,
     )
 
 

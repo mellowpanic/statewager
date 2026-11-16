@@ -1,6 +1,7 @@
 """HTTP client helpers with retry/backoff, Wayback fallback, and URL probing."""
 from __future__ import annotations
 
+import atexit
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
@@ -10,6 +11,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlparse
+import weakref
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -20,8 +22,22 @@ if TYPE_CHECKING:
     from .discover import DiscoveryReport
 
 _THREAD_LOCAL = threading.local()
-_ORIG_REQUESTS_REQUEST = requests.request
-_ORIG_REQUESTS_SESSION = requests.Session
+_SESSION_LOCK = threading.Lock()
+_CREATED_SESSIONS: weakref.WeakSet[requests.Session] = weakref.WeakSet()
+
+
+def _close_all_sessions() -> None:
+    with _SESSION_LOCK:
+        sessions = list(_CREATED_SESSIONS)
+        _CREATED_SESSIONS.clear()
+    for sess in sessions:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_all_sessions)
 
 
 def _get_session() -> requests.Session:
@@ -33,6 +49,8 @@ def _get_session() -> requests.Session:
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         _THREAD_LOCAL.session = session
+        with _SESSION_LOCK:
+            _CREATED_SESSIONS.add(session)
     return session
 
 
@@ -67,17 +85,13 @@ def retry_request(
     data: bytes | str | dict[str, object] | None = None,
 ) -> requests.Response:
     """HTTP request with retry/backoff for transient failures."""
-    if session is not None:
-        client = session
-    elif requests.request is _ORIG_REQUESTS_REQUEST and requests.Session is _ORIG_REQUESTS_SESSION:
-        client = _get_session()
-    else:
-        client = requests
+    client = session if session is not None else _get_session()
+    attempts = max(1, retries)
     last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, attempts + 1):
         try:
             response = client.request(method, url, timeout=timeout, headers=headers, data=data)
-            if response.status_code in {429, 503} and attempt < retries:
+            if response.status_code in {429, 503} and attempt < attempts:
                 retry_after = _resolve_retry_after(response.headers.get("Retry-After"))
                 response.close()
                 backoff = retry_after if retry_after is not None else max(1.0, attempt * 2.0)
@@ -85,7 +99,7 @@ def retry_request(
                 continue
             if response.status_code == 404:
                 return response
-            if 500 <= response.status_code < 600 and attempt < retries:
+            if 500 <= response.status_code < 600 and attempt < attempts:
                 response.close()
                 _sleep_with_jitter(float(attempt))
                 continue
@@ -93,9 +107,9 @@ def retry_request(
             return response
         except requests.RequestException as exc:
             last_exc = exc
-            if attempt < retries:
+            if attempt < attempts:
                 _sleep_with_jitter(float(attempt))
-    raise RuntimeError(f"Failed to {method.upper()} {url} after {retries} attempts") from last_exc
+    raise RuntimeError(f"Failed to {method.upper()} {url} after {attempts} attempts") from last_exc
 
 
 def retry_get(
@@ -127,9 +141,14 @@ def fetch_bytes(
 ) -> bytes | None:
     """HTTP GET returning bytes, or None on 404. Retries 429/5xx/timeouts."""
     response = retry_get(url, retries=retries, timeout=timeout, headers=headers, session=session)
-    if response.status_code == 404:
-        return None
-    return response.content
+    try:
+        if response.status_code == 404:
+            return None
+        return response.content
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 
 def fetch_text(
@@ -147,7 +166,7 @@ def fetch_text(
 
 
 _XLS_SIGNATURES = (b"PK", b"\xd0\xcf\x11\xe0")
-_HTML_PREFIXES = (b"<!doctype html", b"<html", b"<head")
+_HTML_PREFIXES = (b"<!doctype", b"<html", b"<head", b"<body", b"<script", b"<!--")
 _NON_DIGIT_RE = re.compile(r"[^0-9]")
 _WAYBACK_TS_RE = re.compile(r"\d{4,14}")
 
@@ -239,9 +258,14 @@ def _fetch_wayback_snapshot(
         if log:
             log(f"WARN wayback API JSON parse failed for {url}: {exc}")
         return None
-    snapshot = payload.get("archived_snapshots", {}).get("closest", {})
-    snapshot_url = snapshot.get("url")
-    snapshot_ts = snapshot.get("timestamp")
+    if not isinstance(payload, dict):
+        return None
+    snapshots = payload.get("archived_snapshots")
+    closest = snapshots.get("closest") if isinstance(snapshots, dict) else None
+    if not isinstance(closest, dict):
+        return None
+    snapshot_url = closest.get("url")
+    snapshot_ts = closest.get("timestamp")
     if not snapshot_url:
         if log:
             log(f"WARN wayback has no snapshot for {url}")
@@ -297,9 +321,6 @@ def fetch_with_wayback_fallback(
     )
 
 
-_ORIG_FETCH_WAYBACK = fetch_with_wayback_fallback
-
-
 def _accept_probe_payload(
     data: bytes | None,
     url: str,
@@ -327,7 +348,7 @@ def _accept_probe_payload(
 
 
 def _record_probe(
-    report: "DiscoveryReport | None",
+    report: DiscoveryReport | None,
     report_key: str | None,
     url: str,
     *,
@@ -338,6 +359,22 @@ def _record_probe(
         report.add_probe(report_key, url, status=status, reason=reason)
 
 
+def _record_probe_hit(
+    report: DiscoveryReport | None,
+    report_key: str | None,
+    url: str,
+    matched_url: list[str] | None,
+    reason: str,
+    message: str,
+    log: Callable[[str], None] | None,
+) -> None:
+    _record_probe(report, report_key, url, status="ok", reason=reason)
+    if matched_url is not None:
+        matched_url[:] = [url]
+    if log:
+        log(message)
+
+
 def probe_url_variants(
     templates: list[str],
     format_kwargs: dict[str, str],
@@ -346,46 +383,13 @@ def probe_url_variants(
     wayback_timestamp: str | None = None,
     convert_xls: bool = False,
     log: Callable[[str], None] | None = None,
-    report: "DiscoveryReport | None" = None,
+    report: DiscoveryReport | None = None,
     report_key: str | None = None,
     matched_url: list[str] | None = None,
 ) -> bytes | None:
     """Try multiple URL templates live first, then Wayback fallback; return first valid response."""
     urls = list(dict.fromkeys(template.format(**format_kwargs) for template in templates))
     eff_sig = None if convert_xls else signature_check
-
-    # Honor monkeypatching of fetch_with_wayback_fallback in tests.
-    if fetch_with_wayback_fallback is not _ORIG_FETCH_WAYBACK:
-        for url in urls:
-            try:
-                data = fetch_with_wayback_fallback(
-                    url,
-                    timestamp_yyyymm=wayback_timestamp,
-                    signature_check=eff_sig,
-                    log=log,
-                )
-            except Exception as exc:
-                if log:
-                    log(f"WARN fetch error for {url}: {exc}")
-                _record_probe(report, report_key, url, status="error", reason=str(exc))
-                continue
-            accepted = _accept_probe_payload(
-                data, url, signature_check=signature_check, convert_xls=convert_xls, log=log
-            )
-            _record_probe(
-                report,
-                report_key,
-                url,
-                status="ok" if accepted else "fail",
-                reason="downloaded" if accepted else "fetch-failed",
-            )
-            if accepted is not None:
-                if matched_url is not None:
-                    matched_url[:] = [url]
-                if log:
-                    log(f"INFO downloaded from {url}")
-                return accepted
-        return None
 
     # Pass 1: try all live URLs before hitting Wayback.
     try_wayback = _should_try_wayback(wayback_timestamp)
@@ -402,11 +406,9 @@ def probe_url_variants(
             raw, url, signature_check=signature_check, convert_xls=convert_xls, log=log
         )
         if accepted is not None:
-            _record_probe(report, report_key, url, status="ok", reason="downloaded")
-            if matched_url is not None:
-                matched_url[:] = [url]
-            if log:
-                log(f"INFO downloaded from {url}")
+            _record_probe_hit(
+                report, report_key, url, matched_url, "downloaded", f"INFO downloaded from {url}", log
+            )
             return accepted
         live_failures[url] = ("fail", "fetch-failed")
 
@@ -430,11 +432,9 @@ def probe_url_variants(
             snap, url, signature_check=signature_check, convert_xls=convert_xls, log=log
         )
         if accepted is not None:
-            _record_probe(report, report_key, url, status="ok", reason="wayback")
-            if matched_url is not None:
-                matched_url[:] = [url]
-            if log:
-                log(f"INFO downloaded from Wayback for {url}")
+            _record_probe_hit(
+                report, report_key, url, matched_url, "wayback", f"INFO downloaded from Wayback for {url}", log
+            )
             return accepted
         status, reason = live_failures.get(url, ("fail", "fetch-failed"))
         _record_probe(report, report_key, url, status=status, reason=reason)

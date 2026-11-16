@@ -4,14 +4,16 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+import logging
 import os
 import sys
+import tempfile
 from types import ModuleType
 from typing import Sequence
 
 from dateutil.relativedelta import relativedelta
 
-from statewager.model import StateMonthResult, month_starts, parse_month_spec
+from statewager.model import StateMonthResult, parse_month_spec, resolve_fetch_months
 from statewager.states import ALL_STATES, load_state_module
 
 from .csv_writer import (
@@ -101,10 +103,12 @@ def publish_all(
     jobs: int = 4,
 ) -> dict[str, list[StateMonthResult]]:
     """Run ``statewager`` for ``states`` and write ``docs/data/*.csv`` + ``docs/index.html``."""
+    cache_dir = (cache_dir or "").strip() or None
     data_dir = os.path.join(docs_dir, "data")
     details_dir = os.path.join(data_dir, "details")
     by_state: dict[str, list[StateMonthResult]] = {}
     details_by_state: dict[str, list[PublishedDetailRow]] = {}
+    pub_log = logging.getLogger("publish")
 
     modules: list[tuple[str, ModuleType]] = []
     loaded_modules: dict[str, ModuleType] = {}
@@ -115,7 +119,13 @@ def publish_all(
             continue
         loaded_modules[slug] = mod
         modules.append((slug, mod))
+    if not modules:
+        raise ValueError("No states selected")
 
+    expected_by_slug = {
+        slug: bool(resolve_fetch_months(month_start, month_end, launch_date=getattr(mod, "LAUNCH_DATE", None)))
+        for slug, mod in modules
+    }
     silent_log = (lambda _msg: None) if quiet else None
 
     def _fetch_one(item: tuple[str, object]) -> tuple[list[StateMonthResult], Exception | None]:
@@ -134,7 +144,7 @@ def publish_all(
         except Exception as exc:
             if not merge_existing:
                 raise
-            print(f"WARN {slug}: refresh failed ({exc!r}); keeping existing rows", file=sys.stderr)
+            pub_log.warning("%s: refresh failed (%r); keeping existing rows", slug, exc)
             return ([], exc)
 
     worker_count = min(max(1, jobs), len(modules)) if modules else 1
@@ -147,29 +157,41 @@ def publish_all(
     if modules and all(exc is not None for _res, exc in fetched_lists):
         first_exc = fetched_lists[0][1]
         raise RuntimeError(f"All {len(modules)} state refreshes failed") from first_exc
+    if any(expected_by_slug.values()) and all(not res for res, _exc in fetched_lists):
+        raise RuntimeError(f"All {len(modules)} state refreshes returned 0 rows")
 
     for (slug, mod), (results, exc) in zip(modules, fetched_lists):
         csv_path = os.path.join(data_dir, f"{slug}.csv")
+        detail_csv_path = os.path.join(details_dir, f"{slug}.csv")
+        has_details = bool(getattr(mod, "HAS_DETAILS", False))
         if exc is not None:
-            existing_rows = read_state_csv(csv_path)
-            by_state[slug] = existing_rows
-            if getattr(mod, "HAS_DETAILS", False):
-                detail_csv_path = os.path.join(details_dir, f"{slug}.csv")
+            by_state[slug] = read_state_csv(csv_path)
+            if has_details:
                 details_by_state[slug] = read_detail_csv(detail_csv_path)
             continue
 
         if merge_existing:
             merged = merge_state_results(read_state_csv(csv_path), results)
+        elif not results and expected_by_slug[slug] and os.path.isfile(csv_path):
+            pub_log.warning("%s: refresh returned 0 rows under --no-merge; keeping existing rows", slug)
+            merged = read_state_csv(csv_path)
+            by_state[slug] = merged
+            if has_details:
+                details_by_state[slug] = read_detail_csv(detail_csv_path)
+            continue
         else:
             merged = sorted(results, key=lambda r: r.month)
         write_state_csv(data_dir, slug, merged)
         by_state[slug] = merged
 
-        if getattr(mod, "HAS_DETAILS", False):
+        if has_details:
             fresh_details = extract_published_details(results)
-            detail_csv_path = os.path.join(details_dir, f"{slug}.csv")
             if merge_existing:
-                merged_details = merge_detail_results(read_detail_csv(detail_csv_path), fresh_details)
+                merged_details = merge_detail_results(
+                    read_detail_csv(detail_csv_path),
+                    fresh_details,
+                    refreshed_months={(r.state, r.month) for r in results},
+                )
             else:
                 merged_details = sorted(fresh_details, key=lambda r: (r.month, r.operator))
             write_state_detail_csv(details_dir, slug, merged_details)
@@ -178,30 +200,25 @@ def publish_all(
     combined: list[StateMonthResult] = []
     combined_details: list[PublishedDetailRow] = []
     state_options: list[tuple[str, str]] = []
-    if merge_existing:
-        for slug in ALL_STATES:
-            mod = loaded_modules.get(slug) or load_state_module(slug)
-            if slug in by_state:
-                combined.extend(by_state[slug])
+    for slug in ALL_STATES:
+        mod = loaded_modules.get(slug) or load_state_module(slug)
+        existing_path = os.path.join(data_dir, f"{slug}.csv")
+        if slug in by_state:
+            rows = by_state[slug]
+            combined.extend(rows)
+            if rows or os.path.isfile(existing_path):
                 state_options.append((slug, mod.STATE_NAME))
-            else:
-                existing_path = os.path.join(data_dir, f"{slug}.csv")
-                if os.path.isfile(existing_path):
-                    combined.extend(read_state_csv(existing_path))
-                    state_options.append((slug, mod.STATE_NAME))
-            if getattr(mod, "HAS_DETAILS", False):
-                if slug in details_by_state:
-                    combined_details.extend(details_by_state[slug])
-                else:
-                    existing_detail_path = os.path.join(details_dir, f"{slug}.csv")
-                    if os.path.isfile(existing_detail_path):
-                        combined_details.extend(read_detail_csv(existing_detail_path))
-    else:
-        for slug, mod in modules:
-            combined.extend(by_state[slug])
+        elif os.path.isfile(existing_path):
+            combined.extend(read_state_csv(existing_path))
             state_options.append((slug, mod.STATE_NAME))
+
+        if getattr(mod, "HAS_DETAILS", False):
             if slug in details_by_state:
                 combined_details.extend(details_by_state[slug])
+            else:
+                existing_detail_path = os.path.join(details_dir, f"{slug}.csv")
+                if os.path.isfile(existing_detail_path):
+                    combined_details.extend(read_detail_csv(existing_detail_path))
 
     write_combined_csv(data_dir, combined)
     write_combined_detail_csv(details_dir, combined_details)
@@ -209,34 +226,61 @@ def publish_all(
     return by_state
 
 
+def _verify_docs_dir_writable(docs_dir: str) -> None:
+    os.makedirs(docs_dir, exist_ok=True)
+    with tempfile.TemporaryFile(dir=docs_dir):
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.months < 1:
         parser.error("--months must be >= 1")
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
 
-    last_completed = date.today().replace(day=1) - relativedelta(months=1)
-    end_date = parse_month_spec(args.end_month) if args.end_month else last_completed
-    if args.start_month:
-        start_date = parse_month_spec(args.start_month)
-    elif args.offline:
-        start_date = date(2023, 1, 1)
-    else:
-        window = month_starts(args.months)
-        start_date = window[0]
+    for raw_state in args.states:
+        try:
+            load_state_module(raw_state)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    current_month = date.today().replace(day=1)
+    last_completed = current_month - relativedelta(months=1)
+    try:
+        end_date = parse_month_spec(args.end_month) if args.end_month else last_completed
+        if args.start_month:
+            start_date = parse_month_spec(args.start_month)
+            if not args.end_month and start_date > end_date:
+                end_date = start_date
+        elif args.offline:
+            start_date = date(2023, 1, 1)
+        else:
+            start_date = end_date - relativedelta(months=args.months - 1)
+    except ValueError as exc:
+        parser.error(str(exc))
     if end_date < start_date:
         parser.error(f"--end-month ({end_date:%Y-%m}) must be on or after --start-month ({start_date:%Y-%m})")
+    if end_date > current_month:
+        parser.error(f"--end-month ({end_date:%Y-%m}) cannot be in the future")
+
+    cache_dir = (args.cache_dir or "").strip() or None
+    try:
+        _verify_docs_dir_writable(args.docs_dir)
+    except OSError as exc:
+        parser.error(f"--docs-dir {args.docs_dir!r} is not writable: {exc}")
 
     by_state = publish_all(
         states=args.states,
         month_start=start_date,
         month_end=end_date,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         docs_dir=args.docs_dir,
         offline=args.offline,
         quiet=args.quiet,
         merge_existing=not args.no_merge,
-        jobs=max(1, args.jobs),
+        jobs=args.jobs,
     )
     total_rows = sum(len(rows) for rows in by_state.values())
     populated_states = sum(1 for rows in by_state.values() if rows)

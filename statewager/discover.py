@@ -7,36 +7,34 @@ from html import unescape
 from html.parser import HTMLParser
 import os
 import re
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlparse
-
-import requests
 
 from .http import fetch_text
 from .model import MONTH_NAME_TO_NUM
 
+if TYPE_CHECKING:
+    import requests
+
 MONTH_NAMES: dict[str, int] = MONTH_NAME_TO_NUM
+
+_FULL_MONTH_PAT = (
+    r"january|february|march|april|may|june|july|august|september|october|november|december"
+)
+_ABBR_MONTH_PAT = r"jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec"
 
 MONTH_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
-        r"(?<!\d)(?P<year>20\d{2})[\W_]{0,2}(?P<month>0[1-9]|1[0-2])(?!\d)"
-        r"(?:[\W_]{0,2}(?P<name>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
-        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
-        r"dec(?:ember)?))?"
+        rf"(?<!\d)(?P<year>20\d{{2}})[\W_]{{0,2}}(?P<month>0[1-9]|1[0-2])(?!\d)"
+        rf"(?:[\W_]{{0,2}}(?P<name>{_FULL_MONTH_PAT}|{_ABBR_MONTH_PAT}))?"
     ),
     re.compile(r"(?P<month>0[1-9]|1[0-2])[\W_]{1,2}(?P<year>20\d{2})"),
+    re.compile(rf"(?P<year>20\d{{2}})[\W_]{{1,2}}(?P<name>{_FULL_MONTH_PAT})"),
+    re.compile(rf"(?P<name>{_FULL_MONTH_PAT})[\W_]{{1,2}}(?P<year>20\d{{2}})"),
     re.compile(
-        r"(?P<year>20\d{2})[\W_]{1,2}(?P<name>january|february|march|april|may|june|"
-        r"july|august|september|october|november|december)"
-    ),
-    re.compile(
-        r"(?P<name>january|february|march|april|may|june|july|august|september|"
-        r"october|november|december)[\W_]{1,2}(?P<year>20\d{2})"
-    ),
-    re.compile(
-        r"(?:(?<=^)|(?<=[\W_]))"
-        r"(?P<name>jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)"
-        r"[\W_]{1,2}(?P<year>20\d{2})"
+        rf"(?:(?<=^)|(?<=[\W_]))"
+        rf"(?P<name>{_ABBR_MONTH_PAT})"
+        rf"[\W_]{{1,2}}(?P<year>20\d{{2}})"
     ),
 ]
 
@@ -102,10 +100,18 @@ def extract_month_label(name: str) -> str | None:
         return None
     candidates.sort(key=lambda triple: triple[0])
     _, year, month_num = candidates[-1]
-    try:
-        return datetime(year, month_num, 1).strftime("%b %Y")
-    except ValueError:
+    return datetime(year, month_num, 1).strftime("%b %Y")
+
+
+def parse_text_month(text: str) -> str | None:
+    """Extract the first spelled-out ``Mon YYYY`` label matching ``TEXT_MONTH_RE``."""
+    match = TEXT_MONTH_RE.search(text)
+    if not match:
         return None
+    month_num = MONTH_NAMES.get(match.group(1).lower())
+    if month_num is None:
+        return None
+    return datetime(int(match.group(2)), month_num, 1).strftime("%b %Y")
 
 
 def _resolve_channel(combined: str, channel_keywords: dict[str, list[str]] | None) -> str | None:
@@ -199,11 +205,13 @@ def classify_cumulative_filename(
         start_year = end_year - 1
     else:
         return None
+    if not (0 < end_year - start_year <= 10):
+        return None
     months: set[str] = set()
-    for month_num in range(7, 13):
-        months.add(datetime(start_year, month_num, 1).strftime("%b %Y"))
-    for month_num in range(1, 7):
-        months.add(datetime(end_year, month_num, 1).strftime("%b %Y"))
+    y, m = start_year, 7
+    while (y, m) <= (end_year, 6):
+        months.add(datetime(y, m, 1).strftime("%b %Y"))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
     return months, channel
 
 
@@ -219,8 +227,7 @@ class AnchorParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() != "a":
             return
-        if self._anchor is not None:
-            self._flush()
+        self._flush()
         attr_map = {key.lower(): value or "" for key, value in attrs}
         self._anchor = {
             "href": attr_map.get("href", ""),
@@ -233,13 +240,11 @@ class AnchorParser(HTMLParser):
             self._text_parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() != "a" or self._anchor is None:
-            return
-        self._flush()
+        if tag.lower() == "a":
+            self._flush()
 
     def close(self) -> None:
-        if self._anchor is not None:
-            self._flush()
+        self._flush()
         super().close()
 
     def _flush(self) -> None:

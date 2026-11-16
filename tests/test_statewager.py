@@ -310,10 +310,15 @@ def test_pennsylvania_fy27_filter_and_option_parsing() -> None:
 
 
 def test_render_index_html_has_partial_month_controls() -> None:
+    import re
+
     html_text = render_index_html()
     assert "includePartial" in html_text
     assert "expectedStatesForMonth" in html_text
-    assert html_text.index('<th data-col="month">Month</th>') < html_text.index('<th data-col="state">State</th>')
+    month_m = re.search(r'<th[^>]*data-col="month"[^>]*>Month</th>', html_text)
+    state_m = re.search(r'<th[^>]*data-col="state"[^>]*>State</th>', html_text)
+    assert month_m is not None and state_m is not None
+    assert month_m.start() < state_m.start()
 
 
 def test_missouri_pdf_name_re_matches_underscores_and_revised() -> None:
@@ -1138,6 +1143,199 @@ def test_critique_core_fixes_and_single_pass_parsers(tmp_path: pathlib.Path, mon
         publish_main(["--months", "0"])
     with pytest.raises(SystemExit):
         publish_main(["--start-month", "2026-05", "--end-month", "2026-03"])
+
+
+def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) -> None:
+    import datetime
+    import json
+    import os
+    import pytest
+    import publish.__main__ as pub_main
+    from publish.csv_writer import PublishedDetailRow, merge_detail_results, read_detail_csv, write_state_detail_csv
+    from publish.site import _safe_inline_json, render_index_html
+    from statewager import http as sw_http
+    from statewager.cache import cache_path, recent_cache_ttl, recent_fy_cache_ttl
+    from statewager.model import finalize_state_month, hold_pct
+    from statewager.operators import normalize_operator_name
+    from statewager.states import indiana, iowa, kansas, missouri, nevada, ohio, pennsylvania
+
+    # 1. cache_path rejects "." and symlink escapes while accepting clean subpaths
+    cache_root = tmp_path / "cache_root"
+    cache_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(ValueError):
+        cache_path(str(cache_root), ".")
+    escape_link = cache_root / "escape"
+    os.symlink(str(outside), str(escape_link))
+    with pytest.raises(ValueError):
+        cache_path(str(cache_root), "escape/secret.pdf")
+    assert cache_path(str(cache_root), "sub/ok.pdf") == os.path.join(os.path.abspath(str(cache_root)), "sub", "ok.pdf")
+
+    # recent_cache_ttl / recent_fy_cache_ttl handle year rollover cleanly
+    today = datetime.date.today()
+    prev_month = (today.replace(day=1) - datetime.timedelta(days=1))
+    assert recent_cache_ttl(prev_month.year, prev_month.month) is not None
+    assert recent_cache_ttl(2023, 1) is None
+    assert recent_fy_cache_ttl(today.year + 1) is not None
+    assert recent_fy_cache_ttl(2023) is None
+
+    # 2. http: fetch_bytes closes response on 404; Wayback guards null JSON snapshots
+    closed = {"count": 0}
+
+    class FakeResp:
+        def __init__(self, status_code: int, content: bytes = b"") -> None:
+            self.status_code = status_code
+            self.content = content
+
+        def close(self) -> None:
+            closed["count"] += 1
+
+    monkeypatch.setattr(sw_http, "retry_get", lambda *_a, **_kw: FakeResp(404))
+    assert sw_http.fetch_bytes("https://example.test/missing.pdf") is None
+    assert closed["count"] == 1
+    monkeypatch.setattr(sw_http, "fetch_text", lambda *_a, **_kw: json.dumps({"archived_snapshots": None}))
+    assert sw_http._fetch_wayback_snapshot("https://example.test/old.pdf") is None
+
+    # 3. model: hold_pct rejects <= 0 handle; finalize_state_month blanks non-reconciling splits on zero total
+    assert hold_pct(-100.0, -50.0) is None
+    assert hold_pct(0.0, 10.0) is None
+    zero_split = finalize_state_month(
+        state="Ohio",
+        iso_month="2026-01",
+        handle=100.0,
+        revenue=0.0,
+        retail_handle=50.0,
+        retail_revenue=5.0,
+        mobile_handle=50.0,
+        mobile_revenue=5.0,
+        strict_split_pct=0.05,
+    )
+    assert zero_split is not None
+    assert zero_split.retail_handle is None and zero_split.mobile_handle is None
+
+    # 4. operators & state parsers
+    assert normalize_operator_name("KS Crossing-DraftKings", state="Kansas") == "Kansas Crossing - DraftKings"
+    assert normalize_operator_name("HOLLYWOOD - THE SCORE", state="Missouri") == "Hollywood - theScore Bet"
+
+    adj = indiana._allocate_component_adjustments([100.0, -100.0], 20.0)
+    assert round(sum(adj), 6) == 20.0
+    assert indiana._allocate_component_tax([100.0, 200.0], 0.0) == [0.0, 0.0]
+    neg_tail_tax = indiana._allocate_component_tax([1000.0, 1000.0, 1.0], 0.03)
+    assert neg_tail_tax is not None and all(v is not None and v >= 0 for v in neg_tail_tax)
+    assert round(sum(v for v in neg_tail_tax if v is not None), 2) == 0.03
+
+    assert iowa.MONEY_RE.findall("-$1,234.56 \u2212$9.50") == ["-$1,234.56", "\u2212$9.50"]
+    assert kansas._extract_handle_and_revenue_from_line("Casino $1,234.00 -") == (1234.0, 0.0)
+    assert nevada._metrics_from_win(100.0, 0.0) is None
+    assert nevada._metrics_from_win(100.0, -5.0) is None
+    assert nevada.reconcile_county_details([("Clark County", 10.0, -5.0)], statewide_revenue=-10.0) == [("Clark County", 10.0, -5.0)]
+    assert pennsylvania.parse_month_columns([("Operator", "July", "July YTD", "January", "Total")], 2025, 2026) == {
+        1: "Jul 2025",
+        3: "Jan 2026",
+    }
+
+    # 5. publish CSV hardening, lossless detail hold, merge_detail_results, --no-merge --states, CLI validation
+    bom_csv = tmp_path / "bom_detail.csv"
+    bom_csv.write_bytes(
+        "\ufeffstate,month,operator,brand,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,"
+        "mobile_handle,mobile_revenue,mobile_hold,gross_revenue,promo_deductions,tax,source_url\n"
+        "Ohio,2026-01,Test Op,Other / Retail Venue,0,0,0,0,0,0,0,0,0,,,,https://oh.gov/x\n".encode("utf-8")
+    )
+    loaded_det = read_detail_csv(str(bom_csv))
+    assert len(loaded_det) == 1 and loaded_det[0].hold == 0.0 and loaded_det[0].retail_hold == 0.0
+
+    # Preserves distinct published hold instead of recomputing if single row has rounded hold
+    single_det = PublishedDetailRow(
+        state="Ohio", month="2026-01", operator="Op A", brand="DraftKings",
+        handle=1000.0, revenue=123.45, hold=12.40,
+        retail_handle=200.0, retail_revenue=20.0, retail_hold=9.99,
+        mobile_handle=800.0, mobile_revenue=103.45, mobile_hold=12.95,
+    )
+    det_dir = tmp_path / "det"
+    det_csv = write_state_detail_csv(str(det_dir), "ohio", [single_det])
+    roundtrip = read_detail_csv(det_csv)
+    assert len(roundtrip) == 1 and roundtrip[0].hold == 12.40 and roundtrip[0].retail_hold == 9.99
+
+    bad_csv = tmp_path / "bad.csv"
+    bad_csv.write_text("foo,bar\n1,2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid CSV header"):
+        read_state_csv(str(bad_csv))
+
+    merged_det = merge_detail_results([single_det], [], refreshed_months=[("Ohio", "2026-01")])
+    assert merged_det == []
+
+    # publish_all: --no-merge keeps existing ohio (when 0 rows for one state) + untouched nevada
+    docs_dir = tmp_path / "docs"
+    data_dir = docs_dir / "data"
+    write_state_csv(
+        str(data_dir),
+        "nevada",
+        [StateMonthResult("Nevada", "2026-02", 500.0, 50.0, 10.0, None, None, None, None, None, None, None)],
+    )
+    write_state_csv(
+        str(data_dir),
+        "ohio",
+        [StateMonthResult("Ohio", "2026-02", 600.0, 60.0, 10.0, None, None, None, None, None, None, None)],
+    )
+    monkeypatch.setattr(ohio, "fetch", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        missouri,
+        "fetch",
+        lambda *_a, **_kw: [StateMonthResult("Missouri", "2026-02", 400.0, 40.0, 10.0, None, None, None, None, None, None, None)],
+    )
+    res_map = pub_main.publish_all(
+        month_start="2026-02",
+        month_end="2026-02",
+        states=["ohio", "missouri"],
+        cache_dir=str(tmp_path / "c"),
+        docs_dir=str(docs_dir),
+        merge_existing=False,
+        quiet=True,
+    )
+    assert [r.month for r in res_map["ohio"]] == ["2026-02"]
+    assert {(r.state, r.month) for r in read_state_csv(str(data_dir / "all.csv"))} == {
+        ("Missouri", "2026-02"),
+        ("Nevada", "2026-02"),
+        ("Ohio", "2026-02"),
+    }
+
+    with pytest.raises(RuntimeError, match="All 1 state refreshes returned 0 rows"):
+        pub_main.publish_all(
+            month_start="2026-02",
+            month_end="2026-02",
+            states=["ohio"],
+            cache_dir=str(tmp_path / "c2"),
+            docs_dir=str(tmp_path / "empty_docs"),
+            merge_existing=False,
+            quiet=True,
+        )
+
+    # CLI validation: invalid --states & --months + --end-month
+    with pytest.raises(SystemExit):
+        pub_main.main(["--states", "atlantis"])
+    captured = {}
+
+    def _fake_publish_all(**kw):
+        captured.update(kw)
+        return {}
+
+    monkeypatch.setattr(pub_main, "publish_all", _fake_publish_all)
+    assert pub_main.main(["--months", "3", "--end-month", "2026-03", "--docs-dir", str(docs_dir), "--quiet"]) == 0
+    assert captured["month_start"] == datetime.date(2026, 1, 1)
+    assert captured["month_end"] == datetime.date(2026, 3, 1)
+
+    # 6. viewer inline JSON escaping & ARIA/safety markers
+    escaped = _safe_inline_json("</script>&\u2028\u2029")
+    assert "</" not in escaped and "&" not in escaped and "\\u2028" in escaped and "\\u2029" in escaped
+    html = render_index_html()
+    assert "TABLE_COLUMNS.some((c) => c.key === sc)" in html
+    assert 'aria-controls="comparePanel"' in html
+    assert 'aria-live="polite"' in html
+    assert 'scope="col"' in html
+    assert "ensureNonZeroRange" in html
+    assert "csvInFlight" in html
+
 
 
 

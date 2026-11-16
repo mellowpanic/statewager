@@ -5,11 +5,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 import logging
 import math
+import sys
 from typing import Callable, Iterable, Mapping, Sequence, TypeVar
 
 from dateutil.relativedelta import relativedelta
 
 T = TypeVar("T")
+
+_DC_SLOTS: dict[str, bool] = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 DQ_WARN_PREFIX = "DQ-WARN"
 
@@ -61,7 +64,7 @@ MONTH_NAME_TO_NUM: dict[str, int] = {
 }
 
 
-@dataclass(slots=True)
+@dataclass(**_DC_SLOTS)
 class OperatorMonthResult:
     """Operator- or property-level breakdown for a single state-month."""
 
@@ -103,38 +106,45 @@ class StateMonthResult:
     tax: float | None = None
 
 
+def _valid_year_month(year: int, month: int) -> date:
+    if not (1900 <= year <= 2100):
+        raise ValueError(f"Year out of range [1900, 2100]: {year}")
+    return date(year, month, 1)
+
+
 def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
     """Normalize a month specification into a first-of-month ``date``.
 
-    Accepts ``"YYYY-MM"``, ``"Mon YYYY"``, ``"Month YYYY"``, ``date``/``datetime``,
-    or ``(year, month)`` tuples.
+    Accepts ``"YYYY-MM"``, ``"YYYY-MM-DD"``, ``"Mon YYYY"``, ``"Mon-YYYY"``,
+    ``"Month YYYY"``, ``date``/``datetime``, or ``(year, month)`` tuples.
     """
-    if isinstance(value, datetime):
-        return date(value.year, value.month, 1)
     if isinstance(value, date):
-        return date(value.year, value.month, 1)
+        return _valid_year_month(value.year, value.month)
     if isinstance(value, tuple) and len(value) == 2:
-        year, month = int(value[0]), int(value[1])
-        return date(year, month, 1)
+        return _valid_year_month(int(value[0]), int(value[1]))
     if isinstance(value, str):
         text = value.strip()
-        if "-" in text:
-            parts = text.split("-")
-            if len(parts) == 2:
-                if parts[0].isdigit() and parts[1].isdigit():
-                    return date(int(parts[0]), int(parts[1]), 1)
-                mon = MONTH_NAME_TO_NUM.get(parts[0].lower())
-                if mon is not None and parts[1].isdigit():
-                    return date(int(parts[1]), mon, 1)
-            elif len(parts) == 3 and all(p.isdigit() for p in parts):
-                parsed_full = date(int(parts[0]), int(parts[1]), int(parts[2]))
-                return date(parsed_full.year, parsed_full.month, 1)
-        parts = text.split()
+        parts = text.split("-") if "-" in text else text.split()
         if len(parts) == 2:
+            if "-" in text and len(parts[0]) == 4 and parts[0].isdigit() and parts[1].isdigit():
+                return _valid_year_month(int(parts[0]), int(parts[1]))
             mon = MONTH_NAME_TO_NUM.get(parts[0].lower())
-            if mon is not None and parts[1].isdigit():
-                return date(int(parts[1]), mon, 1)
+            if mon is not None and len(parts[1]) == 4 and parts[1].isdigit():
+                return _valid_year_month(int(parts[1]), mon)
+        elif "-" in text and len(parts) == 3 and len(parts[0]) == 4 and all(p.isdigit() for p in parts):
+            parsed_full = date(int(parts[0]), int(parts[1]), int(parts[2]))
+            return _valid_year_month(parsed_full.year, parsed_full.month)
     raise ValueError(f"Invalid month specification: {value!r} (expected 'YYYY-MM', 'Mon YYYY', date, or (year, month))")
+
+
+def month_yyyymm(value: object) -> str | None:
+    """Return ``'YYYYMM'`` for a valid month specification/label, else None."""
+    if value is None or not isinstance(value, (str, date, datetime, tuple)):
+        return None
+    try:
+        return parse_month_spec(value).strftime("%Y%m")  # type: ignore[arg-type]
+    except ValueError:
+        return None
 
 
 def resolve_fetch_months(
@@ -255,19 +265,9 @@ def month_starts(
         raise ValueError("n_months must be >= 1")
     anchor = date.today().replace(day=1)
     latest = anchor if include_current_month else anchor - relativedelta(months=1)
-    if launch_date is not None:
-        launch_month = launch_date.replace(day=1)
-        if latest < launch_month:
-            return []
-    start = latest - relativedelta(months=n_months - 1)
-    if launch_date is not None:
-        start = max(start, launch_date.replace(day=1))
-    months: list[date] = []
-    current = start
-    while current <= latest:
-        months.append(current)
-        current += relativedelta(months=1)
-    return months
+    if launch_date is not None and latest < launch_date.replace(day=1):
+        return []
+    return resolve_fetch_months(latest - relativedelta(months=n_months - 1), latest, launch_date=launch_date)
 
 
 def month_range(
@@ -301,6 +301,15 @@ def safe_float(value: object) -> float | None:
     return 0.0 if val == 0.0 else val
 
 
+def sum_optional(*values: float | None) -> float | None:
+    """Sum non-None finite numbers, returning None when all inputs are None."""
+    present = [num for v in values if (num := safe_float(v)) is not None]
+    if not present:
+        return None
+    total = sum(present)
+    return 0.0 if total == 0.0 else total
+
+
 def fiscal_year_july(year: int, month: int) -> tuple[int, int]:
     """Return the July–June fiscal year ``(fy_start, fy_end)`` containing ``(year, month)``."""
     return (year, year + 1) if month >= 7 else (year - 1, year)
@@ -310,9 +319,11 @@ def hold_pct(handle: float | None, revenue: float | None) -> float | None:
     """Return revenue/handle * 100 rounded to two decimals, or None when invalid."""
     h_val = safe_float(handle)
     r_val = safe_float(revenue)
-    if h_val is None or r_val is None or h_val == 0:
+    if h_val is None or r_val is None or h_val <= 0:
         return None
     rounded = round(r_val / h_val * 100, 2)
+    if not math.isfinite(rounded):
+        return None
     return 0.0 if rounded == 0.0 else rounded
 
 
@@ -343,34 +354,66 @@ def validate_result(
     log: Callable[[str], None] | None = None,
 ) -> tuple[float, float] | None:
     """Validate handle/revenue pair. Logs warning and returns None if invalid."""
-    if (
-        handle is None
-        or isinstance(handle, bool)
-        or not isinstance(handle, (int, float))
-        or not math.isfinite(float(handle))
-        or handle <= 0
-    ):
+    h = safe_float(handle)
+    if h is None or h <= 0:
         _emit_warn(log, f"{label}: invalid handle {handle}")
         return None
-    if (
-        revenue is None
-        or isinstance(revenue, bool)
-        or not isinstance(revenue, (int, float))
-        or not math.isfinite(float(revenue))
-    ):
+    r = safe_float(revenue)
+    if r is None:
         _emit_warn(log, f"{label}: missing revenue")
         return None
-    h = float(handle)
-    r = float(revenue)
     hold = r / h
     if abs(hold) > max_abs_hold:
         _emit_warn(log, f"{label}: suspicious hold % {hold * 100:.1f}%")
     return h, r
 
 
+def log_month_result(
+    log: Callable[[str], None],
+    label: str,
+    item: StateMonthResult,
+    *,
+    prefix: str | None = None,
+    include_splits: bool = True,
+    hold_decimals: int = 1,
+) -> None:
+    """Emit a standardized INFO summary line for a finalized ``StateMonthResult``."""
+    head = prefix or label
+    h_str = f"{item.handle:,.0f}" if item.handle is not None else "n/a"
+    r_str = f"{item.revenue:,.0f}" if item.revenue is not None else "n/a"
+    parts = [f"INFO {head}: handle={h_str} revenue={r_str}"]
+    if include_splits:
+        rh = f"{item.retail_handle:,.0f}" if item.retail_handle is not None else "n/a"
+        mh = f"{item.mobile_handle:,.0f}" if item.mobile_handle is not None else "n/a"
+        parts.append(f"retail_handle={rh} mobile_handle={mh}")
+    parts.append(f"hold={(item.hold or 0.0):.{hold_decimals}f}%")
+    log(" ".join(parts))
+
+
 def log_skip(log: Callable[[str], None], label: str, reason: str) -> None:
     """Log a standardized skip warning."""
     log(f"WARN skipped {label}; {reason}")
+
+
+def _reconcile_pair(
+    total: float,
+    retail: float | None,
+    mobile: float | None,
+    *,
+    metric: str,
+    label: str,
+    tolerance: float,
+    log: Callable[[str], None] | None,
+) -> tuple[float | None, float | None]:
+    if retail is None and mobile is not None:
+        retail = total - mobile
+    if mobile is None and retail is not None:
+        mobile = total - retail
+    if retail is not None and mobile is not None:
+        delta = (retail + mobile) - total
+        if abs(delta) > tolerance:
+            _emit_warn(log, f"{label}: retail/mobile {metric} mismatch vs total by {delta:.2f}")
+    return retail, mobile
 
 
 def reconcile_components(
@@ -386,22 +429,14 @@ def reconcile_components(
     log: Callable[[str], None] | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """Fill missing component values from totals and warn on inconsistent sums."""
-    if retail_handle is None and mobile_handle is not None:
-        retail_handle = total_handle - mobile_handle
-    if mobile_handle is None and retail_handle is not None:
-        mobile_handle = total_handle - retail_handle
-    if retail_revenue is None and mobile_revenue is not None:
-        retail_revenue = total_revenue - mobile_revenue
-    if mobile_revenue is None and retail_revenue is not None:
-        mobile_revenue = total_revenue - retail_revenue
-    if retail_handle is not None and mobile_handle is not None:
-        handle_delta = (retail_handle + mobile_handle) - total_handle
-        if abs(handle_delta) > tolerance:
-            _emit_warn(log, f"{label}: retail/mobile handle mismatch vs total by {handle_delta:.2f}")
-    if retail_revenue is not None and mobile_revenue is not None:
-        revenue_delta = (retail_revenue + mobile_revenue) - total_revenue
-        if abs(revenue_delta) > tolerance:
-            _emit_warn(log, f"{label}: retail/mobile revenue mismatch vs total by {revenue_delta:.2f}")
+    retail_handle, mobile_handle = _reconcile_pair(
+        total_handle, retail_handle, mobile_handle,
+        metric="handle", label=label, tolerance=tolerance, log=log,
+    )
+    retail_revenue, mobile_revenue = _reconcile_pair(
+        total_revenue, retail_revenue, mobile_revenue,
+        metric="revenue", label=label, tolerance=tolerance, log=log,
+    )
     return retail_handle, retail_revenue, mobile_handle, mobile_revenue
 
 
@@ -506,38 +541,44 @@ def finalize_state_month(
     if validated is None:
         return None
     total_h, total_r = validated
+    rh = safe_float(retail_handle)
+    rr = safe_float(retail_revenue)
+    mh = safe_float(mobile_handle)
+    mr = safe_float(mobile_revenue)
     if reconcile_splits:
         rh, rr, mh, mr = reconcile_components(
             tag,
             total_h,
             total_r,
-            retail_handle,
-            retail_revenue,
-            mobile_handle,
-            mobile_revenue,
+            rh,
+            rr,
+            mh,
+            mr,
             tolerance=tolerance,
             log=log,
         )
-        if strict_split_pct is not None and rh is not None and mh is not None:
-            handle_delta_pct = abs((rh + mh) - total_h) / total_h
-            if handle_delta_pct > strict_split_pct:
-                if log:
-                    log(
-                        f"WARN {tag}: retail/mobile handle reconciliation failed "
-                        f"({handle_delta_pct * 100:.2f}% delta vs total); blanking splits"
-                    )
-                rh = rr = mh = mr = None
-            elif rr is not None and mr is not None and total_r != 0:
-                revenue_delta_pct = abs((rr + mr) - total_r) / abs(total_r)
-                if revenue_delta_pct > strict_split_pct:
+        if strict_split_pct is not None:
+            for metric_name, total_val, ret_val, mob_val in (
+                ("handle", total_h, rh, mh),
+                ("revenue", total_r, rr, mr),
+            ):
+                if ret_val is None or mob_val is None:
+                    continue
+                if total_val != 0:
+                    delta_pct = abs((ret_val + mob_val) - total_val) / abs(total_val)
+                    if delta_pct > strict_split_pct:
+                        if log:
+                            log(
+                                f"WARN {tag}: retail/mobile {metric_name} reconciliation failed "
+                                f"({delta_pct * 100:.2f}% delta vs total); blanking splits"
+                            )
+                        rh = rr = mh = mr = None
+                        break
+                elif abs((ret_val + mob_val) - total_val) > tolerance:
                     if log:
-                        log(
-                            f"WARN {tag}: retail/mobile revenue reconciliation failed "
-                            f"({revenue_delta_pct * 100:.2f}% delta vs total); blanking splits"
-                        )
+                        log(f"WARN {tag}: retail/mobile {metric_name} non-zero splits on zero total; blanking splits")
                     rh = rr = mh = mr = None
-    else:
-        rh, rr, mh, mr = retail_handle, retail_revenue, mobile_handle, mobile_revenue
+                    break
     return StateMonthResult(
         state=state,
         month=iso_month,
@@ -583,13 +624,9 @@ def find_stale_months(
             month_peers.setdefault(label, set()).add(state)
 
     def _month_sort_key(label: str) -> tuple[int, int]:
-        parts = label.split()
-        if len(parts) != 2:
-            return (9999, 0)
-        tok = parts[0].lower()
-        mon = MONTH_NAME_TO_NUM.get(tok, MONTH_NAME_TO_NUM.get(tok[:3], 0))
         try:
-            return (int(parts[1]), mon)
+            d = parse_month_spec(label)
+            return (d.year, d.month)
         except ValueError:
             return (9999, 0)
 

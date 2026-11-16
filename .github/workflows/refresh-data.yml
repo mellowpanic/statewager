@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       months:
-        description: 'Trailing months to refresh (including current month)'
+        description: 'Trailing completed months to refresh'
         required: false
         default: '3'
         type: string
@@ -27,8 +27,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Install system PDF tools
         run: |
@@ -41,9 +39,10 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install statewager
+      - name: Install statewager and run unit tests
         run: |
-          pip install -e .
+          pip install -e ".[dev]"
+          pytest -q
 
       - name: Refresh trailing regulatory months
         env:

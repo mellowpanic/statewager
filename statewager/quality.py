@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import io
 import re
 import threading
 from typing import Any, Callable
@@ -9,7 +10,8 @@ from typing import Any, Callable
 from .discover import extract_month_label
 from .http import fetch_bytes, fetch_text
 from .model import dq_warn
-from .parse import _parse_money
+from .parse import PDFPLUMBER_LOCK, _parse_money
+from .states import STATE_ABBR_TO_SLUG
 
 _AGGREGATOR_CACHE: dict[str, dict[str, tuple[float | None, float | None]]] = {}
 _SPORTSHANDLE_HTML_CACHE: dict[tuple[str, Any], str] = {}
@@ -18,14 +20,6 @@ _AGGREGATOR_LOCK = threading.Lock()
 _TR_RE = re.compile(r"(?is)<tr[^>]*>(.*?)</tr>")
 _TD_RE = re.compile(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def clear_aggregator_cache() -> None:
-    """Clear cached aggregator lookups and downloaded source payloads."""
-    with _AGGREGATOR_LOCK:
-        _AGGREGATOR_CACHE.clear()
-        _SPORTSHANDLE_HTML_CACHE.clear()
-        _UNLV_PAGES_CACHE.clear()
 
 
 def _source_cache_key(url: str, fetcher: Any) -> tuple[str, Any] | None:
@@ -38,17 +32,8 @@ def _source_cache_key(url: str, fetcher: Any) -> tuple[str, Any] | None:
         return None
 
 
-_STATE_ABBR = {
-    "illinois": "IL",
-    "indiana": "IN",
-    "iowa": "IA",
-    "kansas": "KS",
-    "louisiana": "LA",
-    "missouri": "MO",
-    "mississippi": "MS",
-    "nevada": "NV",
-    "ohio": "OH",
-    "pennsylvania": "PA",
+_STATE_ABBR: dict[str, str] = {
+    slug: abbr.upper() for abbr, slug in STATE_ABBR_TO_SLUG.items()
 }
 
 _STATE_SECTION_RES: dict[str, re.Pattern[str]] = {
@@ -57,10 +42,6 @@ _STATE_SECTION_RES: dict[str, re.Pattern[str]] = {
     )
     for state_lower in _STATE_ABBR
 }
-
-
-def _state_section_re(state_lower: str) -> re.Pattern[str] | None:
-    return _STATE_SECTION_RES.get(state_lower)
 
 
 def _normalize_aggregator_month(value: str) -> str | None:
@@ -83,8 +64,8 @@ def query_aggregator_sportshandle(
 ) -> dict[str, tuple[float | None, float | None]]:
     """Best-effort scrape of sportshandle.com revenue-tracker for ``state``."""
     state_lower = state.strip().lower()
-    abbr = _STATE_ABBR.get(state_lower)
-    if abbr is None:
+    section_re = _STATE_SECTION_RES.get(state_lower)
+    if section_re is None:
         return {}
     url = "https://sportshandle.com/sports-betting-revenue/"
     cache_key = _source_cache_key(url, fetch_text)
@@ -105,7 +86,7 @@ def query_aggregator_sportshandle(
         if cache_key is not None:
             with _AGGREGATOR_LOCK:
                 html_lower = _SPORTSHANDLE_HTML_CACHE.setdefault(cache_key, html_lower)
-    match = _state_section_re(state_lower).search(html_lower)
+    match = section_re.search(html_lower)
     if not match:
         return {}
     section = match.group(1)
@@ -154,9 +135,8 @@ def query_aggregator_unlv(
         if not data:
             return {}
         try:
-            import io as _io
             extracted: list[tuple[str, list[Any]]] = []
-            with pdfplumber.open(_io.BytesIO(data)) as pdf:
+            with PDFPLUMBER_LOCK, pdfplumber.open(io.BytesIO(data)) as pdf:
                 for page in pdf.pages:
                     text = (page.extract_text() or "").lower()
                     tables = page.extract_tables() or []
@@ -202,23 +182,22 @@ def _aggregator_lookup(
 ) -> tuple[float | None, float | None] | None:
     """Best-effort lookup of (handle, revenue) for a state/month from aggregators."""
     state_key = state.strip().lower()
-    sh_key = f"sportshandle:{state_key}"
-    with _AGGREGATOR_LOCK:
-        sh_data = _AGGREGATOR_CACHE.get(sh_key)
-    if sh_data is None:
-        fetched_sh = query_aggregator_sportshandle(state, log=log)
+    for prefix, query_fn in (
+        ("sportshandle", query_aggregator_sportshandle),
+        ("unlv", query_aggregator_unlv),
+    ):
+        cache_key = f"{prefix}:{state_key}"
         with _AGGREGATOR_LOCK:
-            sh_data = _AGGREGATOR_CACHE.setdefault(sh_key, fetched_sh)
-    if label in sh_data:
-        return sh_data[label]
-    unlv_key = f"unlv:{state_key}"
-    with _AGGREGATOR_LOCK:
-        unlv_data = _AGGREGATOR_CACHE.get(unlv_key)
-    if unlv_data is None:
-        fetched_unlv = query_aggregator_unlv(state, log=log)
-        with _AGGREGATOR_LOCK:
-            unlv_data = _AGGREGATOR_CACHE.setdefault(unlv_key, fetched_unlv)
-    return unlv_data.get(label)
+            data = _AGGREGATOR_CACHE.get(cache_key)
+        if data is None:
+            fetched = query_fn(state, log=log)
+            if not fetched:
+                continue
+            with _AGGREGATOR_LOCK:
+                data = _AGGREGATOR_CACHE.setdefault(cache_key, fetched)
+        if label in data:
+            return data[label]
+    return None
 
 
 def validate_against_aggregators(
@@ -241,16 +220,12 @@ def validate_against_aggregators(
         return True
     ref_handle, ref_revenue = ref
     diverged = False
-    if ref_handle is not None and handle is not None and ref_handle != 0:
-        delta_pct = abs(handle - ref_handle) / abs(ref_handle) * 100
-        if delta_pct > threshold_pct:
-            dq_warn(log, f"{state} {label}: handle ${handle:,.0f} differs from aggregator ${ref_handle:,.0f} by {delta_pct:.1f}%")
-            diverged = True
-    if ref_revenue is not None and revenue is not None and ref_revenue != 0:
-        delta_pct = abs(revenue - ref_revenue) / abs(ref_revenue) * 100
-        if delta_pct > threshold_pct:
-            dq_warn(log, f"{state} {label}: revenue ${revenue:,.0f} differs from aggregator ${ref_revenue:,.0f} by {delta_pct:.1f}%")
-            diverged = True
+    for metric, actual, expected in (("handle", handle, ref_handle), ("revenue", revenue, ref_revenue)):
+        if expected is not None and actual is not None and expected != 0:
+            delta_pct = abs(actual - expected) / abs(expected) * 100
+            if delta_pct > threshold_pct:
+                dq_warn(log, f"{state} {label}: {metric} ${actual:,.0f} differs from aggregator ${expected:,.0f} by {delta_pct:.1f}%")
+                diverged = True
     return not diverged
 
 
@@ -281,7 +256,7 @@ def check_anomaly(
             dq_warn(log, f"{state} {label}: handle ${handle:,.0f} is {zscore:.1f}σ from trailing mean ${mean:,.0f}")
             flagged = True
     last_handle = handles[-1]
-    if last_handle is not None and last_handle != 0 and handle is not None:
+    if last_handle != 0 and handle is not None:
         mom = abs(handle - last_handle) / abs(last_handle)
         if mom > mom_threshold:
             dq_warn(log, f"{state} {label}: handle ${handle:,.0f} differs from prior month ${last_handle:,.0f} by {mom * 100:.0f}%")

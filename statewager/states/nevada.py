@@ -4,10 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from html import unescape
 import io
-import os
 import re
-import subprocess
-import tempfile
 from typing import Callable
 from urllib.parse import urljoin
 
@@ -21,28 +18,31 @@ try:
 except ImportError:
     openpyxl = None
 
-from ..cache import cache_path, load_cache, save_cache
-from ..discover import MONTH_NAMES as CORE_MONTH_NAMES, AnchorParser, DiscoveryReport
+from ..cache import cache_age_seconds, cache_path, find_local_month_file, load_cache, recent_cache_ttl, save_cache
+from ..discover import AnchorParser, DiscoveryReport, extract_month_label
 from ..http import _XLS_SIGNATURES, fetch_bytes
 from ..model import (
     StateMonthResult,
     build_state_logger,
     finalize_state_month,
     format_iso_month,
+    log_month_result,
     log_skip,
+    parse_month_spec,
     resolve_fetch_months,
 )
-from ..parse import _which, ensure_xlsx, parse_dollar
+from ..parse import PDFPLUMBER_LOCK, ensure_xlsx, extract_pdf_text, open_xlsx_workbook, parse_dollar
 
 STATE_NAME = "Nevada"
 LAUNCH_DATE: date | None = None
+REGION_ORDER = ["Clark County", "Washoe County", "Other Areas"]
+REGION_EXTRA_KEYS = {
+    "Clark County": ("Clark Handle", "Clark Revenue"),
+    "Washoe County": ("Washoe Handle", "Washoe Revenue"),
+    "Other Areas": ("Other Handle", "Other Revenue"),
+}
 EXTRA_HEADERS: list[str] = [
-    "Clark Handle",
-    "Clark Revenue",
-    "Washoe Handle",
-    "Washoe Revenue",
-    "Other Handle",
-    "Other Revenue",
+    key for region in REGION_ORDER for key in REGION_EXTRA_KEYS[region]
 ]
 HAS_DETAILS = False
 
@@ -51,12 +51,6 @@ USER_AGENT = "Mozilla/5.0"
 HTTP_TIMEOUT = 30
 HTTP_RETRIES = 3
 GRI_PAGE_URL = f"{BASE}/about-us/gaming-revenue-information-gri/"
-REGION_ORDER = ["Clark County", "Washoe County", "Other Areas"]
-REGION_EXTRA_KEYS = {
-    "Clark County": ("Clark Handle", "Clark Revenue"),
-    "Washoe County": ("Washoe Handle", "Washoe Revenue"),
-    "Other Areas": ("Other Handle", "Other Revenue"),
-}
 PDFPLUMBER_MIN_WORDS = 100
 PDFPLUMBER_SAMPLE_PAGES = 3
 NGCB_PDFTOTEXT_PAGE_HINTS = {
@@ -70,15 +64,7 @@ AREA_LABELS = {
     "Washoe County": "Washoe County - All Nonrestricted Locations",
 }
 
-MONTH_NAMES = {**CORE_MONTH_NAMES, "sept": 9}
-MONTH_RE = "|".join(sorted(MONTH_NAMES.keys(), key=len, reverse=True))
-MONTH_YEAR_PATTERNS = [
-    re.compile(rf"\b({MONTH_RE})\b[\s_\-/(),]+(20\d{{2}})\b", re.IGNORECASE),
-    re.compile(rf"\b(20\d{{2}})[\s_\-/(),]+({MONTH_RE})\b", re.IGNORECASE),
-]
 _DIGIT_ALPHA_SPLIT_RE = re.compile(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", re.IGNORECASE)
-_COMPACT_YM_RE = re.compile(rf"\b(20\d{{2}})({MONTH_RE})\b", re.IGNORECASE)
-_COMPACT_MY_RE = re.compile(rf"\b({MONTH_RE})(20\d{{2}})\b", re.IGNORECASE)
 _SPORTS_LINE_RE = re.compile(r"(?:\d+\s+){0,3}([()\d,]+)\s+([()\d.\-]+)\s+([()\d.\-]+)")
 
 _DEFAULT_LOG = build_state_logger("NV")
@@ -101,25 +87,11 @@ def fetch_nv_bytes(url: str, retries: int = HTTP_RETRIES, timeout: int = HTTP_TI
 def extract_month_year(value: str) -> tuple[int, int] | None:
     text = unescape(value or "").replace("%20", " ")
     text = _DIGIT_ALPHA_SPLIT_RE.sub(" ", text)
-    for pattern in MONTH_YEAR_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        first, second = match.groups()
-        if first.isdigit():
-            year = int(first)
-            month = MONTH_NAMES[second.lower()]
-        else:
-            month = MONTH_NAMES[first.lower()]
-            year = int(second)
-        return month, year
-    compact = _COMPACT_YM_RE.search(text)
-    if compact:
-        return MONTH_NAMES[compact.group(2).lower()], int(compact.group(1))
-    compact_rev = _COMPACT_MY_RE.search(text)
-    if compact_rev:
-        return MONTH_NAMES[compact_rev.group(1).lower()], int(compact_rev.group(2))
-    return None
+    label = extract_month_label(text)
+    if not label:
+        return None
+    d = parse_month_spec(label)
+    return d.month, d.year
 
 
 def discover_report_urls(log: Callable[[str], None] = _DEFAULT_LOG) -> dict[tuple[int, int], dict[str, str]]:
@@ -134,6 +106,7 @@ def discover_report_urls(log: Callable[[str], None] = _DEFAULT_LOG) -> dict[tupl
     html = html_bytes.decode("utf-8", errors="replace")
     parser = AnchorParser()
     parser.feed(html)
+    parser.close()
     urls: dict[tuple[int, int], dict[str, str]] = {}
     for link in parser.links:
         href = unescape(link.get("href", "").strip())
@@ -181,13 +154,17 @@ def build_pdf_url_candidates(month: int, year: int) -> list[str]:
     ]
 
 
+def _fetch_nv_safe(url: str, log: Callable[[str], None]) -> bytes | None:
+    try:
+        return fetch_nv_bytes(url)
+    except Exception as exc:
+        log(f"WARN could not download {url}: {exc}")
+        return None
+
+
 def download_pdf(month: int, year: int, log: Callable[[str], None] = _DEFAULT_LOG) -> bytes | None:
     for url in build_pdf_url_candidates(month, year):
-        try:
-            data = fetch_nv_bytes(url)
-        except Exception as exc:
-            log(f"WARN could not download {url}: {exc}")
-            continue
+        data = _fetch_nv_safe(url, log)
         if data and data.startswith(b"%PDF"):
             log(f"INFO downloaded {url}")
             return data
@@ -207,11 +184,7 @@ def download_report(
         url = discovered.get(kind)
         if not url:
             continue
-        try:
-            data = fetch_nv_bytes(url)
-        except Exception as exc:
-            log(f"WARN could not download {url}: {exc}")
-            continue
+        data = _fetch_nv_safe(url, log)
         if data:
             valid = data.startswith(_XLS_SIGNATURES) if kind == "excel" else data.startswith(b"%PDF")
             if not valid:
@@ -232,54 +205,48 @@ def download_report(
 def load_cached_reports(month: int, year: int, cache_dir: str | None) -> list[tuple[str, bytes]]:
     downloads: list[tuple[str, bytes]] = []
     excel_data = load_cache(cache_path(cache_dir, f"nevada_{year}_{month:02d}.xlsx"))
-    if excel_data:
+    if excel_data and excel_data.startswith(_XLS_SIGNATURES):
         downloads.append(("excel", excel_data))
     pdf_data = load_cache(cache_path(cache_dir, f"nevada_{year}_{month:02d}.pdf"))
-    if pdf_data:
+    if pdf_data and pdf_data.startswith(b"%PDF"):
         downloads.append(("pdf", pdf_data))
     return downloads
 
 
 def extract_pdftotext_pages(data: bytes) -> list[str]:
-    pdftotext_bin = _which("pdftotext")
-    if pdftotext_bin is None:
+    text = extract_pdf_text(data, layout=True, use_pdfplumber=False)
+    if not text or not text.strip():
         return []
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as file_handle:
-        file_handle.write(data)
-        temp_path = file_handle.name
-    try:
-        completed = subprocess.run(
-            [pdftotext_bin, "-layout", temp_path, "-"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-    if completed.returncode != 0 or not completed.stdout.strip():
-        return []
-    return completed.stdout.split("\f")
+    return text.split("\f")
 
 
 def extract_layout_pages(data: bytes, log: Callable[[str], None] = _DEFAULT_LOG) -> tuple[list[str], str]:
     if pdfplumber is not None:
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
+        with PDFPLUMBER_LOCK, pdfplumber.open(io.BytesIO(data)) as pdf:
             pdfplumber_words = sum(len(page.extract_words() or []) for page in pdf.pages[:PDFPLUMBER_SAMPLE_PAGES])
-            if pdfplumber_words >= PDFPLUMBER_MIN_WORDS:
-                return [page.extract_text(x_tolerance=1, y_tolerance=1) or "" for page in pdf.pages], "pdfplumber"
-            log(
-                f"WARN pdfplumber extracted only {pdfplumber_words} words across the first "
-                f"{PDFPLUMBER_SAMPLE_PAGES} pages; falling back to pdftotext"
-            )
-            pdftotext_pages = extract_pdftotext_pages(data)
-            if pdftotext_pages:
-                return pdftotext_pages, "pdftotext"
+            if pdfplumber_words < PDFPLUMBER_MIN_WORDS:
+                log(
+                    f"WARN pdfplumber extracted only {pdfplumber_words} words across the first "
+                    f"{PDFPLUMBER_SAMPLE_PAGES} pages; falling back to pdftotext"
+                )
+                pdftotext_pages = extract_pdftotext_pages(data)
+                if pdftotext_pages:
+                    return pdftotext_pages, "pdftotext"
             return [page.extract_text(x_tolerance=1, y_tolerance=1) or "" for page in pdf.pages], "pdfplumber"
     pdftotext_pages = extract_pdftotext_pages(data)
     if pdftotext_pages:
         return pdftotext_pages, "pdftotext"
     return [], "pdfplumber"
+
+
+def _metrics_from_win(win_amount: float | None, win_pct: float | None) -> tuple[float, float] | None:
+    if win_amount is None or win_pct is None or abs(win_pct) < 1e-9:
+        return None
+    if win_amount != 0 and (win_amount < 0) != (win_pct < 0):
+        return None
+    revenue = win_amount * 1000
+    handle = revenue / (win_pct / 100)
+    return handle, revenue
 
 
 def parse_sports_line(line: str, label: str) -> tuple[float, float] | None:
@@ -289,13 +256,7 @@ def parse_sports_line(line: str, label: str) -> tuple[float, float] | None:
     match = _SPORTS_LINE_RE.search(suffix)
     if not match:
         return None
-    win_amount = parse_dollar(match.group(1))
-    win_pct = parse_dollar(match.group(3))
-    if win_amount is None or win_pct is None or win_pct == 0:
-        return None
-    revenue = win_amount * 1000
-    handle = revenue / (win_pct / 100)
-    return handle, revenue
+    return _metrics_from_win(parse_dollar(match.group(1)), parse_dollar(match.group(3)))
 
 
 def parse_label_from_area_pages(
@@ -382,7 +343,7 @@ def reconcile_county_details(
 ) -> list[tuple[str, float, float]]:
     reconciled: list[tuple[str, float, float]] = []
     for name, handle, revenue in details:
-        if name in {"Clark County", "Washoe County"} and revenue > statewide_revenue + 1.0:
+        if name in {"Clark County", "Washoe County"} and statewide_revenue >= 0 and revenue > statewide_revenue + 1.0:
             log(
                 f"WARN [Nevada] {name} revenue {revenue:,.0f} exceeds statewide revenue "
                 f"{statewide_revenue:,.0f}; blanking county revenue"
@@ -439,8 +400,24 @@ def parse_gri_pdftotext_fallback(
     return total_handle, total_revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details
 
 
-def parse_area_sports_from_pages(page_texts: list[str], area_title: str) -> tuple[float, float] | None:
-    return parse_label_from_area_pages(page_texts, area_title, "Sports Pool (2)")
+def _with_mobile_splits(
+    total_handle: float,
+    total_revenue: float,
+    mobile: tuple[float, float] | None,
+    details: list[tuple[str, float, float]],
+) -> tuple[float, float, float, float, float | None, float | None, list[tuple[str, float, float]]]:
+    if mobile is None:
+        return total_handle, total_revenue, total_handle, total_revenue, None, None, details
+    mobile_handle, mobile_revenue = mobile
+    return (
+        total_handle,
+        total_revenue,
+        total_handle - mobile_handle,
+        total_revenue - mobile_revenue,
+        mobile_handle,
+        mobile_revenue,
+        details,
+    )
 
 
 def parse_gri_pdf(
@@ -454,7 +431,7 @@ def parse_gri_pdf(
         return None
     if not page_texts:
         return None
-    total = parse_area_sports_from_pages(page_texts, AREA_LABELS["Statewide"])
+    total = parse_label_from_area_pages(page_texts, AREA_LABELS["Statewide"], "Sports Pool (2)")
     mobile = parse_label_from_area_pages(page_texts, AREA_LABELS["Statewide"], "Sports - Mobile")
     if total is None:
         if extraction_source != "pdftotext":
@@ -465,15 +442,10 @@ def parse_gri_pdf(
         log("INFO parsed Nevada PDF via pdftotext page-hint fallback")
         return parsed
     total_handle, total_revenue = total
-    clark = parse_area_sports_from_pages(page_texts, AREA_LABELS["Clark County"])
-    washoe = parse_area_sports_from_pages(page_texts, AREA_LABELS["Washoe County"])
+    clark = parse_label_from_area_pages(page_texts, AREA_LABELS["Clark County"], "Sports Pool (2)")
+    washoe = parse_label_from_area_pages(page_texts, AREA_LABELS["Washoe County"], "Sports Pool (2)")
     details = _build_nv_details(total_handle, total_revenue, clark, washoe, log=log)
-    if mobile is None:
-        return total_handle, total_revenue, total_handle, total_revenue, None, None, details
-    mobile_handle, mobile_revenue = mobile
-    retail_handle = total_handle - mobile_handle
-    retail_revenue = total_revenue - mobile_revenue
-    return total_handle, total_revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details
+    return _with_mobile_splits(total_handle, total_revenue, mobile, details)
 
 
 def extract_numeric_cells(values: list[object]) -> list[float]:
@@ -492,13 +464,7 @@ def parse_sports_row_values(values: list[object], label: str) -> tuple[float, fl
     numbers = extract_numeric_cells(values)
     if len(numbers) < 5:
         return None
-    win_amount = numbers[2]
-    win_pct = numbers[4]
-    if win_pct == 0:
-        return None
-    revenue = win_amount * 1000
-    handle = revenue / (win_pct / 100)
-    return handle, revenue
+    return _metrics_from_win(numbers[2], numbers[4])
 
 
 def parse_gri_workbook(
@@ -508,13 +474,12 @@ def parse_gri_workbook(
     if openpyxl is None:
         log("WARN openpyxl not installed; cannot parse Excel report")
         return None
-    try:
-        data = ensure_xlsx(data, log=log)
-        workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    except Exception as exc:
-        log(f"WARN could not open Nevada workbook: {exc}")
-        return None
-    try:
+    converted = ensure_xlsx(data, log=log)
+    with open_xlsx_workbook(
+        converted, openpyxl_mod=openpyxl, log=log, error_prefix="could not open Nevada workbook",
+    ) as workbook:
+        if workbook is None:
+            return None
         total = None
         mobile = None
         for sheet in workbook.worksheets:
@@ -528,15 +493,7 @@ def parse_gri_workbook(
                 break
         if total is None:
             return None
-        total_handle, total_revenue = total
-        if mobile is None:
-            return total_handle, total_revenue, total_handle, total_revenue, None, None, []
-        mobile_handle, mobile_revenue = mobile
-        retail_handle = total_handle - mobile_handle
-        retail_revenue = total_revenue - mobile_revenue
-        return total_handle, total_revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, []
-    finally:
-        workbook.close()
+        return _with_mobile_splits(total[0], total[1], mobile, [])
 
 
 def parse_report_bytes(
@@ -559,17 +516,12 @@ def parse_local_file(
     year: int,
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> tuple[float, float, float | None, float | None, float | None, float | None, list[tuple[str, float, float]]] | None:
-    full_month = date(year, month, 1).strftime("%B").lower()
-    short_month = date(year, month, 1).strftime("%b").lower()
-    for entry in sorted(os.listdir(local_dir)):
-        if not entry.lower().endswith((".pdf", ".xlsx", ".xls")):
-            continue
-        lower = entry.lower()
-        if str(year) in lower and (full_month in lower or short_month in lower):
-            with open(os.path.join(local_dir, entry), "rb") as file_handle:
-                kind = "excel" if lower.endswith((".xlsx", ".xls")) else "pdf"
-                return parse_report_bytes(kind, file_handle.read(), log=log)
-    return None
+    matched = find_local_month_file(local_dir, year, month, (".pdf", ".xlsx", ".xls"))
+    if matched is None:
+        return None
+    entry, raw = matched
+    kind = "excel" if entry.lower().endswith((".xlsx", ".xls")) else "pdf"
+    return parse_report_bytes(kind, raw, log=log)
 
 
 def fetch(
@@ -601,6 +553,16 @@ def fetch(
                 chosen_url = GRI_PAGE_URL
             if parsed is None:
                 cached_reports = load_cached_reports(month, year, cache_dir)
+                ttl_seconds = recent_cache_ttl(year, month)
+                stale_reports: list[tuple[str, bytes]] = []
+                if cached_reports and not offline and ttl_seconds is not None:
+                    ages = [
+                        cache_age_seconds(cache_path(cache_dir, f"nevada_{year}_{month:02d}.{'xlsx' if kind == 'excel' else 'pdf'}"))
+                        for kind, _ in cached_reports
+                    ]
+                    valid_ages = [a for a in ages if a is not None]
+                    if not valid_ages or min(valid_ages) > ttl_seconds:
+                        stale_reports, cached_reports = cached_reports, []
                 default_candidate = build_pdf_url_candidates(month, year)[0]
                 if cached_reports:
                     logger(f"INFO using cached report file(s) for {label}")
@@ -614,6 +576,8 @@ def fetch(
                                 for kind, url in kinds.items():
                                     report.add_anchor(f"{lab}:{kind}", url)
                     cached_reports = download_report(month, year, discovered_urls, cache_dir, log=logger)
+                    if not cached_reports and stale_reports:
+                        cached_reports = stale_reports
                     if report is not None:
                         report.add_probe(
                             f"{label}:report",
@@ -662,12 +626,7 @@ def fetch(
             if item is None:
                 continue
             results.append(item)
-            logger(
-                f"INFO {label}: handle={item.handle:,.0f} revenue={item.revenue:,.0f} "
-                f"retail_handle={item.retail_handle if item.retail_handle is not None else 'n/a'} "
-                f"mobile_handle={item.mobile_handle if item.mobile_handle is not None else 'n/a'} "
-                f"hold={(item.hold or 0.0):.2f}%"
-            )
+            log_month_result(logger, label, item, hold_decimals=2)
         except Exception as exc:
             logger(f"WARN failed {label}: {exc}")
     return results

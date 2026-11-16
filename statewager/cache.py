@@ -1,6 +1,7 @@
 """Local source-file caching utilities for statewager."""
 from __future__ import annotations
 
+from datetime import date
 import os
 import tempfile
 import time
@@ -9,17 +10,67 @@ from typing import Callable, TypeVar
 T = TypeVar("T")
 
 
+def find_local_file(
+    local_dir: str | None,
+    predicate: Callable[[str], bool],
+    *,
+    reverse: bool = False,
+) -> tuple[str, bytes] | None:
+    """Return ``(filename, bytes)`` for the first regular file in ``local_dir`` matching ``predicate``."""
+    if not local_dir or not os.path.isdir(local_dir):
+        return None
+    for entry in sorted(os.listdir(local_dir), reverse=reverse):
+        if not predicate(entry):
+            continue
+        full_path = os.path.join(local_dir, entry)
+        if os.path.isfile(full_path):
+            with open(full_path, "rb") as file_handle:
+                return entry, file_handle.read()
+    return None
+
+
+def find_local_month_file(
+    local_dir: str | None,
+    year: int,
+    month: int,
+    extensions: tuple[str, ...] | str,
+) -> tuple[str, bytes] | None:
+    """Return ``(filename, bytes)`` for a local file matching year, full/short month name, and extension."""
+    month_date = date(year, month, 1)
+    full_month = month_date.strftime("%B").lower()
+    short_month = month_date.strftime("%b").lower()
+    year_str = str(year)
+
+    def _matches(entry: str) -> bool:
+        low = entry.lower()
+        return low.endswith(extensions) and year_str in low and (full_month in low or short_month in low)
+
+    return find_local_file(local_dir, _matches)
+
+
 def cache_path(cache_dir: str | None, filename: str) -> str | None:
     """Return full path for a cache file, or None if caching is disabled."""
     if not cache_dir:
         return None
-    if not filename or os.path.isabs(filename):
+    if not filename or "\x00" in filename or os.path.isabs(filename):
         raise ValueError(f"Invalid cache filename: {filename!r}")
     base = os.path.abspath(cache_dir)
     target = os.path.abspath(os.path.join(base, filename))
-    if os.path.commonpath([base, target]) != base:
+    real_base = os.path.realpath(base)
+    real_target = os.path.realpath(target)
+    if target == base or os.path.commonpath([real_base, real_target]) != real_base:
         raise ValueError(f"Cache path escapes cache_dir: {filename!r}")
     return target
+
+
+def recent_cache_ttl(year: int, month: int, *, window_days: int = 90, ttl_seconds: float = 7 * 86400) -> float | None:
+    """Return ``ttl_seconds`` for months within ``window_days`` of today (handles Dec->Jan rollover)."""
+    return ttl_seconds if (date.today() - date(year, month, 1)).days <= window_days else None
+
+
+def recent_fy_cache_ttl(fy_end: int, *, grace_days: int = 90, ttl_seconds: float = 7 * 86400) -> float | None:
+    """Return ``ttl_seconds`` for active/recently closed June-30 fiscal years."""
+    return ttl_seconds if (date.today() - date(fy_end, 6, 30)).days <= grace_days else None
 
 
 def cache_age_seconds(path: str | None) -> float | None:
@@ -75,6 +126,27 @@ def ensure_cache_dir(cache_dir: str | None) -> None:
         os.makedirs(cache_dir, exist_ok=True)
 
 
+def _fetch_and_validate(
+    fetcher: Callable[[], bytes | None],
+    *,
+    validate: Callable[[bytes], bool] | None,
+    log: Callable[[str], None] | None,
+    fail_message: str,
+    invalid_message: str,
+) -> bytes | None:
+    try:
+        fresh = fetcher()
+    except Exception as exc:
+        if log:
+            log(f"WARN {fail_message}: {exc}")
+        return None
+    if fresh is not None and (not fresh or (validate is not None and not validate(fresh))):
+        if log:
+            log(f"WARN {invalid_message}")
+        return None
+    return fresh
+
+
 def load_cached_or_fetch(
     *,
     cache_file: str | None,
@@ -125,17 +197,13 @@ def load_cached_or_fetch(
             if log and cache_file:
                 log(f"INFO offline cache miss for {os.path.basename(cache_file)}")
             return None
-        try:
-            fresh = fetcher()
-        except Exception as exc:
-            if log:
-                detail = fetch_error_message or "fetch failed"
-                log(f"WARN {detail}: {exc}")
-            fresh = None
-        if fresh is not None and (not fresh or (validate is not None and not validate(fresh))):
-            if log:
-                log(f"WARN fetched payload failed validation for {cache_file or 'remote source'}")
-            fresh = None
+        fresh = _fetch_and_validate(
+            fetcher,
+            validate=validate,
+            log=log,
+            fail_message=fetch_error_message or "fetch failed",
+            invalid_message=f"fetched payload failed validation for {cache_file or 'remote source'}",
+        )
         if fresh is not None:
             if cache_file:
                 try:
@@ -169,13 +237,15 @@ def refresh_cached_if_stale(
     age = cache_age_seconds(cache_file)
     if age is not None and age <= max_age_seconds:
         return None
-    try:
-        fresh = fetcher()
-    except Exception as exc:
-        if log:
-            log(f"WARN stale cache refresh failed for {os.path.basename(cache_file)}: {exc}")
-        return None
-    if not fresh or (validate is not None and not validate(fresh)) or fresh == current_data:
+    name = os.path.basename(cache_file)
+    fresh = _fetch_and_validate(
+        fetcher,
+        validate=validate,
+        log=log,
+        fail_message=f"stale cache refresh failed for {name}",
+        invalid_message=f"stale cache refresh returned invalid payload for {name}",
+    )
+    if fresh is None or fresh == current_data:
         return None
     save_cache(cache_file, fresh)
     return fresh
