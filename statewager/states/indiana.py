@@ -90,15 +90,22 @@ def _find_tax_summary_sheet(workbook):
     return next((ws for ws in workbook.worksheets if is_location_totals_sheet(ws)), None)
 
 
-def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
+def _parse_tax_summary_sheet(
+    workbook,
+) -> tuple[dict[str, tuple[float, float]], float | None, dict[str, float]]:
+    """Parse Indiana Sheet7 (location handle/AGR totals and taxes) in a single pass."""
     sheet = _find_tax_summary_sheet(workbook)
     if sheet is None:
-        return {}
-    rows: dict[str, tuple[float, float]] = {}
-    saw_location_rows = False
+        return {}, None, {}
+    locations: dict[str, tuple[float, float]] = {}
+    loc_taxes: dict[str, float] = {}
+    total_tax: float | None = None
+    saw_rows = False
     handle_col: int | None = None
     agr_col: int | None = None
+    tax_col: int | None = None
     for row in sheet.iter_rows(values_only=True):
+        matched_header = False
         if handle_col is None or agr_col is None:
             h_idx: int | None = None
             a_idx: int | None = None
@@ -111,16 +118,34 @@ def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
             if h_idx is not None and a_idx is not None:
                 handle_col = h_idx
                 agr_col = a_idx
-                continue
+                matched_header = True
+        if tax_col is None:
+            th_idx: int | None = None
+            t_idx: int | None = None
+            for index, cell in enumerate(row):
+                if index == 0:
+                    continue
+                text = str(cell or "").strip().lower()
+                if th_idx is None and text == "handle":
+                    th_idx = index
+                if t_idx is None and "tax" in text and "taxable" not in text:
+                    t_idx = index
+            if th_idx is not None and t_idx is not None:
+                tax_col = t_idx
+                matched_header = True
+        if matched_header:
+            continue
+
         label = str(row[0] if row else "").strip()
-        if not label:
+        if not label or label.startswith("*"):
             continue
         if label.upper() == "TOTAL":
-            if saw_location_rows:
+            if saw_rows:
+                if tax_col is not None and tax_col < len(row) and is_number(row[tax_col]):
+                    total_tax = float(row[tax_col])
                 break
             continue
-        if label.startswith("*"):
-            continue
+
         if handle_col is not None and agr_col is not None:
             handle = row[handle_col] if handle_col < len(row) else None
             revenue = row[agr_col] if agr_col < len(row) else None
@@ -131,49 +156,24 @@ def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
                 handle = row[3] if len(row) > 3 else None
                 revenue = row[5] if len(row) > 5 else None
         if is_number(handle) and is_number(revenue):
-            saw_location_rows = True
-            rows[label] = (float(handle), float(revenue))
-    return rows
-
-
-def parse_tax_summary(workbook) -> tuple[float | None, dict[str, float]]:
-    """Extract ``(total_tax, {location_name: tax})`` from Indiana Sheet7 (7 SW Tax Summary)."""
-    sheet = _find_tax_summary_sheet(workbook)
-    if sheet is None:
-        return None, {}
-    loc_taxes: dict[str, float] = {}
-    total_tax: float | None = None
-    saw_rows = False
-    tax_col: int | None = None
-    for row in sheet.iter_rows(values_only=True):
-        if tax_col is None:
-            h_idx: int | None = None
-            t_idx: int | None = None
-            for index, cell in enumerate(row):
-                if index == 0:
-                    continue
-                text = str(cell or "").strip().lower()
-                if h_idx is None and text == "handle":
-                    h_idx = index
-                if t_idx is None and "tax" in text and "taxable" not in text:
-                    t_idx = index
-            if h_idx is not None and t_idx is not None:
-                tax_col = t_idx
-                continue
-        label = str(row[0] if row else "").strip()
-        if not label or label.startswith("*"):
-            continue
-        if label.upper() == "TOTAL":
-            if saw_rows:
-                if tax_col is not None and tax_col < len(row) and is_number(row[tax_col]):
-                    total_tax = float(row[tax_col])
-                break
-            continue
+            saw_rows = True
+            locations[label] = (float(handle), float(revenue))
         if tax_col is not None and tax_col < len(row) and is_number(row[tax_col]):
             saw_rows = True
             loc_taxes[label] = float(row[tax_col])
     if total_tax is None and loc_taxes:
         total_tax = sum(loc_taxes.values())
+    return locations, total_tax, loc_taxes
+
+
+def parse_location_totals(workbook) -> dict[str, tuple[float, float]]:
+    locations, _total_tax, _loc_taxes = _parse_tax_summary_sheet(workbook)
+    return locations
+
+
+def parse_tax_summary(workbook) -> tuple[float | None, dict[str, float]]:
+    """Extract ``(total_tax, {location_name: tax})`` from Indiana Sheet7 (7 SW Tax Summary)."""
+    _locations, total_tax, loc_taxes = _parse_tax_summary_sheet(workbook)
     return total_tax, loc_taxes
 
 
@@ -254,10 +254,9 @@ def _parse_detail_sheet_blocks(
     return blocks
 
 
-def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, float]] | None:
-    blocks = _parse_detail_sheet_blocks(workbook)
-    if blocks is None:
-        return None
+def _breakdown_from_blocks(
+    blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]],
+) -> dict[str, tuple[float, float, float, float]]:
     breakdowns: dict[str, tuple[float, float, float, float]] = {}
     for location_name, (ret_h, ret_raw_r, skins, adjustments) in blocks.items():
         mob_h = sum(sh for _, sh, _ in skins)
@@ -265,6 +264,13 @@ def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, flo
         adj_ret_r, adj_mob_r = allocate_adjustments(ret_raw_r, mob_raw_r, adjustments)
         breakdowns[location_name] = (ret_h, adj_ret_r, mob_h, adj_mob_r)
     return breakdowns
+
+
+def parse_detail_breakdown(workbook) -> dict[str, tuple[float, float, float, float]] | None:
+    blocks = _parse_detail_sheet_blocks(workbook)
+    if blocks is None:
+        return None
+    return _breakdown_from_blocks(blocks)
 
 
 def _format_skin_operator_name(location_name: str, skin_label: str) -> str:
@@ -412,13 +418,9 @@ def _parse_workbook_with_skins(
         if not blocks:
             log("WARN Indiana workbook missing operator retail/mobile breakdown")
             return None
-        locations = parse_location_totals(workbook)
-        total_tax, loc_taxes = parse_tax_summary(workbook)
+        locations, total_tax, loc_taxes = _parse_tax_summary_sheet(workbook)
         handle, revenue = totals
-        breakdown = {
-            loc: (ret_h, *allocate_adjustments(ret_raw_r, sum(sr for _, _, sr in skins), adj)[:1], sum(sh for _, sh, _ in skins), allocate_adjustments(ret_raw_r, sum(sr for _, _, sr in skins), adj)[1])
-            for loc, (ret_h, ret_raw_r, skins, adj) in blocks.items()
-        }
+        breakdown = _breakdown_from_blocks(blocks)
         loc_gross = {
             loc: ret_raw_r + sum(sr for _, _, sr in skins)
             for loc, (_ret_h, ret_raw_r, skins, _adj) in blocks.items()

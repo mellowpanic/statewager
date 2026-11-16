@@ -6,7 +6,7 @@ import csv
 import math
 import os
 import tempfile
-from typing import Callable, Iterable, Sequence, TextIO
+from typing import Callable, Iterable, Mapping, Sequence, TextIO
 
 from statewager.model import CORE_RESULT_FIELDS, StateMonthResult, hold_pct, safe_float
 from statewager.operators import classify_operator_brand, normalize_operator_name
@@ -84,10 +84,49 @@ def _parse_opt_float(value: str | None) -> float | None:
     text = (value or "").strip()
     if not text:
         return None
-    val = float(text)
+    try:
+        val = float(text)
+    except ValueError:
+        return None
     if not math.isfinite(val):
         return None
     return 0.0 if val == 0.0 else val
+
+
+def _parse_csv_metric_fields(raw: Mapping[str, str | None]) -> dict[str, float | str | None]:
+    return {
+        "handle": _parse_opt_float(raw.get("handle")),
+        "revenue": _parse_opt_float(raw.get("revenue")),
+        "hold": _parse_opt_float(raw.get("hold")),
+        "retail_handle": _parse_opt_float(raw.get("retail_handle")),
+        "retail_revenue": _parse_opt_float(raw.get("retail_revenue")),
+        "retail_hold": _parse_opt_float(raw.get("retail_hold")),
+        "mobile_handle": _parse_opt_float(raw.get("mobile_handle")),
+        "mobile_revenue": _parse_opt_float(raw.get("mobile_revenue")),
+        "mobile_hold": _parse_opt_float(raw.get("mobile_hold")),
+        "source_url": (raw.get("source_url") or "").strip() or None,
+        "gross_revenue": _parse_opt_float(raw.get("gross_revenue")),
+        "promo_deductions": _parse_opt_float(raw.get("promo_deductions")),
+        "tax": _parse_opt_float(raw.get("tax")),
+    }
+
+
+def _format_csv_metric_cells(item: StateMonthResult | PublishedDetailRow) -> list[str]:
+    return [
+        _format_amount(item.handle),
+        _format_amount(item.revenue),
+        _format_pct(item.hold),
+        _format_amount(item.retail_handle),
+        _format_amount(item.retail_revenue),
+        _format_pct(item.retail_hold),
+        _format_amount(item.mobile_handle),
+        _format_amount(item.mobile_revenue),
+        _format_pct(item.mobile_hold),
+        item.source_url or "",
+        _format_amount(item.gross_revenue),
+        _format_amount(item.promo_deductions),
+        _format_amount(item.tax),
+    ]
 
 
 def read_state_csv(csv_path: str) -> list[StateMonthResult]:
@@ -101,25 +140,7 @@ def read_state_csv(csv_path: str) -> list[StateMonthResult]:
             month = (raw.get("month") or "").strip()
             if not state or not month:
                 continue
-            rows.append(
-                StateMonthResult(
-                    state=state,
-                    month=month,
-                    handle=_parse_opt_float(raw.get("handle")),
-                    revenue=_parse_opt_float(raw.get("revenue")),
-                    hold=_parse_opt_float(raw.get("hold")),
-                    retail_handle=_parse_opt_float(raw.get("retail_handle")),
-                    retail_revenue=_parse_opt_float(raw.get("retail_revenue")),
-                    retail_hold=_parse_opt_float(raw.get("retail_hold")),
-                    mobile_handle=_parse_opt_float(raw.get("mobile_handle")),
-                    mobile_revenue=_parse_opt_float(raw.get("mobile_revenue")),
-                    mobile_hold=_parse_opt_float(raw.get("mobile_hold")),
-                    source_url=(raw.get("source_url") or "").strip() or None,
-                    gross_revenue=_parse_opt_float(raw.get("gross_revenue")),
-                    promo_deductions=_parse_opt_float(raw.get("promo_deductions")),
-                    tax=_parse_opt_float(raw.get("tax")),
-                )
-            )
+            rows.append(StateMonthResult(state=state, month=month, **_parse_csv_metric_fields(raw)))  # type: ignore[arg-type]
     return rows
 
 
@@ -138,23 +159,7 @@ def merge_state_results(
 
 def result_to_csv_row(item: StateMonthResult) -> list[str]:
     """Serialize a ``StateMonthResult`` into the 15-column CSV row schema."""
-    return [
-        item.state,
-        item.month,
-        _format_amount(item.handle),
-        _format_amount(item.revenue),
-        _format_pct(item.hold),
-        _format_amount(item.retail_handle),
-        _format_amount(item.retail_revenue),
-        _format_pct(item.retail_hold),
-        _format_amount(item.mobile_handle),
-        _format_amount(item.mobile_revenue),
-        _format_pct(item.mobile_hold),
-        item.source_url or "",
-        _format_amount(item.gross_revenue),
-        _format_amount(item.promo_deductions),
-        _format_amount(item.tax),
-    ]
+    return [item.state, item.month, *_format_csv_metric_cells(item)]
 
 
 def atomic_write_file(
@@ -200,47 +205,52 @@ def _sum_opt(current: float | None, added: float | None) -> float | None:
     return added if current is None else current + added
 
 
+@dataclass(slots=True)
+class _DetailAccumulator:
+    brand: str
+    handle: float | None
+    revenue: float | None
+    retail_handle: float | None
+    retail_revenue: float | None
+    mobile_handle: float | None
+    mobile_revenue: float | None
+    source_url: str | None
+    gross_revenue: float | None
+    promo_deductions: float | None
+    tax: float | None
+
+
 def _make_detail_row(
     *,
     state: str,
     month: str,
     operator: str,
-    brand: str,
-    handle: float | None,
-    revenue: float | None,
-    retail_handle: float | None,
-    retail_revenue: float | None,
-    mobile_handle: float | None,
-    mobile_revenue: float | None,
-    source_url: str | None,
-    gross_revenue: float | None = None,
-    promo_deductions: float | None = None,
-    tax: float | None = None,
+    acc: _DetailAccumulator,
 ) -> PublishedDetailRow:
     return PublishedDetailRow(
         state=state,
         month=month,
         operator=operator,
-        brand=brand,
-        handle=handle,
-        revenue=revenue,
-        hold=hold_pct(handle, revenue),
-        retail_handle=retail_handle,
-        retail_revenue=retail_revenue,
-        retail_hold=hold_pct(retail_handle, retail_revenue) if retail_handle else None,
-        mobile_handle=mobile_handle,
-        mobile_revenue=mobile_revenue,
-        mobile_hold=hold_pct(mobile_handle, mobile_revenue) if mobile_handle else None,
-        source_url=source_url,
-        gross_revenue=gross_revenue,
-        promo_deductions=promo_deductions,
-        tax=tax,
+        brand=acc.brand,
+        handle=acc.handle,
+        revenue=acc.revenue,
+        hold=hold_pct(acc.handle, acc.revenue),
+        retail_handle=acc.retail_handle,
+        retail_revenue=acc.retail_revenue,
+        retail_hold=hold_pct(acc.retail_handle, acc.retail_revenue),
+        mobile_handle=acc.mobile_handle,
+        mobile_revenue=acc.mobile_revenue,
+        mobile_hold=hold_pct(acc.mobile_handle, acc.mobile_revenue),
+        source_url=acc.source_url,
+        gross_revenue=acc.gross_revenue,
+        promo_deductions=acc.promo_deductions,
+        tax=acc.tax,
     )
 
 
 def extract_published_details(results: Iterable[StateMonthResult]) -> list[PublishedDetailRow]:
     """Normalize and aggregate operator/venue details across ``StateMonthResult`` records."""
-    grouped: dict[tuple[str, str, str], dict[str, object]] = {}
+    grouped: dict[tuple[str, str, str], _DetailAccumulator] = {}
     for item in results:
         source_details = item.publish_details if item.publish_details else item.details
         for op in source_details:
@@ -249,52 +259,37 @@ def extract_published_details(results: Iterable[StateMonthResult]) -> list[Publi
                 continue
             brand = classify_operator_brand(op.operator, state=item.state)
             key = (item.state, item.month, display_name)
-            bucket = grouped.get(key)
-            if bucket is None:
-                grouped[key] = {
-                    "brand": brand,
-                    "handle": safe_float(op.handle),
-                    "revenue": safe_float(op.revenue),
-                    "retail_handle": safe_float(op.retail_handle),
-                    "retail_revenue": safe_float(op.retail_revenue),
-                    "mobile_handle": safe_float(op.mobile_handle),
-                    "mobile_revenue": safe_float(op.mobile_revenue),
-                    "source_url": item.source_url,
-                    "gross_revenue": safe_float(op.gross_revenue),
-                    "promo_deductions": safe_float(op.promo_deductions),
-                    "tax": safe_float(op.tax),
-                }
+            acc = grouped.get(key)
+            if acc is None:
+                grouped[key] = _DetailAccumulator(
+                    brand=brand,
+                    handle=safe_float(op.handle),
+                    revenue=safe_float(op.revenue),
+                    retail_handle=safe_float(op.retail_handle),
+                    retail_revenue=safe_float(op.retail_revenue),
+                    mobile_handle=safe_float(op.mobile_handle),
+                    mobile_revenue=safe_float(op.mobile_revenue),
+                    source_url=item.source_url,
+                    gross_revenue=safe_float(op.gross_revenue),
+                    promo_deductions=safe_float(op.promo_deductions),
+                    tax=safe_float(op.tax),
+                )
             else:
-                if bucket["brand"] == "Other / Retail Venue" and brand != "Other / Retail Venue":
-                    bucket["brand"] = brand
-                bucket["handle"] = _sum_opt(bucket["handle"], safe_float(op.handle))  # type: ignore[arg-type]
-                bucket["revenue"] = _sum_opt(bucket["revenue"], safe_float(op.revenue))  # type: ignore[arg-type]
-                bucket["retail_handle"] = _sum_opt(bucket["retail_handle"], safe_float(op.retail_handle))  # type: ignore[arg-type]
-                bucket["retail_revenue"] = _sum_opt(bucket["retail_revenue"], safe_float(op.retail_revenue))  # type: ignore[arg-type]
-                bucket["mobile_handle"] = _sum_opt(bucket["mobile_handle"], safe_float(op.mobile_handle))  # type: ignore[arg-type]
-                bucket["mobile_revenue"] = _sum_opt(bucket["mobile_revenue"], safe_float(op.mobile_revenue))  # type: ignore[arg-type]
-                bucket["gross_revenue"] = _sum_opt(bucket["gross_revenue"], safe_float(op.gross_revenue))  # type: ignore[arg-type]
-                bucket["promo_deductions"] = _sum_opt(bucket["promo_deductions"], safe_float(op.promo_deductions))  # type: ignore[arg-type]
-                bucket["tax"] = _sum_opt(bucket["tax"], safe_float(op.tax))  # type: ignore[arg-type]
+                if acc.brand == "Other / Retail Venue" and brand != "Other / Retail Venue":
+                    acc.brand = brand
+                acc.handle = _sum_opt(acc.handle, safe_float(op.handle))
+                acc.revenue = _sum_opt(acc.revenue, safe_float(op.revenue))
+                acc.retail_handle = _sum_opt(acc.retail_handle, safe_float(op.retail_handle))
+                acc.retail_revenue = _sum_opt(acc.retail_revenue, safe_float(op.retail_revenue))
+                acc.mobile_handle = _sum_opt(acc.mobile_handle, safe_float(op.mobile_handle))
+                acc.mobile_revenue = _sum_opt(acc.mobile_revenue, safe_float(op.mobile_revenue))
+                acc.gross_revenue = _sum_opt(acc.gross_revenue, safe_float(op.gross_revenue))
+                acc.promo_deductions = _sum_opt(acc.promo_deductions, safe_float(op.promo_deductions))
+                acc.tax = _sum_opt(acc.tax, safe_float(op.tax))
 
     rows = [
-        _make_detail_row(
-            state=state,
-            month=month,
-            operator=operator,
-            brand=str(bucket["brand"]),
-            handle=bucket["handle"],  # type: ignore[arg-type]
-            revenue=bucket["revenue"],  # type: ignore[arg-type]
-            retail_handle=bucket["retail_handle"],  # type: ignore[arg-type]
-            retail_revenue=bucket["retail_revenue"],  # type: ignore[arg-type]
-            mobile_handle=bucket["mobile_handle"],  # type: ignore[arg-type]
-            mobile_revenue=bucket["mobile_revenue"],  # type: ignore[arg-type]
-            source_url=bucket["source_url"],  # type: ignore[arg-type]
-            gross_revenue=bucket["gross_revenue"],  # type: ignore[arg-type]
-            promo_deductions=bucket["promo_deductions"],  # type: ignore[arg-type]
-            tax=bucket["tax"],  # type: ignore[arg-type]
-        )
-        for (state, month, operator), bucket in grouped.items()
+        _make_detail_row(state=state, month=month, operator=operator, acc=acc)
+        for (state, month, operator), acc in grouped.items()
     ]
     return sorted(rows, key=lambda r: (r.state, r.month, r.operator))
 
@@ -319,19 +314,7 @@ def read_detail_csv(csv_path: str) -> list[PublishedDetailRow]:
                     month=month,
                     operator=operator,
                     brand=brand,
-                    handle=_parse_opt_float(raw.get("handle")),
-                    revenue=_parse_opt_float(raw.get("revenue")),
-                    hold=_parse_opt_float(raw.get("hold")),
-                    retail_handle=_parse_opt_float(raw.get("retail_handle")),
-                    retail_revenue=_parse_opt_float(raw.get("retail_revenue")),
-                    retail_hold=_parse_opt_float(raw.get("retail_hold")),
-                    mobile_handle=_parse_opt_float(raw.get("mobile_handle")),
-                    mobile_revenue=_parse_opt_float(raw.get("mobile_revenue")),
-                    mobile_hold=_parse_opt_float(raw.get("mobile_hold")),
-                    source_url=(raw.get("source_url") or "").strip() or None,
-                    gross_revenue=_parse_opt_float(raw.get("gross_revenue")),
-                    promo_deductions=_parse_opt_float(raw.get("promo_deductions")),
-                    tax=_parse_opt_float(raw.get("tax")),
+                    **_parse_csv_metric_fields(raw),  # type: ignore[arg-type]
                 )
             )
     return rows
@@ -350,25 +333,7 @@ def merge_detail_results(
 
 def detail_to_csv_row(item: PublishedDetailRow) -> list[str]:
     """Serialize a ``PublishedDetailRow`` into the 17-column detail CSV row schema."""
-    return [
-        item.state,
-        item.month,
-        item.operator,
-        item.brand,
-        _format_amount(item.handle),
-        _format_amount(item.revenue),
-        _format_pct(item.hold),
-        _format_amount(item.retail_handle),
-        _format_amount(item.retail_revenue),
-        _format_pct(item.retail_hold),
-        _format_amount(item.mobile_handle),
-        _format_amount(item.mobile_revenue),
-        _format_pct(item.mobile_hold),
-        item.source_url or "",
-        _format_amount(item.gross_revenue),
-        _format_amount(item.promo_deductions),
-        _format_amount(item.tax),
-    ]
+    return [item.state, item.month, item.operator, item.brand, *_format_csv_metric_cells(item)]
 
 
 def write_state_csv(

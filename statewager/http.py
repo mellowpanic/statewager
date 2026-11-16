@@ -45,8 +45,10 @@ def _resolve_retry_after(value: str | None) -> float | None:
         pass
     try:
         retry_at = parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
     return max(0.0, retry_at.timestamp() - time.time())
 
 
@@ -77,12 +79,14 @@ def retry_request(
             response = client.request(method, url, timeout=timeout, headers=headers, data=data)
             if response.status_code in {429, 503} and attempt < retries:
                 retry_after = _resolve_retry_after(response.headers.get("Retry-After"))
+                response.close()
                 backoff = retry_after if retry_after is not None else max(1.0, attempt * 2.0)
                 _sleep_with_jitter(backoff)
                 continue
             if response.status_code == 404:
                 return response
             if 500 <= response.status_code < 600 and attempt < retries:
+                response.close()
                 _sleep_with_jitter(float(attempt))
                 continue
             response.raise_for_status()
@@ -166,12 +170,11 @@ def _matches_signature(
         return False
     if signature_check == "auto":
         lower = urlparse(url).path.lower()
-        if lower.endswith(".pdf"):
-            return data.startswith(b"%PDF")
-        if lower.endswith(".xlsx"):
-            return data.startswith(b"PK")
         if lower.endswith(".xls"):
             return data.startswith(_XLS_SIGNATURES)
+        ext_sig = _signature_from_extension(url)
+        if ext_sig is not None:
+            return data.startswith(ext_sig)
         if not lower.endswith((".html", ".htm")):
             head = data.lstrip()[:64].lower()
             if head.startswith(_HTML_PREFIXES):

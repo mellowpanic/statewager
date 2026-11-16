@@ -125,6 +125,11 @@ def _resolve_channel(combined: str, channel_keywords: dict[str, list[str]] | Non
     return matches[0][1]
 
 
+def _combined_anchor_text(href: str, title: str | None, text: str | None) -> str:
+    filename = os.path.basename(urlparse(href).path) or href
+    return normalize_filename(" ".join([filename, href, title or "", text or ""]))
+
+
 def classify_sportsbook_filename(
     href: str,
     *,
@@ -136,9 +141,7 @@ def classify_sportsbook_filename(
     """Classify a sportsbook file anchor by ``(month-label, channel)``."""
     if not href:
         return None
-    filename = os.path.basename(urlparse(href).path) or href
-    parts = [filename, href, title or "", text or ""]
-    combined = normalize_filename(" ".join(parts))
+    combined = _combined_anchor_text(href, title, text)
     if not _SPORTSBOOK_HINT_RE.search(combined):
         return None
     if exclude_cumulative and _TIMESTAMP_RE.search(combined):
@@ -167,9 +170,7 @@ def classify_cumulative_filename(
     """Identify cumulative/FY-spanning sportsbook files."""
     if not href:
         return None
-    filename = os.path.basename(urlparse(href).path) or href
-    parts = [filename, href, title or "", text or ""]
-    combined = normalize_filename(" ".join(parts))
+    combined = _combined_anchor_text(href, title, text)
 
     has_per_month = _PER_MONTH_SUFFIX_RE.search(combined)
     has_timestamp = _TIMESTAMP_RE.search(combined)
@@ -236,6 +237,11 @@ class AnchorParser(HTMLParser):
             return
         self._flush()
 
+    def close(self) -> None:
+        if self._anchor is not None:
+            self._flush()
+        super().close()
+
     def _flush(self) -> None:
         if self._anchor is None:
             return
@@ -268,6 +274,7 @@ def crawl_anchors(
     parser = AnchorParser()
     try:
         parser.feed(html)
+        parser.close()
     except Exception as exc:
         if log:
             log(f"WARN HTML parse failed for {url}: {exc}")

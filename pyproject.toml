@@ -27,7 +27,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["statewager*"]
+include = ["statewager*", "publish*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

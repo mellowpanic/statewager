@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 import os
 import sys
+from types import ModuleType
 from typing import Sequence
 
 from dateutil.relativedelta import relativedelta
@@ -105,14 +106,14 @@ def publish_all(
     by_state: dict[str, list[StateMonthResult]] = {}
     details_by_state: dict[str, list[PublishedDetailRow]] = {}
 
-    modules = []
-    seen_slugs: set[str] = set()
+    modules: list[tuple[str, ModuleType]] = []
+    loaded_modules: dict[str, ModuleType] = {}
     for raw_state in states:
         mod = load_state_module(raw_state)
         slug = mod.__name__.rsplit(".", 1)[-1]
-        if slug in seen_slugs:
+        if slug in loaded_modules:
             continue
-        seen_slugs.add(slug)
+        loaded_modules[slug] = mod
         modules.append((slug, mod))
 
     silent_log = (lambda _msg: None) if quiet else None
@@ -179,7 +180,7 @@ def publish_all(
     state_options: list[tuple[str, str]] = []
     if merge_existing:
         for slug in ALL_STATES:
-            mod = load_state_module(slug)
+            mod = loaded_modules.get(slug) or load_state_module(slug)
             if slug in by_state:
                 combined.extend(by_state[slug])
                 state_options.append((slug, mod.STATE_NAME))
@@ -211,6 +212,8 @@ def publish_all(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.months < 1:
+        parser.error("--months must be >= 1")
 
     last_completed = date.today().replace(day=1) - relativedelta(months=1)
     end_date = parse_month_spec(args.end_month) if args.end_month else last_completed
@@ -221,6 +224,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         window = month_starts(args.months)
         start_date = window[0]
+    if end_date < start_date:
+        parser.error(f"--end-month ({end_date:%Y-%m}) must be on or after --start-month ({start_date:%Y-%m})")
 
     by_state = publish_all(
         states=args.states,

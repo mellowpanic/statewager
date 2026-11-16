@@ -1042,6 +1042,10 @@ def test_viewer_html_features_and_workflow_file() -> None:
         "URLSearchParams",
         "buildWindowedRows",
         "computeSameStoreYoY",
+        "showTooltip",
+        "renderEmptyChart",
+        "aria-sort",
+        "windowedDetailRows",
     ):
         assert marker in html
 
@@ -1051,6 +1055,90 @@ def test_viewer_html_features_and_workflow_file() -> None:
         assert "17 13 */2 * *" in wf
         assert "workflow_dispatch" in wf
         assert "python -m publish" in wf
+
+
+def test_critique_core_fixes_and_single_pass_parsers(tmp_path: pathlib.Path, monkeypatch) -> None:
+    import datetime
+    import pytest
+    from publish.__main__ import main as publish_main
+    from publish.csv_writer import _parse_opt_float
+    from statewager.discover import AnchorParser
+    from statewager.model import parse_month_spec
+    from statewager.operators import classify_operator_brand, normalize_operator_name
+    from statewager.states import STATE_ABBR_TO_SLUG, iowa, load_state_module, louisiana, missouri
+
+    # parse_month_spec validation & variant formats
+    assert parse_month_spec("Mar-2026") == datetime.date(2026, 3, 1)
+    assert parse_month_spec("2026-03-15") == datetime.date(2026, 3, 1)
+    with pytest.raises(ValueError):
+        parse_month_spec("2026-03-foo")
+
+    # All 10 two-letter postal codes resolve cleanly
+    assert len(STATE_ABBR_TO_SLUG) == 10
+    for abbr, slug in STATE_ABBR_TO_SLUG.items():
+        mod = load_state_module(abbr)
+        assert mod.__name__.endswith(f".{slug}")
+
+    # Operator normalization & Barstool/The Score brand classification
+    assert normalize_operator_name("FRENCH LICK RESORT - GETSBK") == "French Lick Resort - getSBK"
+    assert classify_operator_brand("Hollywood Gaming at Dayton Raceway - Barstool", state="Ohio") == "PENN / ESPN Bet"
+    assert classify_operator_brand("HOLLYWOOD - THE SCORE", state="Missouri") == "PENN / ESPN Bet"
+
+    # AnchorParser flushes unclosed trailing anchor on close()
+    parser = AnchorParser()
+    parser.feed('<a href="/report.pdf">March 2026')
+    parser.close()
+    assert len(parser.links) == 1 and parser.links[0]["href"] == "/report.pdf"
+
+    # Louisiana _scan_cache_dir indexes remote-named cached files as cumulative fallbacks
+    cache_dir = tmp_path / "la_cache"
+    cache_dir.mkdir()
+    cached_fy = cache_dir / "Sep_2026-mobile_fy27_mobile_sb_2026_09.xlsx"
+    cached_fy.write_bytes(b"PK")
+    _pm, cum = louisiana._scan_cache_dir(str(cache_dir), {"Jul 2026", "Sep 2026"})
+    assert str(cached_fy) in cum.get("Jul 2026:mobile", [])
+
+    # Missouri Detail Report per-operator gross revenue & alias key alignment
+    mo_pages = [
+        "SPORTS WAGERING RETAIL STATISTICAL REPORT\n"
+        "CAESAR'S SPORTSBOOK-HARRAH'S - RETAIL Sep-26 100 $1,000.00 $900.00 $100.00 $10.00\n"
+        "FANATICS-AMERISTAR KC - RETAIL Sep-26 100 $2,000.00 $1,800.00 $200.00 $20.00\n"
+        "STATE TOTALS MTD: 200 $3,000.00 $2,700.00 $300.00 $30.00",
+        "SPORTS WAGERING RETAIL DETAIL REPORT\n"
+        "CAESARS SPORTSBOOK- HARRAH'S- RETAIL Sep-26\n"
+        "Football 100 $1,000.00 $880.00 $120.00\n"
+        "TOTALS: 100 $1,000.00 $880.00 $120.00\n"
+        "FANATICS SPORTSBOOK- AMERISTAR KC - RETAIL Sep-26\n"
+        "Football 100 $2,000.00 $1,750.00 $250.00\n"
+        "TOTALS: 100 $2,000.00 $1,750.00 $250.00\n"
+        "STATE TOTALS MTD: 200 $3,000.00 $2,630.00 $370.00",
+    ]
+    st_g, st_t, op_t, op_g = missouri._parse_page_texts_fiscal_full(mo_pages, 2026, 9)
+    assert st_g == 370.0 and st_t == 30.0
+    k_caesars = missouri._fiscal_operator_key("CAESAR'S SPORTSBOOK-HARRAH'S")
+    k_fanatics = missouri._fiscal_operator_key("FANATICS-AMERISTAR KC")
+    assert op_t[k_caesars] == 10.0 and op_g[k_caesars] == 120.0
+    assert op_t[k_fanatics] == 20.0 and op_g[k_fanatics] == 250.0
+
+    # Iowa fetch populates operator gross_revenue equal to net receipts
+    fake_ia = iowa.ParsedIowaMetrics(
+        metrics=(1000.0, 100.0, 200.0, 20.0, 800.0, 80.0),
+        layout="test",
+        details=(("Crown IA Gaming, LLC", 800.0, 80.0, None, None, 800.0, 80.0),),
+        tax=6.75,
+    )
+    monkeypatch.setattr(iowa, "build_archive_lookup", lambda *_a, **_kw: {"Sep 2026": fake_ia})
+    ia_res = iowa.fetch("2026-09", "2026-09", offline=True, log=lambda _m: None)
+    assert len(ia_res) == 1
+    assert ia_res[0].details[0].gross_revenue == 80.0
+
+    # CSV malformed float defense & publish CLI validation
+    assert _parse_opt_float("not-a-number") is None
+    with pytest.raises(SystemExit):
+        publish_main(["--months", "0"])
+    with pytest.raises(SystemExit):
+        publish_main(["--start-month", "2026-05", "--end-month", "2026-03"])
+
 
 
 

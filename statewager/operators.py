@@ -1,6 +1,7 @@
 """Operator display-name normalization and cross-state brand classification."""
 from __future__ import annotations
 
+import functools
 import re
 
 BRAND_ORDER: tuple[str, ...] = (
@@ -101,6 +102,7 @@ _SPECIAL_WORDS: dict[str, str] = {
     "betway": "Betway",
     "betr": "Betr",
     "fanatics": "Fanatics",
+    "getsbk": "getSBK",
     "fhr-illinois": "FHR-Illinois",
     "iowa": "Iowa",
     "illinois": "Illinois",
@@ -115,9 +117,7 @@ _CANONICAL_OVERRIDES: dict[str, str] = {
     "hollywood columbus - penn interactive (espn bet)": "Hollywood Columbus - Penn Interactive (ESPN Bet)",
     "hollywood - espnbet": "Hollywood - ESPN Bet",
     "hollywood - thescore": "Hollywood - theScore Bet",
-    "ks crossing - caesar's": "Kansas Crossing - Caesars",
     "kansas crossing - caesar's": "Kansas Crossing - Caesars",
-    "ks crossing - caesars": "Kansas Crossing - Caesars",
     "kansas star - bet365": "Kansas Star - bet365",
     "caesar's sportsbook- horseshoe": "Caesars Sportsbook - Horseshoe",
     "caesar's sportsbook - horseshoe": "Caesars Sportsbook - Horseshoe",
@@ -177,6 +177,7 @@ def _normalize_token(token: str, *, allow_connector_lower: bool) -> str:
     return f"{prefix}{normalized}{suffix}"
 
 
+@functools.lru_cache(maxsize=1024)
 def normalize_operator_name(raw: str, *, state: str | None = None) -> str:
     """Normalize regulator operator/venue names away from ALL-CAPS into readable display names."""
     cleaned = _SUPERSCRIPT_RE.sub("", str(raw or ""))
@@ -210,8 +211,6 @@ def normalize_operator_name(raw: str, *, state: str | None = None) -> str:
     result = result.replace("LLC.,", "LLC,").rstrip()
     if result.endswith("LLC."):
         result = result[:-1]
-    if state == "Indiana" and result.endswith(" - getSBK"):
-        result = result[:-len("getSBK")] + "getSBK"
     return result
 
 
@@ -285,6 +284,8 @@ _DIRECT_BRAND_PATTERNS: tuple[tuple[str, str], ...] = (
     ("hillside (iowa)", "bet365"),
     ("espn", "PENN / ESPN Bet"),
     ("thescore", "PENN / ESPN Bet"),
+    ("the score", "PENN / ESPN Bet"),
+    ("barstool", "PENN / ESPN Bet"),
     ("(tsb)", "PENN / ESPN Bet"),
     ("penn interactive", "PENN / ESPN Bet"),
     ("penn sports interactive", "PENN / ESPN Bet"),
@@ -299,6 +300,7 @@ _DIRECT_BRAND_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 
+@functools.lru_cache(maxsize=1024)
 def classify_operator_brand(raw: str, *, state: str | None = None) -> str:
     """Map an operator/licensee string to its canonical cross-state sportsbook brand."""
     low = _WS_RE.sub(" ", _SUPERSCRIPT_RE.sub("", str(raw or "")).strip()).lower()

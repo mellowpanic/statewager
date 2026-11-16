@@ -391,6 +391,9 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
       cursor: pointer;
       user-select: none;
     }
+    th:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    th[aria-sort="ascending"]::after { content: " ▲"; font-size: 0.7em; color: var(--accent); }
+    th[aria-sort="descending"]::after { content: " ▼"; font-size: 0.7em; color: var(--accent); }
     tbody tr:hover { background: #f8fafc; }
     .pos { color: var(--pos); }
     .neg { color: var(--neg); }
@@ -576,6 +579,7 @@ __STATE_OPTIONS__
       let activeDetailRows = [];
       let activeRows = [];
       let windowedActiveRows = [];
+      let windowedDetailRows = [];
       let lastRenderedRows = [];
       let lastColFlags = null;
       let allStatesCount = 10;
@@ -694,13 +698,17 @@ __STATE_OPTIONS__
 
       function parseNormalizedCsv(text) {
         return parseCsvObjects(text).map((raw) => {
+          const state = raw.state || "";
+          const operator = raw.operator || "";
+          const brand = raw.brand || "";
           const handle = toNum(raw.handle);
           const grossRev = toNum(raw.gross_revenue);
           return {
-            state: raw.state || "",
+            state,
             month: raw.month || "",
-            operator: raw.operator || "",
-            brand: raw.brand || "",
+            operator,
+            brand,
+            _ekey: `${state}\\x1f${operator}\\x1f${brand}`,
             handle,
             revenue: toNum(raw.revenue),
             hold: toNum(raw.hold),
@@ -736,7 +744,7 @@ __STATE_OPTIONS__
         const W = Math.max(1, Number(windowMonths) || 1);
         const groups = new Map();
         rows.forEach((r) => {
-          const gKey = detailMode ? JSON.stringify([r.state, r.operator, r.brand]) : r.state;
+          const gKey = detailMode ? (r._ekey || `${r.state}\\x1f${r.operator}\\x1f${r.brand}`) : r.state;
           let g = groups.get(gKey);
           if (!g) {
             g = new Map();
@@ -747,21 +755,19 @@ __STATE_OPTIONS__
 
         const out = [];
         groups.forEach((byMonth) => {
-          const sortedMonths = Array.from(byMonth.keys()).sort();
+          const sortedEntries = Array.from(byMonth.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+          const sortedMonths = sortedEntries.map(([m]) => m);
+          const sortedRows = sortedEntries.map(([, r]) => r);
           const winByMonth = new Map();
-          sortedMonths.forEach((m) => {
+          sortedEntries.forEach(([m, head], idx) => {
             if (W === 1) {
-              winByMonth.set(m, Object.assign({}, byMonth.get(m)));
+              winByMonth.set(m, Object.assign({}, head));
               return;
             }
-            const slice = [];
-            for (let k = 0; k < W; k++) {
-              const prevM = addMonths(m, -k);
-              const item = byMonth.get(prevM);
-              if (!item) return;
-              slice.push(item);
+            if (idx < W - 1 || sortedMonths[idx - W + 1] !== addMonths(m, -(W - 1))) {
+              return;
             }
-            const head = byMonth.get(m);
+            const slice = sortedRows.slice(idx - W + 1, idx + 1);
             const handle = sumAllOpt(slice, "handle");
             const revenue = sumAllOpt(slice, "revenue");
             const grossRev = sumAllOpt(slice, "gross_revenue");
@@ -774,6 +780,7 @@ __STATE_OPTIONS__
               month: m,
               operator: head.operator,
               brand: head.brand,
+              _ekey: head._ekey,
               handle,
               revenue,
               hold: (handle !== null && handle > 0 && revenue !== null) ? (revenue / handle) * 100 : null,
@@ -816,16 +823,16 @@ __STATE_OPTIONS__
       function computeSameStoreYoY(currRows, lookupRows, detailMode) {
         const lookupMap = new Map();
         lookupRows.forEach((r) => {
-          const eKey = detailMode ? JSON.stringify([r.state, r.operator, r.brand]) : r.state;
-          lookupMap.set(JSON.stringify([eKey, r.month]), r);
+          const eKey = detailMode ? (r._ekey || `${r.state}\\x1f${r.operator}\\x1f${r.brand}`) : r.state;
+          lookupMap.set(`${eKey}\\x1f${r.month}`, r);
         });
         let currH = 0, prevH = 0, hasH = false;
         let currR = 0, prevR = 0, hasR = false;
         let currHoldH = 0, currHoldR = 0, prevHoldH = 0, prevHoldR = 0;
         let matched = 0;
         currRows.forEach((c) => {
-          const eKey = detailMode ? JSON.stringify([c.state, c.operator, c.brand]) : c.state;
-          const p = lookupMap.get(JSON.stringify([eKey, addMonths(c.month, -12)]));
+          const eKey = detailMode ? (c._ekey || `${c.state}\\x1f${c.operator}\\x1f${c.brand}`) : c.state;
+          const p = lookupMap.get(`${eKey}\\x1f${addMonths(c.month, -12)}`);
           if (!p) return;
           matched += 1;
           if (c.handle !== null && p.handle !== null) {
@@ -1009,7 +1016,11 @@ __STATE_OPTIONS__
 
       function refreshWindowedRows() {
         const winM = Number(windowSelect.value) || 1;
-        windowedActiveRows = buildWindowedRows(activeRows, winM, isDetailView());
+        const detailMode = isDetailView();
+        windowedActiveRows = buildWindowedRows(activeRows, winM, detailMode);
+        windowedDetailRows = activeDetailRows.length
+          ? (entitySelect.value === "__ALL_DETAILS__" ? windowedActiveRows : buildWindowedRows(activeDetailRows, winM, true))
+          : [];
       }
 
       function updateKpis(rows) {
@@ -1090,12 +1101,16 @@ __STATE_OPTIONS__
         });
       }
 
-      function expectedDetailStatesCount(month) {
+      function expectedDetailStatesCountFromSet(month, stateCollection) {
         let exp = 0;
-        detailDisclosingStates.forEach((s) => {
+        stateCollection.forEach((s) => {
           if (s !== "Missouri" || month >= "2025-12") exp += 1;
         });
         return Math.max(1, exp);
+      }
+
+      function expectedDetailStatesCount(month) {
+        return expectedDetailStatesCountFromSet(month, detailDisclosingStates);
       }
 
       function expectedStatesForMonth(month) {
@@ -1157,6 +1172,36 @@ __STATE_OPTIONS__
         chartLegend.style.display = "flex";
       }
 
+      function showTooltip(ev, text) {
+        tooltip.textContent = text;
+        tooltip.style.display = "block";
+        const maxLeft = Math.max(8, window.innerWidth - tooltip.offsetWidth - 12);
+        const left = Math.max(8, Math.min(ev.clientX + 12, maxLeft));
+        const top = Math.max(8, ev.clientY - 32);
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${top}px`;
+      }
+
+      function hideTooltip() {
+        tooltip.style.display = "none";
+      }
+
+      function renderEmptyChart(reason) {
+        chartSvg.innerHTML = "";
+        const fromM = fromMonthInput.value;
+        const toM = toMonthInput.value;
+        const msg = reason || ((fromM && toM && fromM > toM)
+          ? "From Month is after To Month — adjust date range"
+          : "No records match the selected filters");
+        chartSvg.appendChild(svgEl("text", {
+          x: 480,
+          y: 145,
+          "text-anchor": "middle",
+          fill: "#64748b",
+          "font-size": 14
+        }, msg));
+      }
+
       function aggregateByMonth(rows, metric) {
         const isYoy = metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
         const isOptionalMoney = metric === "promo_deductions" || metric === "tax";
@@ -1165,7 +1210,8 @@ __STATE_OPTIONS__
         rows.forEach((r) => {
           if (!byMonth.has(r.month)) {
             byMonth.set(r.month, {
-              handle: 0, revenue: 0, mobile_handle: 0, retail_handle: 0,
+              handle: 0, revenue: 0, holdHandle: 0, holdRevenue: 0,
+              mobile_handle: 0, retail_handle: 0,
               promo_deductions: 0, tax: 0, hasPromo: false, hasTax: false,
               states: new Set()
             });
@@ -1173,6 +1219,10 @@ __STATE_OPTIONS__
           const agg = byMonth.get(r.month);
           if (r.handle !== null) agg.handle += r.handle;
           if (r.revenue !== null) agg.revenue += r.revenue;
+          if (r.handle !== null && r.revenue !== null) {
+            agg.holdHandle += r.handle;
+            agg.holdRevenue += r.revenue;
+          }
           if (r.mobile_handle !== null) agg.mobile_handle += r.mobile_handle;
           if (r.retail_handle !== null) agg.retail_handle += r.retail_handle;
           if (r.promo_deductions !== null) {
@@ -1209,7 +1259,8 @@ __STATE_OPTIONS__
               if (value === null) return;
               sameStoreMatched = yoy.matched;
             } else if (metric === "hold") {
-              value = agg.handle > 0 ? (agg.revenue / agg.handle) * 100 : 0;
+              if (agg.holdHandle <= 0) return;
+              value = (agg.holdRevenue / agg.holdHandle) * 100;
             } else if (isOptionalMoney) {
               if ((metric === "promo_deductions" && !agg.hasPromo) || (metric === "tax" && !agg.hasTax)) return;
               value = agg[metric];
@@ -1285,14 +1336,9 @@ __STATE_OPTIONS__
             ? ` (${pt.count}/${pt.expected} ${detail ? "disclosing states" : "states"}${pt.partial ? " — partial" : ""}${pt.sameStoreMatched ? `, ${pt.sameStoreMatched} same-store` : ""})`
             : "";
           rect.addEventListener("mousemove", (ev) => {
-            tooltip.style.display = "block";
-            tooltip.style.left = `${ev.clientX + 12}px`;
-            tooltip.style.top = `${ev.clientY - 28}px`;
-            tooltip.textContent = `${pt.month}: ${formatted}${countInfo}`;
+            showTooltip(ev, `${pt.month}: ${formatted}${countInfo}`);
           });
-          rect.addEventListener("mouseleave", () => {
-            tooltip.style.display = "none";
-          });
+          rect.addEventListener("mouseleave", hideTooltip);
           chartSvg.appendChild(rect);
 
           if (pt.partial && multi && barW >= 14) {
@@ -1321,7 +1367,6 @@ __STATE_OPTIONS__
       }
 
       function renderBrandShareChart(metric, stateLabel, windowSuffix) {
-        const winM = Number(windowSelect.value) || 1;
         const valField = metric === "revenue_share" ? "revenue" : "handle";
         const fromM = fromMonthInput.value;
         const toM = toMonthInput.value;
@@ -1330,7 +1375,7 @@ __STATE_OPTIONS__
         document.getElementById("chartTitle").textContent =
           `${stateLabel} — ${titlePrefix}${metric === "revenue_share" ? "Brand Revenue Share (%)" : "Brand Handle Share (%)"}`;
 
-        const winDetail = buildWindowedRows(activeDetailRows, winM, true).filter((r) => {
+        const winDetail = windowedDetailRows.filter((r) => {
           if (fromM && r.month < fromM) return false;
           if (toM && r.month > toM) return false;
           return true;
@@ -1379,16 +1424,18 @@ __STATE_OPTIONS__
             : "Across disclosing states (LA, MS, NV do not disclose operators)")
           : "Normalized brand mix from state regulator disclosures";
 
-        chartSvg.innerHTML = "";
         if (!series.length) {
+          renderEmptyChart();
           setChartLegend([]);
           return;
         }
+        chartSvg.innerHTML = "";
 
         const rankedBrands = Array.from(brandTotals.entries())
           .sort((a, b) => b[1] - a[1])
           .map(([b]) => b);
         const topBrands = rankedBrands.slice(0, 7);
+        const topBrandSet = new Set(topBrands);
         const hasOtherBucket = rankedBrands.length > 7;
         const segments = hasOtherBucket ? [...topBrands, "Other Brands"] : topBrands;
         const segColors = segments.map((_b, idx) => SERIES_COLORS[idx % SERIES_COLORS.length]);
@@ -1420,7 +1467,7 @@ __STATE_OPTIONS__
             let amt = 0;
             if (hasOtherBucket && segName === "Other Brands") {
               pt.brands.forEach((bAmt, bKey) => {
-                if (!topBrands.includes(bKey)) amt += bAmt;
+                if (!topBrandSet.has(bKey)) amt += bAmt;
               });
             } else {
               amt = pt.brands.get(segName) || 0;
@@ -1442,14 +1489,9 @@ __STATE_OPTIONS__
             x, y: pad.top, width: barW, height: plotH, fill: "transparent", cursor: "crosshair"
           });
           hit.addEventListener("mousemove", (ev) => {
-            tooltip.style.display = "block";
-            tooltip.style.left = `${ev.clientX + 12}px`;
-            tooltip.style.top = `${ev.clientY - 28}px`;
-            tooltip.textContent = `${pt.month} (${fmtCompactMoney(pt.total)}) — ${breakdown.slice(0, 5).join(" | ")}`;
+            showTooltip(ev, `${pt.month} (${fmtCompactMoney(pt.total)}) — ${breakdown.slice(0, 5).join(" | ")}`);
           });
-          hit.addEventListener("mouseleave", () => {
-            tooltip.style.display = "none";
-          });
+          hit.addEventListener("mouseleave", hideTooltip);
           chartSvg.appendChild(hit);
 
           if (idx % labelEvery === 0 || idx === series.length - 1) {
@@ -1471,28 +1513,53 @@ __STATE_OPTIONS__
 
         let seriesList = [];
         let marketTotalByMonth = new Map();
+        let hiddenPartial = 0;
         const winTitle = windowSuffix ? `${windowSuffix} ` : "";
+        const scopeTitle = compareMode === "brands"
+          ? ((stateSelect.value === "__ALL__" || !DETAIL_STATES.has(stateSelect.value))
+            ? "All Disclosing States — "
+            : `${stateSelect.options[stateSelect.selectedIndex]?.text || ""} — `)
+          : "";
         document.getElementById("chartTitle").textContent =
-          `Compare (${compareSelected.length} ${compareMode === "brands" ? "Brands" : "States"}) — ${winTitle}${metricLabel}`;
+          `${scopeTitle}Compare (${compareSelected.length} ${compareMode === "brands" ? "Brands" : "States"}) — ${winTitle}${metricLabel}`;
 
         try {
           if (compareMode === "states") {
             const allStateRaw = await fetchCsvRows("__ALL__");
             if (mySeq !== compareSeq) return;
             const winAll = buildWindowedRows(allStateRaw, winM, false);
-            if (isShare) {
-              winAll.forEach((r) => {
+            const allStateSet = new Set(allStateRaw.map((r) => r.state));
+            const allCount = allStateSet.size || 1;
+            const hasMo = allStateSet.has("Missouri");
+            const statesByMonth = new Map();
+            winAll.forEach((r) => {
+              if (!statesByMonth.has(r.month)) statesByMonth.set(r.month, new Set());
+              statesByMonth.get(r.month).add(r.state);
+              if (isShare) {
                 const v = r[baseShareField];
                 if (v !== null && v > 0) {
                   marketTotalByMonth.set(r.month, (marketTotalByMonth.get(r.month) || 0) + v);
                 }
-              });
+              }
+            });
+            let allowedShareMonths = null;
+            if (isShare && !includePartialInput.checked) {
+              const candidateMonths = Array.from(statesByMonth.keys()).filter((m) => (!fromM || m >= fromM) && (!toM || m <= toM));
+              const completeSet = new Set(candidateMonths.filter((m) => {
+                const exp = Math.max(1, allCount - (hasMo && m < "2025-12" ? 1 : 0));
+                return statesByMonth.get(m).size >= Math.max(1, exp - 1);
+              }));
+              if (completeSet.size > 0 && completeSet.size < candidateMonths.length) {
+                allowedShareMonths = completeSet;
+                hiddenPartial = candidateMonths.length - completeSet.size;
+              }
             }
             seriesList = compareSelected.map((stName, idx) => {
               const stRows = winAll.filter((r) => r.state === stName).sort((a, b) => a.month.localeCompare(b.month));
               const pts = new Map();
               stRows.forEach((r) => {
                 if ((fromM && r.month < fromM) || (toM && r.month > toM)) return;
+                if (allowedShareMonths && !allowedShareMonths.has(r.month)) return;
                 let v = r[metric];
                 if (isShare) {
                   const tot = marketTotalByMonth.get(r.month) || 0;
@@ -1505,12 +1572,22 @@ __STATE_OPTIONS__
             });
           } else {
             const needAllDetails = stateSelect.value === "__ALL__" || !DETAIL_STATES.has(stateSelect.value);
-            const rawDet = needAllDetails ? await fetchDetailRows("__ALL__") : activeDetailRows;
-            if (mySeq !== compareSeq) return;
-            const winDet = buildWindowedRows(rawDet, winM, true);
+            let winDet;
+            if (needAllDetails) {
+              const rawDet = await fetchDetailRows("__ALL__");
+              if (mySeq !== compareSeq) return;
+              winDet = buildWindowedRows(rawDet, winM, true);
+            } else {
+              winDet = windowedDetailRows;
+            }
+            const discStatesInDet = new Set();
+            const discByMonth = new Map();
             const detByMonthBrand = new Map();
             winDet.forEach((r) => {
               const m = r.month;
+              discStatesInDet.add(r.state);
+              if (!discByMonth.has(m)) discByMonth.set(m, new Set());
+              discByMonth.get(m).add(r.state);
               if (isShare) {
                 const v = r[baseShareField];
                 if (v !== null && v > 0) {
@@ -1526,19 +1603,36 @@ __STATE_OPTIONS__
               if (!mMap.has(m)) mMap.set(m, []);
               mMap.get(m).push(r);
             });
+            let allowedBrandMonths = null;
+            if (needAllDetails && !includePartialInput.checked) {
+              const candidateMonths = Array.from(discByMonth.keys()).filter((m) => (!fromM || m >= fromM) && (!toM || m <= toM));
+              const completeSet = new Set(candidateMonths.filter((m) => (
+                discByMonth.get(m).size >= expectedDetailStatesCountFromSet(m, discStatesInDet)
+              )));
+              if (completeSet.size > 0 && completeSet.size < candidateMonths.length) {
+                allowedBrandMonths = completeSet;
+                hiddenPartial = candidateMonths.length - completeSet.size;
+              }
+            }
             seriesList = compareSelected.map((brandName, idx) => {
               const mMap = detByMonthBrand.get(brandName) || new Map();
               const pts = new Map();
               Array.from(mMap.keys()).sort().forEach((m) => {
                 if ((fromM && m < fromM) || (toM && m > toM)) return;
+                if (allowedBrandMonths && !allowedBrandMonths.has(m)) return;
                 const slice = mMap.get(m);
                 let v = null;
                 if (isYoy) {
                   const prevSlice = mMap.get(addMonths(m, -12)) || [];
                   v = computeSameStoreYoY(slice, prevSlice, true)[metric];
                 } else if (metric === "hold") {
-                  const h = slice.reduce((s, r) => s + (r.handle || 0), 0);
-                  const rev = slice.reduce((s, r) => s + (r.revenue || 0), 0);
+                  let h = 0, rev = 0;
+                  slice.forEach((r) => {
+                    if (r.handle !== null && r.revenue !== null) {
+                      h += r.handle;
+                      rev += r.revenue;
+                    }
+                  });
                   v = h > 0 ? (rev / h) * 100 : null;
                 } else if (isShare) {
                   const tot = marketTotalByMonth.get(m) || 0;
@@ -1568,16 +1662,20 @@ __STATE_OPTIONS__
         const monthSet = new Set();
         seriesList.forEach((s) => s.pts.forEach((_v, m) => monthSet.add(m)));
         const months = Array.from(monthSet).sort();
-        chartSvg.innerHTML = "";
         setChartLegend(seriesList.map((s) => ({ label: s.label, color: s.color })));
-        chartNote.textContent = `Overlaying ${seriesList.length} ${compareMode} (${winTitle || "Monthly"})`;
-        if (!months.length) return;
+        const partialMsg = hiddenPartial > 0 ? `; ${hiddenPartial} partial hidden` : "";
+        chartNote.textContent = `Overlaying ${seriesList.length} ${compareMode} (${winTitle || "Monthly"}${partialMsg})`;
+        if (!months.length) {
+          renderEmptyChart();
+          return;
+        }
+        chartSvg.innerHTML = "";
 
         const allVals = [];
         seriesList.forEach((s) => s.pts.forEach((v) => allVals.push(v)));
         let minVal = Math.min(...allVals);
         let maxVal = Math.max(...allVals);
-        if (metric === "hold" || isShare || metric === "handle" || metric === "revenue") {
+        if (!isYoy) {
           minVal = Math.min(0, minVal);
         }
         if (minVal === maxVal) {
@@ -1634,14 +1732,9 @@ __STATE_OPTIONS__
               cx: xScale(idx), cy: yScale(v), r: months.length > 30 ? 2.5 : 3.5, fill: s.color, stroke: "#fff", "stroke-width": 1
             });
             dot.addEventListener("mousemove", (ev) => {
-              tooltip.style.display = "block";
-              tooltip.style.left = `${ev.clientX + 12}px`;
-              tooltip.style.top = `${ev.clientY - 28}px`;
-              tooltip.textContent = `${s.label} (${m}): ${formatMetricValue(metric, v)}`;
+              showTooltip(ev, `${s.label} (${m}): ${formatMetricValue(metric, v)}`);
             });
-            dot.addEventListener("mouseleave", () => {
-              tooltip.style.display = "none";
-            });
+            dot.addEventListener("mouseleave", hideTooltip);
             chartSvg.appendChild(dot);
           });
         });
@@ -1709,8 +1802,11 @@ __STATE_OPTIONS__
             ? `${partialVisible} partial-coverage month${partialVisible === 1 ? "" : "s"} shown with dashed outline`
             : (detail ? "7 disclosing states (LA, MS, NV do not disclose operators)" : "");
         }
+        if (!series.length) {
+          renderEmptyChart();
+          return;
+        }
         chartSvg.innerHTML = "";
-        if (!series.length) return;
         renderBarChart(series, metric, multi, detail);
       }
 
@@ -1791,6 +1887,13 @@ __STATE_OPTIONS__
 
         lastRenderedRows = sorted;
         lastColFlags = flags;
+        document.querySelectorAll("th[data-col]").forEach((th) => {
+          if (th.getAttribute("data-col") === sortCol) {
+            th.setAttribute("aria-sort", sortAsc ? "ascending" : "descending");
+          } else {
+            th.removeAttribute("aria-sort");
+          }
+        });
 
         const tbody = document.getElementById("tableBody");
         tbody.innerHTML = "";
@@ -1867,7 +1970,10 @@ __STATE_OPTIONS__
       }
 
       function csvCell(val) {
-        const s = val === null || val === undefined ? "" : String(val);
+        let s = val === null || val === undefined ? "" : String(val);
+        if (typeof val === "string" && s.trim() !== "" && !Number.isFinite(Number(s)) && /^[\\t\\r]*[=+@-]/.test(s)) {
+          s = "'" + s;
+        }
         return /["\\r\\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
       }
 
@@ -1926,6 +2032,7 @@ __STATE_OPTIONS__
       }
 
       function refreshView() {
+        hideTooltip();
         const rows = filteredRows();
         updateKpis(rows);
         renderChart(rows);
@@ -2075,7 +2182,11 @@ __STATE_OPTIONS__
         const multi = isMultiStateView();
         const slug = stateSelect.value;
 
-        partialField.style.display = multi ? "" : "none";
+        const showComparePartial = compareSelected.length > 0 && (
+          (compareMode === "brands" && (slug === "__ALL__" || !DETAIL_STATES.has(slug)))
+          || (compareMode === "states" && (metricSelect.value === "handle_share" || metricSelect.value === "revenue_share"))
+        );
+        partialField.style.display = (multi || showComparePartial) ? "" : "none";
 
         if (slug === "__ALL__") {
           stateCsvLink.style.display = "none";
@@ -2306,17 +2417,26 @@ __STATE_OPTIONS__
         }
       }
 
+      function toggleSort(th) {
+        const col = th.getAttribute("data-col");
+        if (sortCol === col) {
+          sortAsc = !sortAsc;
+        } else {
+          sortCol = col;
+          sortAsc = col === "state" || col === "operator" || col === "brand";
+        }
+        renderTable(filteredRows());
+        syncUrlState();
+      }
+
       document.querySelectorAll("th[data-col]").forEach((th) => {
-        th.addEventListener("click", () => {
-          const col = th.getAttribute("data-col");
-          if (sortCol === col) {
-            sortAsc = !sortAsc;
-          } else {
-            sortCol = col;
-            sortAsc = col === "state" || col === "month" || col === "operator" || col === "brand";
+        th.setAttribute("tabindex", "0");
+        th.addEventListener("click", () => toggleSort(th));
+        th.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            toggleSort(th);
           }
-          renderTable(filteredRows());
-          syncUrlState();
         });
       });
 
@@ -2393,7 +2513,10 @@ __STATE_OPTIONS__
         applyDefaultDateBounds();
         refreshView();
       });
-      metricSelect.addEventListener("change", refreshView);
+      metricSelect.addEventListener("change", () => {
+        syncControlsAndSelection();
+        refreshView();
+      });
       fromMonthInput.addEventListener("change", () => {
         userChangedFrom = true;
         refreshView();

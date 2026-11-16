@@ -6,7 +6,7 @@ from html import unescape
 import io
 import os
 import re
-from typing import Callable
+from typing import Callable, Iterator
 from urllib.parse import urljoin
 
 try:
@@ -350,6 +350,35 @@ def _to_float(value: object) -> float | None:
     return float(value) if is_number(value) else None
 
 
+_SKIP_BLOCK_LABELS: frozenset[str] = frozenset({
+    "GRAND TOTAL",
+    "TOTAL SPORTS WAGERING",
+    "RETAIL SPORTS WAGERING",
+    "ONLINE SPORTS WAGERING",
+})
+
+
+def _iter_operator_blocks(rows: list[tuple[object, ...]]) -> Iterator[tuple[int, str]]:
+    """Yield ``(start_index, operator_label)`` for each 16-row PGCB operator block."""
+    index = 0
+    while index < len(rows):
+        label = str(rows[index][0] if rows[index] else "").strip()
+        if not label or label.upper() in _SKIP_BLOCK_LABELS:
+            index += 1
+            continue
+        if index + 15 >= len(rows):
+            break
+        if (
+            normalize_label(rows[index + 1][0] if rows[index + 1] else "") != "total sports wagering"
+            or normalize_label(rows[index + 2][0] if rows[index + 2] else "") != "handle*"
+            or normalize_label(rows[index + 3][0] if rows[index + 3] else "") != "revenue"
+        ):
+            index += 1
+            continue
+        yield index, label
+        index += 16
+
+
 def parse_detail_metrics(
     rows: list[tuple[object, ...]],
     fy_start: int,
@@ -364,29 +393,7 @@ def parse_detail_metrics(
     details: dict[str, list[tuple[str, float, float, float | None, float | None, float | None, float | None]]] = {
         label: [] for label in col_to_label.values()
     }
-    index = 0
-    while index < len(rows):
-        label = str(rows[index][0] if rows[index] else "").strip()
-        upper = label.upper()
-        if not label or upper in {
-            "GRAND TOTAL",
-            "TOTAL SPORTS WAGERING",
-            "RETAIL SPORTS WAGERING",
-            "ONLINE SPORTS WAGERING",
-        }:
-            index += 1
-            continue
-        if index + 15 >= len(rows):
-            break
-        if normalize_label(rows[index + 1][0] if rows[index + 1] else "") != "total sports wagering":
-            index += 1
-            continue
-        if normalize_label(rows[index + 2][0] if rows[index + 2] else "") != "handle*":
-            index += 1
-            continue
-        if normalize_label(rows[index + 3][0] if rows[index + 3] else "") != "revenue":
-            index += 1
-            continue
+    for index, label in _iter_operator_blocks(rows):
         retail_section = normalize_label(rows[index + 8][0] if rows[index + 8] else "")
         retail_metric = normalize_label(rows[index + 9][0] if rows[index + 9] else "")
         retail_revenue_metric = normalize_label(rows[index + 10][0] if rows[index + 10] else "")
@@ -418,7 +425,6 @@ def parse_detail_metrics(
                         _to_float(mobile_revenue),
                     )
                 )
-        index += 16
     return details
 
 
@@ -521,31 +527,10 @@ def parse_detail_fiscal(
     if not col_to_label:
         return {}
     fiscal_by_op: dict[tuple[str, str], tuple[float | None, float | None, float | None]] = {}
-    index = 0
-    while index < len(rows):
-        label = str(rows[index][0] if rows[index] else "").strip()
-        upper = label.upper()
-        if not label or upper in {
-            "GRAND TOTAL",
-            "TOTAL SPORTS WAGERING",
-            "RETAIL SPORTS WAGERING",
-            "ONLINE SPORTS WAGERING",
-        }:
-            index += 1
-            continue
-        if index + 15 >= len(rows):
-            break
-        if (
-            normalize_label(rows[index + 1][0] if rows[index + 1] else "") != "total sports wagering"
-            or normalize_label(rows[index + 2][0] if rows[index + 2] else "") != "handle*"
-            or normalize_label(rows[index + 3][0] if rows[index + 3] else "") != "revenue"
-        ):
-            index += 1
-            continue
+    for index, label in _iter_operator_blocks(rows):
         block_fiscal = _extract_fiscal_block(rows, index, col_to_label)
         for month_label, vals in block_fiscal.items():
             fiscal_by_op[(month_label, label)] = vals
-        index += 16
     return fiscal_by_op
 
 
@@ -764,8 +749,8 @@ def fetch(
                 refreshed = refresh_cached_if_stale(
                     path,
                     data,
-                    fetcher=lambda: download_fy_workbook(
-                        fy_start, fy_end, anchors=_ensure_anchors(), report=report, log=logger,
+                    fetcher=lambda fs=fy_start, fe=fy_end: download_fy_workbook(
+                        fs, fe, anchors=_ensure_anchors(), report=report, log=logger,
                     ),
                     validate=lambda payload: payload.startswith(b"PK"),
                     offline=offline,

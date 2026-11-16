@@ -400,104 +400,135 @@ def _group_page_word_lines(page) -> list[list[dict]]:
     return lines
 
 
-def parse_iowa_pdf_details(
+def _extract_details_from_page(
+    page,
+    text_upper: str,
+    kind: str | None,
+    month_banner: str | None,
+    by_label: dict[str, list[IowaDetailRow]],
+) -> tuple[str | None, str | None]:
+    rev_match = _REV_HEADER_RE.search(text_upper)
+    onl_match = _ONL_HEADER_RE.search(text_upper)
+    if rev_match or onl_match:
+        kind = "rev" if rev_match else "online"
+        month_banner = (rev_match or onl_match).group(1).splitlines()[0].strip()
+    elif "ADVANCED DEPOSIT" in text_upper or "FANTASY SPORTS" in text_upper:
+        return None, None
+    if not kind or not month_banner or any(tok in month_banner for tok in ("FISCAL", "THROUGH", "FYTD")):
+        return kind, month_banner
+    try:
+        label = datetime.strptime(month_banner.title(), "%B %Y").strftime("%b %Y")
+    except ValueError:
+        return kind, month_banner
+
+    lines = _group_page_word_lines(page)
+    blocks: list[tuple[list[list[dict]], dict[str, list[dict]]]] = []
+    header_lines: list[list[dict]] = []
+    metric_rows: dict[str, list[dict]] = {}
+    for line in lines:
+        full_upper = " ".join(w["text"] for w in line).upper().strip()
+        if "SPORTS WAGERING REVENUE REPORT" in full_upper or "ONLINE SPORTS WAGERING BY OPERATOR" in full_upper:
+            continue
+        money_words = [w for w in line if _WORD_MONEY_RE.match(w["text"])]
+        if money_words:
+            first_money_x = money_words[0]["x0"]
+            left_txt = " ".join(w["text"] for w in line if w["x0"] < first_money_x - 2).upper().strip()
+            if left_txt in _DETAIL_METRIC_LABELS:
+                metric_rows[left_txt] = money_words
+                continue
+        if metric_rows:
+            blocks.append((header_lines, metric_rows))
+            header_lines = []
+            metric_rows = {}
+        if line[0]["x0"] < 100 and full_upper != "TOTALS":
+            continue
+        if not money_words:
+            header_lines.append(line)
+    if metric_rows:
+        blocks.append((header_lines, metric_rows))
+    if not blocks:
+        return kind, month_banner
+
+    entries = by_label.setdefault(label, [])
+    for hdrs, mrows in blocks:
+        ref_key = "RETAIL HANDLE" if kind == "rev" else (
+            "INTERNET HANDLE" if "INTERNET HANDLE" in mrows else "HANDLE"
+        )
+        rev_key = "RETAIL NET RECEIPTS" if kind == "rev" else (
+            "INTERNET NET RECEIPTS" if "INTERNET NET RECEIPTS" in mrows else "NET RECEIPTS"
+        )
+        if ref_key not in mrows or rev_key not in mrows:
+            continue
+        cols_h = mrows[ref_key]
+        cols_r = mrows[rev_key]
+        ncols = len(cols_h)
+        equal_mrows = [mw for mw in mrows.values() if len(mw) == ncols] or [cols_h]
+        col_x1 = [max(mw[c]["x1"] for mw in equal_mrows) for c in range(ncols)]
+        bounds = [col_x1[c] + 6.0 for c in range(ncols - 1)]
+        names: list[list[str]] = [[] for _ in range(ncols)]
+        for hline in hdrs:
+            for word in hline:
+                mid = (word["x0"] + word["x1"]) / 2.0
+                col_idx = 0
+                while col_idx < len(bounds) and mid > bounds[col_idx]:
+                    col_idx += 1
+                names[col_idx].append(word["text"])
+        for col_idx in range(ncols):
+            raw_name = _SUPERSCRIPT_RE.sub("", " ".join(names[col_idx])).strip()
+            if not raw_name or raw_name.upper() == "TOTALS":
+                continue
+            hv = parse_dollar(cols_h[col_idx]["text"])
+            rw = min(cols_r, key=lambda w: abs(w["x1"] - col_x1[col_idx]))
+            rv = parse_dollar(rw["text"])
+            if hv is None or rv is None or (hv == 0.0 and rv == 0.0):
+                continue
+            if kind == "rev":
+                entries.append((f"{raw_name} (Retail)", hv, rv, hv, rv, None, None))
+            else:
+                entries.append((raw_name, hv, rv, None, None, hv, rv))
+    return kind, month_banner
+
+
+def _extract_iowa_text_and_details(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
-) -> dict[str, list[IowaDetailRow]]:
-    """Extract per-casino retail and per-operator online details keyed by ``'Mon YYYY'``."""
+) -> tuple[str | None, dict[str, list[IowaDetailRow]]]:
+    """Open Iowa PDF once with pdfplumber to extract full text and detail breakdown together."""
     if pdfplumber is None:
-        return {}
+        return None, {}
     by_label: dict[str, list[IowaDetailRow]] = {}
+    page_texts: list[str] = []
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             kind: str | None = None
             month_banner: str | None = None
             for page in pdf.pages:
-                text_upper = (page.extract_text() or "").upper()
-                rev_match = _REV_HEADER_RE.search(text_upper)
-                onl_match = _ONL_HEADER_RE.search(text_upper)
-                if rev_match or onl_match:
-                    kind = "rev" if rev_match else "online"
-                    month_banner = (rev_match or onl_match).group(1).splitlines()[0].strip()
-                elif "ADVANCED DEPOSIT" in text_upper or "FANTASY SPORTS" in text_upper:
-                    kind = None
-                    month_banner = None
-                    continue
-                if not kind or not month_banner or any(tok in month_banner for tok in ("FISCAL", "THROUGH", "FYTD")):
-                    continue
+                page_text = page.extract_text() or ""
+                page_texts.append(page_text)
                 try:
-                    label = datetime.strptime(month_banner.title(), "%B %Y").strftime("%b %Y")
-                except ValueError:
-                    continue
-
-                lines = _group_page_word_lines(page)
-                blocks: list[tuple[list[list[dict]], dict[str, list[dict]]]] = []
-                header_lines: list[list[dict]] = []
-                metric_rows: dict[str, list[dict]] = {}
-                for line in lines:
-                    full_upper = " ".join(w["text"] for w in line).upper().strip()
-                    if "SPORTS WAGERING REVENUE REPORT" in full_upper or "ONLINE SPORTS WAGERING BY OPERATOR" in full_upper:
-                        continue
-                    money_words = [w for w in line if _WORD_MONEY_RE.match(w["text"])]
-                    if money_words:
-                        first_money_x = money_words[0]["x0"]
-                        left_txt = " ".join(w["text"] for w in line if w["x0"] < first_money_x - 2).upper().strip()
-                        if left_txt in _DETAIL_METRIC_LABELS:
-                            metric_rows[left_txt] = money_words
-                            continue
-                    if metric_rows:
-                        blocks.append((header_lines, metric_rows))
-                        header_lines = []
-                        metric_rows = {}
-                    if line[0]["x0"] < 100 and full_upper != "TOTALS":
-                        continue
-                    if not money_words:
-                        header_lines.append(line)
-                if metric_rows:
-                    blocks.append((header_lines, metric_rows))
-                if not blocks:
-                    continue
-
-                entries = by_label.setdefault(label, [])
-                for hdrs, mrows in blocks:
-                    ref_key = "RETAIL HANDLE" if kind == "rev" else (
-                        "INTERNET HANDLE" if "INTERNET HANDLE" in mrows else "HANDLE"
+                    kind, month_banner = _extract_details_from_page(
+                        page, page_text.upper(), kind, month_banner, by_label,
                     )
-                    rev_key = "RETAIL NET RECEIPTS" if kind == "rev" else (
-                        "INTERNET NET RECEIPTS" if "INTERNET NET RECEIPTS" in mrows else "NET RECEIPTS"
-                    )
-                    if ref_key not in mrows or rev_key not in mrows:
-                        continue
-                    cols_h = mrows[ref_key]
-                    cols_r = mrows[rev_key]
-                    ncols = len(cols_h)
-                    equal_mrows = [mw for mw in mrows.values() if len(mw) == ncols] or [cols_h]
-                    col_x1 = [max(mw[c]["x1"] for mw in equal_mrows) for c in range(ncols)]
-                    bounds = [col_x1[c] + 6.0 for c in range(ncols - 1)]
-                    names: list[list[str]] = [[] for _ in range(ncols)]
-                    for hline in hdrs:
-                        for word in hline:
-                            mid = (word["x0"] + word["x1"]) / 2.0
-                            col_idx = 0
-                            while col_idx < len(bounds) and mid > bounds[col_idx]:
-                                col_idx += 1
-                            names[col_idx].append(word["text"])
-                    for col_idx in range(ncols):
-                        raw_name = _SUPERSCRIPT_RE.sub("", " ".join(names[col_idx])).strip()
-                        if not raw_name or raw_name.upper() == "TOTALS":
-                            continue
-                        hv = parse_dollar(cols_h[col_idx]["text"])
-                        rw = min(cols_r, key=lambda w: abs(w["x1"] - col_x1[col_idx]))
-                        rv = parse_dollar(rw["text"])
-                        if hv is None or rv is None or (hv == 0.0 and rv == 0.0):
-                            continue
-                        if kind == "rev":
-                            entries.append((f"{raw_name} (Retail)", hv, rv, hv, rv, None, None))
-                        else:
-                            entries.append((raw_name, hv, rv, None, None, hv, rv))
+                except Exception as exc:
+                    log(f"WARN could not extract Iowa detail breakdown: {exc}")
     except Exception as exc:
-        log(f"WARN could not extract Iowa detail breakdown: {exc}")
+        log(f"WARN pdfplumber failed on Iowa PDF: {exc}")
+        return None, {}
+    combined = "\n".join(page_texts)
+    return (combined if combined.strip() else None), by_label
+
+
+def parse_iowa_pdf_details(
+    data: bytes,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> dict[str, list[IowaDetailRow]]:
+    """Extract per-casino retail and per-operator online details keyed by ``'Mon YYYY'``."""
+    _text, by_label = _extract_iowa_text_and_details(data, log=log)
     return by_label
+
+
+_ORIG_EXTRACT_PDF_TEXT = extract_pdf_text
+_ORIG_PARSE_IOWA_DETAILS = parse_iowa_pdf_details
 
 
 def parse_iowa_pdf(
@@ -506,10 +537,19 @@ def parse_iowa_pdf(
     *,
     label_hint: str | None = None,
 ) -> ParsedIowaMetrics | None:
-    text = extract_pdf_text(data, log=log)
+    if (
+        pdfplumber is not None
+        and extract_pdf_text is _ORIG_EXTRACT_PDF_TEXT
+        and parse_iowa_pdf_details is _ORIG_PARSE_IOWA_DETAILS
+    ):
+        text, detail_map = _extract_iowa_text_and_details(data, log=log)
+        if not text:
+            text = extract_pdf_text(data, log=log)
+    else:
+        text = extract_pdf_text(data, log=log)
+        detail_map = parse_iowa_pdf_details(data, log=log) if text else {}
     if not text:
         return None
-    detail_map = parse_iowa_pdf_details(data, log=log)
     matched_details: tuple[IowaDetailRow, ...] = ()
     if label_hint and label_hint in detail_map:
         matched_details = tuple(detail_map[label_hint])
@@ -634,11 +674,20 @@ def build_archive_lookup(
             if data is None:
                 log(f"WARN could not load FY archive PDF media/{media_id}")
                 continue
-            text = extract_pdf_text(data, log=log)
+            if (
+                pdfplumber is not None
+                and extract_pdf_text is _ORIG_EXTRACT_PDF_TEXT
+                and parse_iowa_pdf_details is _ORIG_PARSE_IOWA_DETAILS
+            ):
+                text, detail_lookup = _extract_iowa_text_and_details(data, log=log)
+                if not text:
+                    text = extract_pdf_text(data, log=log)
+            else:
+                text = extract_pdf_text(data, log=log)
+                detail_lookup = parse_iowa_pdf_details(data, log=log) if text else {}
             if not text:
                 log(f"WARN could not extract text from Iowa FY archive {fy[0]}-{fy[1]}")
                 continue
-            detail_lookup = parse_iowa_pdf_details(data, log=log)
             for month, year, label in months:
                 if get_fy(month, year) != fy or label in archive_lookup:
                     continue
@@ -731,7 +780,10 @@ def fetch(
                 log_skip(logger, label, "no matching local PDF or known media ID")
                 continue
             total_handle, total_revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue = parsed_result.metrics
-            operator_details = build_operator_results(iso_month, parsed_result.details)
+            operator_details = build_operator_results(
+                iso_month,
+                [(*op_row, op_row[2], None, None) for op_row in parsed_result.details],
+            )
             item = finalize_state_month(
                 state=STATE_NAME,
                 iso_month=iso_month,

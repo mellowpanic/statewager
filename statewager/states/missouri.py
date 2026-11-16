@@ -224,6 +224,12 @@ def detail_operator_key(operator: str) -> str:
     return _NON_ALNUM_RE.sub(" ", clean_operator_name(operator).lower()).strip()
 
 
+def _fiscal_operator_key(operator: str) -> str:
+    cleaned = clean_operator_name(operator).replace("'", "").replace("\u2019", "")
+    normalized = _NON_ALNUM_RE.sub(" ", cleaned.lower()).strip()
+    return normalized.replace("fanatics sportsbook", "fanatics")
+
+
 def parse_licensee_line(line: str, month_token: str) -> tuple[str, float, float] | None:
     if "TOTALS:" in line.upper() or "STATE TOTALS" in line.upper():
         return None
@@ -332,16 +338,17 @@ def _extract_all_dollar_amounts(line: str) -> list[float]:
     ]
 
 
-def parse_page_texts_fiscal(
+def _parse_page_texts_fiscal_full(
     page_texts: list[str],
     year: int,
     month: int,
-) -> tuple[float | None, float | None, dict[str, float]]:
-    """Extract ``(state_gross_revenue, state_tax, {detail_operator_key: tax})`` from MGC page texts."""
+) -> tuple[float | None, float | None, dict[str, float], dict[str, float]]:
+    """Extract ``(state_gross_rev, state_tax, {_fiscal_operator_key: tax}, {_fiscal_operator_key: gross_rev})``."""
     month_token = date(year, month, 1).strftime("%b-%y")
     stat_taxes: dict[str, float] = {}
     detail_gross: dict[str, float] = {}
     op_taxes: dict[str, float] = {}
+    op_gross: dict[str, float] = {}
 
     mode: str | None = None  # "stat_retail", "stat_mobile", "detail_retail", "detail_mobile"
     current_operator: str | None = None
@@ -357,23 +364,27 @@ def parse_page_texts_fiscal(
                 in_summary = True
                 continue
             if "SPORTS WAGERING RETAIL STATISTICAL REPORT" in upper:
+                if mode != "stat_retail":
+                    current_operator = None
                 mode = "stat_retail"
-                current_operator = None
                 in_summary = False
                 continue
             if "SPORTS WAGERING MOBILE STATISTICAL REPORT" in upper:
+                if mode != "stat_mobile":
+                    current_operator = None
                 mode = "stat_mobile"
-                current_operator = None
                 in_summary = False
                 continue
             if "RETAIL DETAIL REPORT" in upper:
+                if mode != "detail_retail":
+                    current_operator = None
                 mode = "detail_retail"
-                current_operator = None
                 in_summary = False
                 continue
             if "MOBILE DETAIL REPORT" in upper:
+                if mode != "detail_mobile":
+                    current_operator = None
                 mode = "detail_mobile"
-                current_operator = None
                 in_summary = False
                 continue
             if "DETAIL REPORT" in upper:
@@ -385,6 +396,7 @@ def parse_page_texts_fiscal(
                 continue
 
             if line.startswith("STATE TOTALS MTD:") or line.startswith("STATE TOTALS:"):
+                current_operator = None
                 amounts = _extract_all_dollar_amounts(line)
                 if mode in ("stat_retail", "stat_mobile") and len(amounts) >= 4:
                     stat_taxes.setdefault(mode, amounts[3])
@@ -392,25 +404,48 @@ def parse_page_texts_fiscal(
                     detail_gross.setdefault(mode, amounts[2])
                 continue
 
+            if mode in ("detail_retail", "detail_mobile"):
+                if current_operator and line.startswith("TOTALS:"):
+                    amounts = _extract_all_dollar_amounts(line)
+                    if len(amounts) >= 3:
+                        k = _fiscal_operator_key(current_operator)
+                        op_gross[k] = op_gross.get(k, 0.0) + amounts[2]
+                    current_operator = None
+                elif "TOTALS" not in upper and month_token in line:
+                    prefix, _, _ = line.partition(month_token)
+                    op_name = clean_operator_name(prefix)
+                    if op_name:
+                        current_operator = op_name
+                continue
+
             if "STATE TOTALS" in upper or "TOTALS:" in upper:
                 continue
 
-            if mode in ("stat_retail", "stat_mobile"):
-                month_match = ROW_MONTH_RE.search(line)
-                if month_match and _CHANNEL_SUFFIX_RE.search(line[:month_match.start()]):
-                    current_operator = clean_operator_name(line[:month_match.start()])
-                if month_token in line:
-                    prefix, _, _ = line.partition(month_token)
-                    op_name = clean_operator_name(prefix) or current_operator
-                    if op_name:
-                        current_operator = op_name
-                        amounts = _extract_all_dollar_amounts(line)
-                        if len(amounts) >= 4:
-                            k = detail_operator_key(op_name)
-                            op_taxes[k] = op_taxes.get(k, 0.0) + amounts[3]
+            month_match = ROW_MONTH_RE.search(line)
+            if month_match and _CHANNEL_SUFFIX_RE.search(line[:month_match.start()]):
+                current_operator = clean_operator_name(line[:month_match.start()])
+            if month_token in line:
+                prefix, _, _ = line.partition(month_token)
+                op_name = clean_operator_name(prefix) or current_operator
+                if op_name:
+                    current_operator = op_name
+                    amounts = _extract_all_dollar_amounts(line)
+                    if len(amounts) >= 4:
+                        k = _fiscal_operator_key(op_name)
+                        op_taxes[k] = op_taxes.get(k, 0.0) + amounts[3]
 
     state_gross_rev = sum(detail_gross.values()) if detail_gross else None
     state_tax = sum(stat_taxes.values()) if stat_taxes else None
+    return state_gross_rev, state_tax, op_taxes, op_gross
+
+
+def parse_page_texts_fiscal(
+    page_texts: list[str],
+    year: int,
+    month: int,
+) -> tuple[float | None, float | None, dict[str, float]]:
+    """Extract ``(state_gross_revenue, state_tax, {operator_key: tax})`` from MGC page texts."""
+    state_gross_rev, state_tax, op_taxes, _op_gross = _parse_page_texts_fiscal_full(page_texts, year, month)
     return state_gross_rev, state_tax, op_taxes
 
 
@@ -432,6 +467,7 @@ def _parse_pdf_with_fiscal(
     float | None,
     float | None,
     dict[str, float],
+    dict[str, float],
 ] | None:
     if pdfplumber is None:
         raise RuntimeError("pdfplumber is required to parse Missouri PDFs")
@@ -443,7 +479,9 @@ def _parse_pdf_with_fiscal(
             mobile = parse_report_state_totals(page_texts, "SPORTS WAGERING MOBILE STATISTICAL REPORT")
             if retail is not None and mobile is not None:
                 details = parse_report_details(page_texts, year, month)
-                state_gross_rev, state_tax, op_taxes = parse_page_texts_fiscal(page_texts, year, month)
+                state_gross_rev, state_tax, op_taxes, op_gross = _parse_page_texts_fiscal_full(
+                    page_texts, year, month,
+                )
                 core = (
                     retail[0] + mobile[0],
                     retail[1] + mobile[1],
@@ -453,7 +491,7 @@ def _parse_pdf_with_fiscal(
                     mobile[1],
                     details,
                 )
-                return core, state_gross_rev, state_tax, op_taxes
+                return core, state_gross_rev, state_tax, op_taxes, op_gross
             text = "\n".join(page_texts)
     except Exception as exc:
         log(f"WARN could not parse Missouri PDF: {exc}")
@@ -488,7 +526,7 @@ def _parse_pdf_with_fiscal(
         mobile[1],
         [],
     )
-    return core, None, None, {}
+    return core, None, None, {}, {}
 
 
 def parse_pdf(
@@ -623,10 +661,15 @@ def fetch(
             if parsed_fiscal is None:
                 log_skip(logger, label, "no parseable MGC PDF")
                 continue
-            core, state_gross_rev, state_tax, op_taxes = parsed_fiscal
+            core, state_gross_rev, state_tax, op_taxes, op_gross = parsed_fiscal
             handle, revenue, retail_handle, retail_revenue, mobile_handle, mobile_revenue, details = core
             enriched_details = [
-                (*op_tuple, None, None, op_taxes.get(detail_operator_key(op_tuple[0])))
+                (
+                    *op_tuple,
+                    op_gross.get(_fiscal_operator_key(op_tuple[0])),
+                    None,
+                    op_taxes.get(_fiscal_operator_key(op_tuple[0])),
+                )
                 for op_tuple in details
             ]
             operator_details = build_operator_results(iso_month, enriched_details)

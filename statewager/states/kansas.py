@@ -330,6 +330,41 @@ def _extract_pdftotext_raw(data: bytes, first_page: int = 1, last_page: int = 1)
     return text.split("\f", 1)[0] if text else None
 
 
+class _KsPdfPageCache:
+    """Lazy per-PDF cache for page-1 pdftotext -raw and pdfplumber tables/text."""
+
+    def __init__(self, data: bytes, log: Callable[[str], None] = _DEFAULT_LOG) -> None:
+        self.data = data
+        self.log = log
+        self._has_raw = False
+        self._raw_text: str | None = None
+        self._has_pdf = False
+        self._has_pages = False
+        self._tables: list[list[list[str | None]]] = []
+        self._page_text = ""
+
+    def raw_text(self) -> str | None:
+        if not self._has_raw:
+            self._raw_text = _extract_pdftotext_raw(self.data)
+            self._has_raw = True
+        return self._raw_text
+
+    def pdf_page0(self) -> tuple[bool, list[list[list[str | None]]], str]:
+        if not self._has_pdf:
+            self._has_pdf = True
+            if pdfplumber is not None:
+                try:
+                    with pdfplumber.open(io.BytesIO(self.data)) as pdf:
+                        if pdf.pages:
+                            self._has_pages = True
+                            page = pdf.pages[0]
+                            self._tables = page.extract_tables() or []
+                            self._page_text = page.extract_text() or ""
+                except Exception as exc:
+                    self.log(f"WARN could not parse Kansas PDF with pdfplumber: {exc}")
+        return self._has_pages, self._tables, self._page_text
+
+
 def _extract_pdf_label(text: str) -> str | None:
     month_match = TEXT_MONTH_RE.search(text)
     if not month_match:
@@ -348,39 +383,35 @@ def _count_usable_words(text: str) -> int:
 def parse_summary_pdf(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    _page_cache: _KsPdfPageCache | None = None,
 ) -> tuple[tuple[float, float], str] | None:
-    fallback_text = _extract_pdftotext_raw(data)
+    cache = _page_cache or _KsPdfPageCache(data, log)
+    fallback_text = cache.raw_text()
     if fallback_text:
         extracted = _extract_from_text(fallback_text)
         if extracted is not None:
             return (extracted[0], extracted[1]), "pdftotext_raw"
     if pdfplumber is not None:
-        try:
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                if not pdf.pages:
-                    log("WARN Kansas PDF contained no pages")
-                    return None
-                page = pdf.pages[0]
-                total = None
-                for table in page.extract_tables():
-                    for row in table:
-                        label = normalize_pdf_label(row[0] if row else "")
-                        handle = parse_dollar(row[2]) if len(row) > 2 else None
-                        revenue = parse_dollar(row[3]) if len(row) > 3 else None
-                        if handle is None or revenue is None:
-                            continue
-                        if label == "totals":
-                            total = (handle, revenue)
-                if total is not None:
-                    return total, "pdfplumber_table"
-                text = page.extract_text() or ""
-        except Exception as exc:
-            log(f"WARN could not parse Kansas PDF with pdfplumber: {exc}")
-        else:
-            if not _looks_fragmented_text(text):
-                extracted = _extract_from_text(text)
-                if extracted is not None:
-                    return (extracted[0], extracted[1]), "pdfplumber_text"
+        has_pages, tables, text = cache.pdf_page0()
+        if not has_pages:
+            return None
+        total = None
+        for table in tables:
+            for row in table:
+                label = normalize_pdf_label(row[0] if row else "")
+                handle = parse_dollar(row[2]) if len(row) > 2 else None
+                revenue = parse_dollar(row[3]) if len(row) > 3 else None
+                if handle is None or revenue is None:
+                    continue
+                if label == "totals":
+                    total = (handle, revenue)
+        if total is not None:
+            return total, "pdfplumber_table"
+        if text and not _looks_fragmented_text(text):
+            extracted = _extract_from_text(text)
+            if extracted is not None:
+                return (extracted[0], extracted[1]), "pdfplumber_text"
     log("WARN Kansas PDF parse returned no totals from table or text")
     return None
 
@@ -389,9 +420,12 @@ def parse_detail_pdf(
     data: bytes,
     month_label: str,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    _page_cache: _KsPdfPageCache | None = None,
 ) -> tuple[tuple[float, float, float | None, float | None, float | None, float | None], str] | None:
     """Parse Kansas detail splits."""
-    fallback_text = _extract_pdftotext_raw(data)
+    cache = _page_cache or _KsPdfPageCache(data, log)
+    fallback_text = cache.raw_text()
     label = _extract_pdf_label(fallback_text or "") or month_label
     usable_word_counts: list[int] = []
     if fallback_text:
@@ -400,22 +434,16 @@ def parse_detail_pdf(
         if extracted is not None:
             return extracted, "pdftotext_raw"
     if pdfplumber is not None:
-        try:
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                if not pdf.pages:
-                    log("WARN Kansas detail PDF contained no pages")
-                    return None
-                text = pdf.pages[0].extract_text() or ""
-        except Exception as exc:
-            log(f"WARN could not parse Kansas detail PDF with pdfplumber: {exc}")
-        else:
-            usable_word_counts.append(_count_usable_words(text))
-            if not _looks_fragmented_text(text):
-                extracted = _extract_from_text(text)
-                if extracted is not None:
-                    return extracted, "pdfplumber_text"
-            if label is None:
-                label = _extract_pdf_label(text)
+        has_pages, _tables, text = cache.pdf_page0()
+        if not has_pages:
+            return None
+        usable_word_counts.append(_count_usable_words(text))
+        if not _looks_fragmented_text(text):
+            extracted = _extract_from_text(text)
+            if extracted is not None:
+                return extracted, "pdfplumber_text"
+        if label is None:
+            label = _extract_pdf_label(text)
     if label in DETAIL_IMAGE_OVERRIDES:
         return DETAIL_IMAGE_OVERRIDES[label], "image_override"
     max_usable_words = max(usable_word_counts, default=0)
@@ -468,9 +496,12 @@ def parse_detail_operators(
     data: bytes,
     month_label: str,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    _page_cache: _KsPdfPageCache | None = None,
 ) -> list[tuple[str, float, float, float | None, float | None, float | None, float | None]]:
     """Extract per-(casino, provider) retail + online wagers and net revenues from Kansas detail PDFs."""
-    fallback_text = _extract_pdftotext_raw(data)
+    cache = _page_cache or _KsPdfPageCache(data, log)
+    fallback_text = cache.raw_text()
     label = _extract_pdf_label(fallback_text or "") or month_label
     if label in DETAIL_OPERATOR_OVERRIDES:
         return list(DETAIL_OPERATOR_OVERRIDES[label])
@@ -479,32 +510,28 @@ def parse_detail_operators(
     order: list[str] = []
 
     if pdfplumber is not None:
-        try:
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                if pdf.pages:
-                    tables = pdf.pages[0].extract_tables()
-                    rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
-                    if len(rows) >= 10:
-                        section = "retail"
-                        for row in rows:
-                            c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
-                            c2_low = str(row[2] if len(row) > 2 else "").lower()
-                            if "casino" in c0 or "settled" in c2_low:
-                                continue
-                            if "subtotal - retail" in c0:
-                                section = "online"
-                                continue
-                            if "subtotal - online" in c0 or c0 == "totals":
-                                break
-                            casino = _WS_RE.sub(" ", str(row[0] or "").strip())
-                            provider = _WS_RE.sub(" ", str(row[1] if len(row) > 1 else "").strip())
-                            if not casino or not provider:
-                                continue
-                            handle = _parse_ks_cell_amount(row[2] if len(row) > 2 else None)
-                            revenue = _parse_ks_cell_amount(row[7] if len(row) > 7 else None)
-                            _record_ks_operator_row(merged, order, casino, provider, section, handle, revenue)
-        except Exception as exc:
-            log(f"WARN could not parse Kansas operator table with pdfplumber for {month_label}: {exc}")
+        has_pages, tables, _text = cache.pdf_page0()
+        if has_pages:
+            rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
+            if len(rows) >= 10:
+                section = "retail"
+                for row in rows:
+                    c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
+                    c2_low = str(row[2] if len(row) > 2 else "").lower()
+                    if "casino" in c0 or "settled" in c2_low:
+                        continue
+                    if "subtotal - retail" in c0:
+                        section = "online"
+                        continue
+                    if "subtotal - online" in c0 or c0 == "totals":
+                        break
+                    casino = _WS_RE.sub(" ", str(row[0] or "").strip())
+                    provider = _WS_RE.sub(" ", str(row[1] if len(row) > 1 else "").strip())
+                    if not casino or not provider:
+                        continue
+                    handle = _parse_ks_cell_amount(row[2] if len(row) > 2 else None)
+                    revenue = _parse_ks_cell_amount(row[7] if len(row) > 7 else None)
+                    _record_ks_operator_row(merged, order, casino, provider, section, handle, revenue)
 
     if not merged and fallback_text:
         section = "retail"
@@ -565,41 +592,39 @@ def _ks_fiscal_key(casino: str, provider: str) -> str:
 def parse_summary_fiscal(
     data: bytes,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    _page_cache: _KsPdfPageCache | None = None,
 ) -> tuple[float | None, dict[str, float]]:
     """Extract Monthly Summary ``(statewide_tax, {canonical_op_key: tax})`` from Kansas summary PDFs."""
+    cache = _page_cache or _KsPdfPageCache(data, log)
     state_tax: float | None = None
     op_taxes: dict[str, float] = {}
 
     if pdfplumber is not None:
-        try:
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                if pdf.pages:
-                    tables = pdf.pages[0].extract_tables()
-                    if tables:
-                        for row in tables[0]:
-                            c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
-                            if not c0 or "casino" in c0:
-                                continue
-                            if "fiscal year" in c0:
-                                break
-                            tax_val = parse_dollar(row[4]) if len(row) > 4 else None
-                            if tax_val is None:
-                                continue
-                            if c0 == "totals":
-                                state_tax = tax_val
-                                break
-                            if "subtotal -" in c0:
-                                continue
-                            casino = _WS_RE.sub(" ", str(row[0] or "").strip())
-                            provider = _WS_RE.sub(" ", str(row[1] if len(row) > 1 else "").strip())
-                            if casino and provider:
-                                k = _ks_fiscal_key(casino, provider)
-                                op_taxes[k] = op_taxes.get(k, 0.0) + tax_val
-        except Exception as exc:
-            log(f"WARN could not parse Kansas summary tax table for fiscal extraction: {exc}")
+        has_pages, tables, _text = cache.pdf_page0()
+        if has_pages and tables:
+            for row in tables[0]:
+                c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
+                if not c0 or "casino" in c0:
+                    continue
+                if "fiscal year" in c0:
+                    break
+                tax_val = parse_dollar(row[4]) if len(row) > 4 else None
+                if tax_val is None:
+                    continue
+                if c0 == "totals":
+                    state_tax = tax_val
+                    break
+                if "subtotal -" in c0:
+                    continue
+                casino = _WS_RE.sub(" ", str(row[0] or "").strip())
+                provider = _WS_RE.sub(" ", str(row[1] if len(row) > 1 else "").strip())
+                if casino and provider:
+                    k = _ks_fiscal_key(casino, provider)
+                    op_taxes[k] = op_taxes.get(k, 0.0) + tax_val
 
     if state_tax is None:
-        fallback_text = _extract_pdftotext_raw(data)
+        fallback_text = cache.raw_text()
         if fallback_text:
             for raw_line in fallback_text.splitlines():
                 collapsed = _BET365_SPACE_RE.sub("BET365", _WS_RE.sub(" ", raw_line).strip())
@@ -643,56 +668,55 @@ def parse_detail_fiscal(
     data: bytes,
     month_label: str,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    _page_cache: _KsPdfPageCache | None = None,
 ) -> tuple[
     tuple[float | None, float | None, float | None],
     dict[str, tuple[float | None, float | None, float | None]],
 ]:
     """Extract ``((gross_rev, promo, tax), {canonical_op_key: (gross_rev, promo, tax)})`` from Kansas detail PDFs."""
+    cache = _page_cache or _KsPdfPageCache(data, log)
     state_fiscal: tuple[float | None, float | None, float | None] = (None, None, None)
     op_buckets: dict[str, list[float]] = {}
 
     if pdfplumber is not None:
-        try:
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                if pdf.pages:
-                    tables = pdf.pages[0].extract_tables()
-                    rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
-                    w_col, p_col, pr_col, tx_col = 2, 3, 4, 9
-                    for row in rows:
-                        if len(row) >= 10 and "casino" in normalize_pdf_label(row[0] or ""):
-                            for idx, cell in enumerate(row):
-                                htxt = normalize_pdf_label(cell or "")
-                                if "settled" in htxt and "wager" in htxt:
-                                    w_col = idx
-                                elif "prizes" in htxt:
-                                    p_col = idx
-                                elif "promotional" in htxt:
-                                    pr_col = idx
-                                elif "state share" in htxt:
-                                    tx_col = idx
-                            continue
-                        if len(row) <= max(w_col, p_col, pr_col, tx_col):
-                            continue
-                        c0 = normalize_pdf_label(row[0] or "")
-                        if "subtotal -" in c0:
-                            continue
-                        wagers = _parse_ks_cell_amount(row[w_col])
-                        prizes = _parse_ks_cell_amount(row[p_col])
-                        gross_rev = wagers - abs(prizes)
-                        promo = abs(_parse_ks_cell_amount(row[pr_col]))
-                        tax = _parse_ks_cell_amount(row[tx_col])
-                        if c0 == "totals":
-                            state_fiscal = (gross_rev, promo, tax)
-                            break
-                        casino = _WS_RE.sub(" ", str(row[0] or "").strip())
-                        provider = _WS_RE.sub(" ", str(row[1] or "").strip())
-                        if casino and provider:
-                            _add_ks_fiscal(op_buckets, _ks_fiscal_key(casino, provider), gross_rev, promo, tax)
-        except Exception as exc:
-            log(f"WARN could not parse Kansas detail fiscal table for {month_label}: {exc}")
+        has_pages, tables, _text = cache.pdf_page0()
+        if has_pages:
+            rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
+            w_col, p_col, pr_col, tx_col = 2, 3, 4, 9
+            for row in rows:
+                if len(row) >= 10 and "casino" in normalize_pdf_label(row[0] or ""):
+                    for idx, cell in enumerate(row):
+                        htxt = normalize_pdf_label(cell or "")
+                        if "settled" in htxt and "wager" in htxt:
+                            w_col = idx
+                        elif "prizes" in htxt:
+                            p_col = idx
+                        elif "promotional" in htxt:
+                            pr_col = idx
+                        elif "state share" in htxt:
+                            tx_col = idx
+                    continue
+                if len(row) <= max(w_col, p_col, pr_col, tx_col):
+                    continue
+                c0 = normalize_pdf_label(row[0] or "")
+                if "subtotal -" in c0:
+                    continue
+                wagers = _parse_ks_cell_amount(row[w_col])
+                prizes = _parse_ks_cell_amount(row[p_col])
+                gross_rev = wagers - abs(prizes)
+                promo = abs(_parse_ks_cell_amount(row[pr_col]))
+                tax = _parse_ks_cell_amount(row[tx_col])
+                if c0 == "totals":
+                    state_fiscal = (gross_rev, promo, tax)
+                    break
+                casino = _WS_RE.sub(" ", str(row[0] or "").strip())
+                provider = _WS_RE.sub(" ", str(row[1] or "").strip())
+                if casino and provider:
+                    _add_ks_fiscal(op_buckets, _ks_fiscal_key(casino, provider), gross_rev, promo, tax)
 
     if state_fiscal == (None, None, None):
-        fallback_text = _extract_pdftotext_raw(data)
+        fallback_text = cache.raw_text()
         if fallback_text:
             for raw_line in fallback_text.splitlines():
                 collapsed = _BET365_SPACE_RE.sub("BET365", _WS_RE.sub(" ", raw_line).strip())
@@ -728,12 +752,7 @@ def parse_detail_fiscal(
     return state_fiscal, op_fiscal
 
 
-def parse_local_file(
-    local_dir: str,
-    month: int,
-    year: int,
-    log: Callable[[str], None] = _DEFAULT_LOG,
-) -> tuple[tuple[float, float], str] | None:
+def _find_local_summary_bytes(local_dir: str, month: int, year: int) -> bytes | None:
     full_month = date(year, month, 1).strftime("%B").lower()
     short_month = date(year, month, 1).strftime("%b").lower()
     for entry in sorted(os.listdir(local_dir)):
@@ -742,8 +761,21 @@ def parse_local_file(
         lower = entry.lower()
         if str(year) in lower and (full_month in lower or short_month in lower):
             with open(os.path.join(local_dir, entry), "rb") as file_handle:
-                return parse_summary_pdf(file_handle.read(), log=log)
+                return file_handle.read()
     return None
+
+
+def parse_local_file(
+    local_dir: str,
+    month: int,
+    year: int,
+    log: Callable[[str], None] = _DEFAULT_LOG,
+) -> tuple[tuple[float, float], str] | None:
+    data = _find_local_summary_bytes(local_dir, month, year)
+    return parse_summary_pdf(data, log=log) if data is not None else None
+
+
+_ORIG_PARSE_LOCAL_FILE = parse_local_file
 
 
 def fetch(
@@ -781,8 +813,15 @@ def fetch(
             chosen_url: str | None = None
 
             summary_data_bytes: bytes | None = None
+            summary_cache: _KsPdfPageCache | None = None
             if local_dir:
-                summary_parsed = parse_local_file(local_dir, month, year, log=logger)
+                if parse_local_file is _ORIG_PARSE_LOCAL_FILE:
+                    summary_data_bytes = _find_local_summary_bytes(local_dir, month, year)
+                    if summary_data_bytes is not None:
+                        summary_cache = _KsPdfPageCache(summary_data_bytes, logger)
+                        summary_parsed = parse_summary_pdf(summary_data_bytes, log=logger, _page_cache=summary_cache)
+                else:
+                    summary_parsed = parse_local_file(local_dir, month, year, log=logger)
                 if summary_parsed:
                     logger(f"INFO {label}: using local file")
                     chosen_url = KS_SUMMARY_PAGE
@@ -852,7 +891,8 @@ def fetch(
                 )
                 if summary_data:
                     summary_data_bytes = summary_data
-                    summary_parsed = parse_summary_pdf(summary_data, log=logger)
+                    summary_cache = _KsPdfPageCache(summary_data, logger)
+                    summary_parsed = parse_summary_pdf(summary_data, log=logger, _page_cache=summary_cache)
                     chosen_url = url or KS_SUMMARY_PAGE
                     if summary_parsed is None:
                         logger(f"WARN {label}: PDF parse returned no totals")
@@ -927,14 +967,17 @@ def fetch(
             summary_tax: float | None = None
             summary_op_tax: dict[str, float] = {}
             if summary_data_bytes:
-                summary_tax, summary_op_tax = parse_summary_fiscal(summary_data_bytes, log=logger)
+                summary_tax, summary_op_tax = parse_summary_fiscal(
+                    summary_data_bytes, log=logger, _page_cache=summary_cache,
+                )
 
             state_gross_rev: float | None = None
             state_promo: float | None = None
             state_tax: float | None = summary_tax
             operator_details = []
             if detail_data:
-                detail_parsed = parse_detail_pdf(detail_data, label, log=logger)
+                detail_cache = _KsPdfPageCache(detail_data, logger)
+                detail_parsed = parse_detail_pdf(detail_data, label, log=logger, _page_cache=detail_cache)
                 if detail_parsed is not None:
                     (
                         detail_handle,
@@ -948,7 +991,9 @@ def fetch(
                     summary_strategy = f"detail_{detail_strategy}"
                     chosen_url = detail_url or chosen_url or KS_DETAIL_PAGE
                     logger(f"INFO {label}: parsed detail splits via {detail_strategy}")
-                    detail_state_fiscal, detail_op_fiscal = parse_detail_fiscal(detail_data, label, log=logger)
+                    detail_state_fiscal, detail_op_fiscal = parse_detail_fiscal(
+                        detail_data, label, log=logger, _page_cache=detail_cache,
+                    )
                     d_gross, d_promo, d_tax = detail_state_fiscal
                     if d_gross is not None:
                         state_gross_rev = d_gross
@@ -956,7 +1001,7 @@ def fetch(
                         state_promo = d_promo
                     if d_tax is not None:
                         state_tax = d_tax
-                    raw_ops = parse_detail_operators(detail_data, label, log=logger)
+                    raw_ops = parse_detail_operators(detail_data, label, log=logger, _page_cache=detail_cache)
                     enriched_ops = []
                     for op_tuple in raw_ops:
                         op_key = op_tuple[0]

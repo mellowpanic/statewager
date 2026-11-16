@@ -28,6 +28,7 @@ from ..model import (
     finalize_state_month,
     format_iso_month,
     log_skip,
+    parse_month_spec,
     resolve_fetch_months,
 )
 from ..parse import is_number
@@ -259,6 +260,11 @@ def _scan_cache_dir(
         if classification:
             label, channel = classification
             per_month.setdefault(label, {}).setdefault(channel, []).append(full_path)
+            try:
+                month_dt = parse_month_spec(label)
+                dated_channel_files.setdefault(channel, []).append(((month_dt.year, month_dt.month), full_path))
+            except ValueError:
+                pass
             continue
         cum_class = classify_cumulative_filename(entry)
         if cum_class:

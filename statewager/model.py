@@ -61,7 +61,7 @@ MONTH_NAME_TO_NUM: dict[str, int] = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class OperatorMonthResult:
     """Operator- or property-level breakdown for a single state-month."""
 
@@ -120,8 +120,15 @@ def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
         text = value.strip()
         if "-" in text:
             parts = text.split("-")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                return date(int(parts[0]), int(parts[1]), 1)
+            if len(parts) == 2:
+                if parts[0].isdigit() and parts[1].isdigit():
+                    return date(int(parts[0]), int(parts[1]), 1)
+                mon = MONTH_NAME_TO_NUM.get(parts[0].lower())
+                if mon is not None and parts[1].isdigit():
+                    return date(int(parts[1]), mon, 1)
+            elif len(parts) == 3 and all(p.isdigit() for p in parts):
+                parsed_full = date(int(parts[0]), int(parts[1]), int(parts[2]))
+                return date(parsed_full.year, parsed_full.month, 1)
         parts = text.split()
         if len(parts) == 2:
             mon = MONTH_NAME_TO_NUM.get(parts[0].lower())
@@ -539,10 +546,10 @@ def finalize_state_month(
         hold=hold_pct(total_h, total_r),
         retail_handle=rh,
         retail_revenue=rr,
-        retail_hold=hold_pct(rh, rr) if rh else None,
+        retail_hold=hold_pct(rh, rr),
         mobile_handle=mh,
         mobile_revenue=mr,
-        mobile_hold=hold_pct(mh, mr) if mh else None,
+        mobile_hold=hold_pct(mh, mr),
         source_url=source_url,
         extra=extra if extra is not None else {},
         details=details if details is not None else [],

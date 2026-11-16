@@ -7,15 +7,22 @@ Static CSV and HTML publisher built on top of `statewager`.
 ## Outputs
 
 - `docs/data/<state>.csv` — Per-state monthly time series (`illinois.csv`, `indiana.csv`, `iowa.csv`, `kansas.csv`, `louisiana.csv`, `mississippi.csv`, `missouri.csv`, `nevada.csv`, `ohio.csv`, `pennsylvania.csv`).
-- `docs/data/all.csv` — Combined dataset across all states sorted by `(state, month)`.
-- `docs/index.html` — Static interactive table and SVG chart that fetches `data/all.csv` and `data/<state>.csv` in the browser with vanilla JavaScript (no bundler or external CDN dependencies).
+- `docs/data/all.csv` — Combined statewide dataset across all states sorted by `(state, month)`.
+- `docs/data/details/<state>.csv` & `docs/data/details/all.csv` — Operator/venue & normalized brand breakdown across the 7 disclosing jurisdictions (`illinois`, `indiana`, `iowa`, `kansas`, `missouri`, `ohio`, `pennsylvania`).
+- `docs/index.html` — Static interactive table and SVG chart viewer in vanilla JavaScript supporting `Monthly` / `Rolling 3M` / `TTM (12M)` windows, `Brand Handle/Revenue Share (%)`, multi-series `Compare`, same-store YoY growth & hold Δ (bps), regulator release freshness badges, fiscal columns, shareable query-parameter links, and client-side View CSV export.
 
-### CSV Schema
+### CSV Schemas
 
-All CSV files share the 12 core fields of `statewager.StateMonthResult`:
+Statewide CSVs (`docs/data/*.csv`, 15 columns):
 
 ```text
-state,month,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url
+state,month,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url,gross_revenue,promo_deductions,tax
+```
+
+Operator/brand detail CSVs (`docs/data/details/*.csv`, 17 columns):
+
+```text
+state,month,operator,brand,handle,revenue,hold,retail_handle,retail_revenue,retail_hold,mobile_handle,mobile_revenue,mobile_hold,source_url,gross_revenue,promo_deductions,tax
 ```
 
 ## Usage

@@ -130,6 +130,8 @@ def build_main_row(
 ) -> list[object]:
     """Build a standard 10-column main-tab row from validated metrics."""
     hold = hold_pct(handle, revenue)
+    r_hold = hold_pct(retail_handle, retail_revenue)
+    m_hold = hold_pct(mobile_handle, mobile_revenue)
     return [
         label,
         round_or_blank(handle),
@@ -137,10 +139,10 @@ def build_main_row(
         hold if hold is not None else "",
         round_or_blank(retail_handle),
         round_or_blank(retail_revenue),
-        hold_pct(retail_handle, retail_revenue) if retail_handle else "",
+        r_hold if r_hold is not None else "",
         round_or_blank(mobile_handle),
         round_or_blank(mobile_revenue),
-        hold_pct(mobile_handle, mobile_revenue) if mobile_handle else "",
+        m_hold if m_hold is not None else "",
     ]
 
 
