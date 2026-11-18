@@ -21,6 +21,11 @@ from .parse import ensure_xlsx
 if TYPE_CHECKING:
     from .discover import DiscoveryReport
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
 _THREAD_LOCAL = threading.local()
 _SESSION_LOCK = threading.Lock()
 _CREATED_SESSIONS: weakref.WeakSet[requests.Session] = weakref.WeakSet()
@@ -45,6 +50,7 @@ def _get_session() -> requests.Session:
     session = getattr(_THREAD_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
+        session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
         adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
         session.mount("https://", adapter)
         session.mount("http://", adapter)

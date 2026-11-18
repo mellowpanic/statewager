@@ -22,7 +22,7 @@ Standalone Python library and static CSV/HTML publisher for official U.S. state 
 
 ## Automated Data Refresh
 
-A scheduled GitHub Actions workflow (`.github/workflows/refresh-data.yml`) runs every other day (`17 13 */2 * *` UTC) and supports manual `workflow_dispatch` triggers with a configurable `months` input (`3` by default), tolerating transient single-state regulator outages while preserving previously published rows in `docs/data/`.
+A scheduled GitHub Actions workflow (`.github/workflows/refresh-data.yml`) runs twice daily (`23 6,18 * * *` UTC) and supports manual `workflow_dispatch` triggers with a configurable `months` input (`4` by default), tolerating transient single-state regulator outages while preserving previously published rows in `docs/data/`.
 
 ## Quick Start
 

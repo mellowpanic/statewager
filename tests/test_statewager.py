@@ -1057,7 +1057,7 @@ def test_viewer_html_features_and_workflow_file() -> None:
     workflow_path = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows" / "refresh-data.yml"
     if workflow_path.exists():
         wf = workflow_path.read_text(encoding="utf-8")
-        assert "17 13 */2 * *" in wf
+        assert "23 6,18 * * *" in wf
         assert "workflow_dispatch" in wf
         assert "python -m publish" in wf
 
@@ -1335,6 +1335,12 @@ def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) ->
     assert 'scope="col"' in html
     assert "ensureNonZeroRange" in html
     assert "csvInFlight" in html
+
+    # Pooled HTTP session uses a standard browser User-Agent for WAF-protected portals (e.g. KS Lottery)
+    sw_http._THREAD_LOCAL.session = None
+    sess = sw_http._get_session()
+    assert sess.headers.get("User-Agent") == sw_http.DEFAULT_USER_AGENT
+    assert "Chrome/" in sw_http.DEFAULT_USER_AGENT
 
 
 

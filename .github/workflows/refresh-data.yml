@@ -2,14 +2,14 @@ name: Refresh Regulatory Data
 
 on:
   schedule:
-    # Run every other day at 13:17 UTC to stay well within free Actions minutes.
-    - cron: '17 13 */2 * *'
+    # Run twice daily at 06:23 and 18:23 UTC (unlimited/free on public repos).
+    - cron: '23 6,18 * * *'
   workflow_dispatch:
     inputs:
       months:
         description: 'Trailing completed months to refresh'
         required: false
-        default: '3'
+        default: '4'
         type: string
 
 permissions:
@@ -46,7 +46,7 @@ jobs:
 
       - name: Refresh trailing regulatory months
         env:
-          REFRESH_MONTHS: ${{ inputs.months || '3' }}
+          REFRESH_MONTHS: ${{ inputs.months || '4' }}
         run: |
           if ! [[ "$REFRESH_MONTHS" =~ ^[1-9][0-9]*$ ]]; then
             echo "Invalid months input: $REFRESH_MONTHS" >&2
