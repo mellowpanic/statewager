@@ -16,6 +16,7 @@ from .csv_writer import (
     write_combined_detail_csv,
     write_state_csv,
     write_state_detail_csv,
+    write_status_json,
 )
 from .site import render_index_html, write_index_html
 
@@ -36,4 +37,5 @@ __all__ = [
     "write_index_html",
     "write_state_csv",
     "write_state_detail_csv",
+    "write_status_json",
 ]

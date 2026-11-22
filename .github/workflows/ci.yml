@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/data/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Ensure poppler-utils is installed
+        run: |
+          if ! command -v pdftotext >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends poppler-utils
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dev dependencies and run pytest
+        run: |
+          pip install -e ".[dev]"
+          pytest -v
+
+      - name: Validate viewer JS and status manifest
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const vm = require('vm');
+          const assert = require('assert');
+          const html = fs.readFileSync('docs/index.html', 'utf8');
+          const m = html.match(/<script>\s*([\s\S]*?)\s*<\/script>/);
+          assert(m, 'missing <script> block in docs/index.html');
+          new vm.Script(m[1]);
+          const status = JSON.parse(fs.readFileSync('docs/data/status.json', 'utf8'));
+          assert(typeof status.data_hash === 'string' && status.data_hash.length === 16);
+          assert(status.state_count >= 10 && status.states);
+          console.log('CI viewer + status.json validation OK');
+          NODE

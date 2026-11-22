@@ -332,12 +332,14 @@ def parse_month_section(
     text: str,
     label: str,
     log: Callable[[str], None] = _DEFAULT_LOG,
+    *,
+    missing_level: str = "WARN",
 ) -> ParsedIowaMetrics | None:
     heading_label = datetime.strptime(label, "%b %Y").strftime("%B %Y").upper()
     heading = f"SPORTS WAGERING REVENUE REPORT -- {heading_label}"
     start = text.upper().find(heading)
     if start < 0:
-        log(f"WARN Iowa archive section not found for {label}")
+        log(f"{missing_level} Iowa archive section not found for {label}")
         return None
     next_marker = text.upper().find("SPORTS WAGERING REVENUE REPORT -- ", start + len(heading))
     section = text[start: next_marker if next_marker >= 0 else None]
@@ -637,10 +639,11 @@ def build_archive_lookup(
             if not text:
                 log(f"WARN could not extract text from Iowa FY archive {fy[0]}-{fy[1]}")
                 continue
+            missing_level = "INFO" if recent_fy_cache_ttl(fy[1]) is not None else "WARN"
             for month, year, label in months:
                 if fiscal_year_july(year, month) != fy or label in archive_lookup:
                     continue
-                parsed = parse_month_section(text, label, log=log)
+                parsed = parse_month_section(text, label, log=log, missing_level=missing_level)
                 if parsed is not None:
                     archive_lookup[label] = ParsedIowaMetrics(
                         metrics=parsed.metrics,
@@ -649,7 +652,7 @@ def build_archive_lookup(
                         tax=parsed.tax,
                     )
                 else:
-                    log(f"WARN Iowa FY archive did not yield totals for {label}")
+                    log(f"{missing_level} Iowa FY archive did not yield totals for {label}")
         except Exception as exc:
             log(f"WARN failed Iowa FY archive processing for {fy[0]}-{fy[1]}: {exc}")
     return archive_lookup

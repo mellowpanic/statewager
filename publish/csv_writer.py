@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import csv
+import hashlib
+import json
 import os
 import re
 import tempfile
@@ -10,6 +13,7 @@ from typing import Callable, Iterable, Mapping, Sequence, TextIO
 
 from statewager.model import _DC_SLOTS, CORE_RESULT_FIELDS, StateMonthResult, hold_pct, safe_float, sum_optional
 from statewager.operators import classify_operator_brand, normalize_operator_name
+from statewager.states import load_state_module
 
 CSV_HEADERS: list[str] = [
     *CORE_RESULT_FIELDS,
@@ -432,3 +436,108 @@ def write_combined_detail_csv(details_dir: str, all_rows: Iterable[PublishedDeta
         details_dir, "all.csv", DETAIL_CSV_HEADERS, all_rows,
         sort_key=lambda r: (r.state, r.month, r.operator), row_fn=detail_to_csv_row,
     )
+
+
+def _month_diff_ym(later: str, earlier: str) -> int:
+    if not later or not earlier:
+        return 0
+    try:
+        ly, lm = map(int, later.split("-"))
+        ey, em = map(int, earlier.split("-"))
+        return (ly - ey) * 12 + (lm - em)
+    except ValueError:
+        return 0
+
+
+def _csv_digest(data_dir: str) -> str:
+    hasher = hashlib.sha256()
+    for rel in ("all.csv", os.path.join("details", "all.csv")):
+        path = os.path.join(data_dir, rel)
+        raw = b""
+        if os.path.isfile(path):
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        hasher.update(len(raw).to_bytes(8, "big"))
+        hasher.update(raw)
+    return hasher.hexdigest()[:16]
+
+
+def write_status_json(
+    data_dir: str,
+    state_rows: Sequence[StateMonthResult],
+    detail_rows: Sequence[PublishedDetailRow],
+    state_options: Sequence[tuple[str, str]],
+    *,
+    now_utc: datetime | None = None,
+) -> str:
+    """Write ``<data_dir>/status.json`` with per-state freshness metadata and content hash."""
+    out_path = os.path.join(data_dir, "status.json")
+    months_by_state: dict[str, list[str]] = {}
+    for row in state_rows:
+        months_by_state.setdefault(row.state, []).append(row.month)
+    detail_counts: dict[str, int] = {}
+    for drow in detail_rows:
+        detail_counts[drow.state] = detail_counts.get(drow.state, 0) + 1
+
+    all_months = [r.month for r in state_rows if r.month]
+    peer_latest = max(all_months) if all_months else ""
+
+    entries: dict[str, str] = {slug: display for slug, display in state_options}
+    known_names = set(entries.values())
+    for state_name in months_by_state:
+        if state_name not in known_names:
+            entries[state_name.lower().replace(" ", "_")] = state_name
+
+    states_payload: dict[str, dict[str, object]] = {}
+    for slug in sorted(entries):
+        display = entries[slug]
+        ms = sorted(months_by_state.get(display, ()))
+        earliest = ms[0] if ms else ""
+        latest = ms[-1] if ms else ""
+        det_count = detail_counts.get(display, 0)
+        try:
+            has_details = bool(getattr(load_state_module(slug), "HAS_DETAILS", False))
+        except ValueError:
+            has_details = det_count > 0
+        states_payload[slug] = {
+            "name": display,
+            "earliest_month": earliest,
+            "latest_month": latest,
+            "months": len(ms),
+            "lag_months": max(0, _month_diff_ym(peer_latest, latest)) if peer_latest and latest else 0,
+            "has_details": has_details,
+            "detail_rows": det_count,
+        }
+
+    data_hash = _csv_digest(data_dir)
+    deterministic = {
+        "data_hash": data_hash,
+        "peer_latest_month": peer_latest,
+        "state_count": len(states_payload),
+        "state_month_rows": len(state_rows),
+        "detail_rows": len(detail_rows),
+        "states": states_payload,
+    }
+
+    if os.path.isfile(out_path):
+        try:
+            with open(out_path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+            if (
+                isinstance(existing, dict)
+                and existing.get("data_hash") == data_hash
+                and isinstance(existing.get("data_updated_at"), str)
+                and {k: v for k, v in existing.items() if k != "data_updated_at"} == deterministic
+            ):
+                return out_path
+        except (OSError, ValueError):
+            pass
+
+    ts_dt = now_utc or datetime.now(timezone.utc)
+    if ts_dt.tzinfo is None:
+        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+    else:
+        ts_dt = ts_dt.astimezone(timezone.utc)
+    payload = {"data_updated_at": ts_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), **deterministic}
+    serialized = json.dumps(payload, indent=2) + "\n"
+    return atomic_write_file(out_path, lambda fh: fh.write(serialized), suffix=".json")

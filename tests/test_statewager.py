@@ -1059,7 +1059,17 @@ def test_viewer_html_features_and_workflow_file() -> None:
         wf = workflow_path.read_text(encoding="utf-8")
         assert "23 6,18 * * *" in wf
         assert "workflow_dispatch" in wf
+        assert "actions/checkout@v7" in wf
+        assert "actions/setup-python@v7" in wf
+        assert "--jobs 10" in wf
+        assert "--recheck-months 2" in wf
         assert "python -m publish" in wf
+        ci_path = workflow_path.parent / "ci.yml"
+        assert ci_path.exists()
+        ci_wf = ci_path.read_text(encoding="utf-8")
+        assert "pytest -v" in ci_wf
+        assert "docs/data/**" in ci_wf
+        assert "actions/checkout@v7" in ci_wf
 
 
 def test_critique_core_fixes_and_single_pass_parsers(tmp_path: pathlib.Path, monkeypatch) -> None:
@@ -1341,6 +1351,102 @@ def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) ->
     sess = sw_http._get_session()
     assert sess.headers.get("User-Agent") == sw_http.DEFAULT_USER_AGENT
     assert "Chrome/" in sw_http.DEFAULT_USER_AGENT
+    sess.close()
+    sw_http._THREAD_LOCAL.session = None
+
+
+def test_maintenance_status_json_and_recheck_months(tmp_path: pathlib.Path, monkeypatch) -> None:
+    import datetime
+    import json
+    import pytest
+    import publish.__main__ as pub_main
+    from publish.csv_writer import write_status_json
+    from publish.site import render_index_html
+    from statewager.states import iowa, nevada
+
+    # Iowa FY archive missing sections log INFO for current FY and WARN for closed FY
+    today = datetime.date.today()
+    cur_fy_end = today.year + (1 if today.month >= 7 else 0)
+    monkeypatch.setattr(iowa, "download_pdf", lambda *_a, **_kw: b"%PDF-1.4\n")
+    monkeypatch.setattr(iowa, "_extract_iowa_text_and_detail_map", lambda *_a, **_kw: ("SPORTS WAGERING REVENUE REPORT", {}))
+    ia_cur_logs: list[str] = []
+    iowa.build_archive_lookup(
+        [(8, cur_fy_end - 1, f"Aug {cur_fy_end - 1}")],
+        None,
+        log=ia_cur_logs.append,
+        fy_lookup={(cur_fy_end - 1, cur_fy_end): 999001},
+    )
+    assert ia_cur_logs and all(not msg.startswith("WARN") for msg in ia_cur_logs)
+    ia_old_logs: list[str] = []
+    iowa.build_archive_lookup(
+        [(8, 2022, "Aug 2022")],
+        None,
+        log=ia_old_logs.append,
+        fy_lookup={(2022, 2023): 999002},
+    )
+    assert any(msg.startswith("WARN Iowa archive section not found") for msg in ia_old_logs)
+
+    # --recheck-months incremental narrowing & status.json idempotency
+    recheck_docs = tmp_path / "recheck_docs"
+    recheck_data = recheck_docs / "data"
+    write_state_csv(
+        str(recheck_data),
+        "nevada",
+        [
+            StateMonthResult("Nevada", "2026-07", 100.0, 10.0, 10.0, None, None, None, None, None, None, None),
+            StateMonthResult("Nevada", "2026-08", 110.0, 11.0, 10.0, None, None, None, None, None, None, None),
+            StateMonthResult("Nevada", "2026-09", 120.0, 12.0, 10.0, None, None, None, None, None, None, None),
+        ],
+    )
+    seen_spans: list[tuple[object, object]] = []
+
+    def _fake_nv_fetch(ms, me, **_kw):
+        seen_spans.append((ms, me))
+        return [StateMonthResult("Nevada", "2026-09", 125.0, 12.5, 10.0, None, None, None, None, None, None, None)]
+
+    monkeypatch.setattr(nevada, "fetch", _fake_nv_fetch)
+    pub_main.publish_all(
+        states=["nevada"],
+        month_start=datetime.date(2026, 7, 1),
+        month_end=datetime.date(2026, 10, 1),
+        cache_dir=str(tmp_path / "c3"),
+        docs_dir=str(recheck_docs),
+        merge_existing=True,
+        quiet=True,
+        recheck_months=2,
+    )
+    assert seen_spans[-1] == (datetime.date(2026, 9, 1), datetime.date(2026, 10, 1))
+    status_path = recheck_data / "status.json"
+    assert status_path.is_file()
+    status_1 = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_1["state_count"] == 1
+    assert status_1["states"]["nevada"]["latest_month"] == "2026-09"
+    assert len(status_1["data_hash"]) == 16
+
+    # Rewriting status.json with unchanged CSV bytes must keep data_updated_at identical
+    later = datetime.datetime(2027, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+    nv_rows = read_state_csv(str(recheck_data / "nevada.csv"))
+    write_status_json(str(recheck_data), nv_rows, [], [("nevada", "Nevada")], now_utc=later)
+    status_2 = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_2["data_updated_at"] == status_1["data_updated_at"]
+
+    # When CSV bytes change, hash and data_updated_at update
+    updated_rows = [StateMonthResult("Nevada", "2026-10", 130.0, 13.0, 10.0, None, None, None, None, None, None, None)]
+    write_combined_csv(str(recheck_data), nv_rows + updated_rows)
+    write_status_json(str(recheck_data), nv_rows + updated_rows, [], [("nevada", "Nevada")], now_utc=later)
+    status_3 = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status_3["data_hash"] != status_1["data_hash"]
+    assert status_3["data_updated_at"] == "2027-01-02T03:04:05Z"
+
+    # Invalid --recheck-months is rejected by CLI parser
+    with pytest.raises(SystemExit):
+        pub_main.main(["--recheck-months", "0"])
+
+    # Viewer HTML includes status.json recency hook & freshness badge
+    html = render_index_html()
+    assert "data/status.json" in html
+    assert "freshness-updated" in html
+    assert "fetchStatusMeta" in html
 
 
 

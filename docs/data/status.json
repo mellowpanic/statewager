@@ -1,0 +1,100 @@
+{
+  "data_updated_at": "2026-11-22T01:36:45Z",
+  "data_hash": "8487b19a641e0166",
+  "peer_latest_month": "2026-10",
+  "state_count": 10,
+  "state_month_rows": 255,
+  "detail_rows": 3316,
+  "states": {
+    "illinois": {
+      "name": "Illinois",
+      "earliest_month": "2025-03",
+      "latest_month": "2026-09",
+      "months": 19,
+      "lag_months": 1,
+      "has_details": true,
+      "detail_rows": 276
+    },
+    "indiana": {
+      "name": "Indiana",
+      "earliest_month": "2025-03",
+      "latest_month": "2026-10",
+      "months": 20,
+      "lag_months": 0,
+      "has_details": true,
+      "detail_rows": 340
+    },
+    "iowa": {
+      "name": "Iowa",
+      "earliest_month": "2024-07",
+      "latest_month": "2026-10",
+      "months": 28,
+      "lag_months": 0,
+      "has_details": true,
+      "detail_rows": 832
+    },
+    "kansas": {
+      "name": "Kansas",
+      "earliest_month": "2025-03",
+      "latest_month": "2026-10",
+      "months": 20,
+      "lag_months": 0,
+      "has_details": true,
+      "detail_rows": 136
+    },
+    "louisiana": {
+      "name": "Louisiana",
+      "earliest_month": "2023-01",
+      "latest_month": "2026-10",
+      "months": 46,
+      "lag_months": 0,
+      "has_details": false,
+      "detail_rows": 0
+    },
+    "mississippi": {
+      "name": "Mississippi",
+      "earliest_month": "2025-03",
+      "latest_month": "2026-10",
+      "months": 20,
+      "lag_months": 0,
+      "has_details": false,
+      "detail_rows": 0
+    },
+    "missouri": {
+      "name": "Missouri",
+      "earliest_month": "2025-12",
+      "latest_month": "2026-09",
+      "months": 10,
+      "lag_months": 1,
+      "has_details": true,
+      "detail_rows": 160
+    },
+    "nevada": {
+      "name": "Nevada",
+      "earliest_month": "2025-03",
+      "latest_month": "2026-09",
+      "months": 19,
+      "lag_months": 1,
+      "has_details": false,
+      "detail_rows": 0
+    },
+    "ohio": {
+      "name": "Ohio",
+      "earliest_month": "2023-01",
+      "latest_month": "2026-09",
+      "months": 45,
+      "lag_months": 1,
+      "has_details": true,
+      "detail_rows": 1094
+    },
+    "pennsylvania": {
+      "name": "Pennsylvania",
+      "earliest_month": "2024-07",
+      "latest_month": "2026-10",
+      "months": 28,
+      "lag_months": 0,
+      "has_details": true,
+      "detail_rows": 478
+    }
+  }
+}

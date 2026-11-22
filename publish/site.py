@@ -142,6 +142,12 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
     .fresh-dot.fresh { background: #16a34a; }
     .fresh-dot.lag1 { background: #d97706; }
     .fresh-dot.lag2 { background: #94a3b8; }
+    .freshness-updated {
+      margin-left: auto;
+      font-size: 0.75rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }
     .controls {
       display: flex;
       flex-wrap: wrap;
@@ -582,6 +588,7 @@ __STATE_OPTIONS__
       let hydrated = false;
       let lastCommittedSlug = "__ALL__";
       let copyBtnTimer = null;
+      let statusMeta = null;
       let loadSeq = 0;
       let compareSeq = 0;
       let compareListSeq = 0;
@@ -981,7 +988,39 @@ __STATE_OPTIONS__
           });
           freshnessBar.appendChild(btn);
         });
+        if (statusMeta && statusMeta.data_updated_at) {
+          const upd = formatStatusTimestamp(statusMeta.data_updated_at);
+          if (upd) {
+            const span = document.createElement("span");
+            span.className = "freshness-updated";
+            span.title = `Dataset last updated: ${statusMeta.data_updated_at}`;
+            span.textContent = `Updated ${upd}`;
+            freshnessBar.appendChild(span);
+          }
+        }
         freshnessBar.style.display = "flex";
+      }
+
+      function formatStatusTimestamp(isoStr) {
+        const d = new Date(String(isoStr || ""));
+        if (!Number.isFinite(d.getTime())) return "";
+        const mon = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+        return `${mon} ${d.getUTCDate()}, ${d.getUTCFullYear()} UTC`;
+      }
+
+      async function fetchStatusMeta() {
+        try {
+          const resp = await fetch("data/status.json");
+          if (!resp.ok) return;
+          const parsed = await resp.json();
+          if (!parsed || typeof parsed !== "object") return;
+          statusMeta = parsed;
+          if (csvCache.has("data/all.csv")) {
+            renderFreshnessBar(csvCache.get("data/all.csv"));
+          }
+        } catch (_e) {
+          // Optional metadata; ignore offline or missing status.json.
+        }
       }
 
       async function fetchCachedCsv(cache, url, allow404) {
@@ -2628,6 +2667,7 @@ __STATE_OPTIONS__
       });
 
       readInitialUrlState();
+      fetchStatusMeta();
       loadSelection();
     })();
   </script>

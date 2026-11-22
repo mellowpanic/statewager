@@ -27,6 +27,7 @@ from .csv_writer import (
     write_combined_detail_csv,
     write_state_csv,
     write_state_detail_csv,
+    write_status_json,
 )
 from .site import write_index_html
 
@@ -47,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=13,
         help="Trailing months to fetch when --start-month is omitted (default: 13).",
+    )
+    parser.add_argument(
+        "--recheck-months",
+        type=int,
+        default=None,
+        help="When merging, re-fetch only the latest N trailing months plus any missing months in the window.",
     )
     parser.add_argument(
         "--start-month",
@@ -101,8 +108,9 @@ def publish_all(
     quiet: bool = False,
     merge_existing: bool = True,
     jobs: int = 4,
+    recheck_months: int | None = None,
 ) -> dict[str, list[StateMonthResult]]:
-    """Run ``statewager`` for ``states`` and write ``docs/data/*.csv`` + ``docs/index.html``."""
+    """Run ``statewager`` for ``states`` and write ``docs/data/*.csv`` + ``status.json`` + ``index.html``."""
     cache_dir = (cache_dir or "").strip() or None
     data_dir = os.path.join(docs_dir, "data")
     details_dir = os.path.join(data_dir, "details")
@@ -126,15 +134,33 @@ def publish_all(
         slug: bool(resolve_fetch_months(month_start, month_end, launch_date=getattr(mod, "LAUNCH_DATE", None)))
         for slug, mod in modules
     }
+    fetch_bounds_by_slug: dict[str, tuple[str | date, str | date | None]] = {
+        slug: (month_start, month_end) for slug, _ in modules
+    }
+    if merge_existing and recheck_months is not None and recheck_months >= 1:
+        for slug, mod in modules:
+            target_dates = resolve_fetch_months(
+                month_start, month_end, launch_date=getattr(mod, "LAUNCH_DATE", None),
+            )
+            if not target_dates:
+                continue
+            existing_months = {r.month for r in read_state_csv(os.path.join(data_dir, f"{slug}.csv"))}
+            needed = sorted(
+                set(target_dates[-recheck_months:])
+                | {d for d in target_dates if d.strftime("%Y-%m") not in existing_months}
+            )
+            if needed:
+                fetch_bounds_by_slug[slug] = (needed[0], needed[-1])
     silent_log = (lambda _msg: None) if quiet else None
 
     def _fetch_one(item: tuple[str, object]) -> tuple[list[StateMonthResult], Exception | None]:
         slug, mod = item
+        f_start, f_end = fetch_bounds_by_slug[slug]
         try:
             return (
                 mod.fetch(
-                    month_start,
-                    month_end,
+                    f_start,
+                    f_end,
                     cache_dir=cache_dir,
                     offline=offline,
                     log=silent_log,
@@ -222,6 +248,7 @@ def publish_all(
 
     write_combined_csv(data_dir, combined)
     write_combined_detail_csv(details_dir, combined_details)
+    write_status_json(data_dir, combined, combined_details, state_options)
     write_index_html(docs_dir, state_options)
     return by_state
 
@@ -237,6 +264,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.months < 1:
         parser.error("--months must be >= 1")
+    if args.recheck_months is not None and args.recheck_months < 1:
+        parser.error("--recheck-months must be >= 1")
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
 
@@ -281,12 +310,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         quiet=args.quiet,
         merge_existing=not args.no_merge,
         jobs=args.jobs,
+        recheck_months=args.recheck_months,
     )
     total_rows = sum(len(rows) for rows in by_state.values())
     populated_states = sum(1 for rows in by_state.values() if rows)
     print(
         f"Published {total_rows} state-month rows across {populated_states}/{len(by_state)} states "
-        f"into {args.docs_dir}/ (all.csv + per-state CSVs + index.html)"
+        f"into {args.docs_dir}/ (all.csv + per-state CSVs + status.json + index.html)"
     )
     return 0
 
