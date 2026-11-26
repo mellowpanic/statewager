@@ -4,7 +4,9 @@ from __future__ import annotations
 import atexit
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import ipaddress
 import json
+import math
 import random
 import re
 import threading
@@ -16,7 +18,7 @@ import weakref
 import requests
 from requests.adapters import HTTPAdapter
 
-from .parse import ensure_xlsx
+from .parse import PDF_MAGIC, XLS_BIFF_MAGIC, XLS_SIGNATURES, XLSX_MAGIC, ensure_xlsx
 
 if TYPE_CHECKING:
     from .discover import DiscoveryReport
@@ -45,16 +47,57 @@ def _close_all_sessions() -> None:
 atexit.register(_close_all_sessions)
 
 
+_MAX_RETRY_AFTER_SECONDS = 60.0
+_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
+
+
+def _is_disallowed_host(hostname: str) -> bool:
+    host = hostname.strip(".").lower()
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+def _validate_http_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Unsupported or invalid URL: {url!r}")
+    if _is_disallowed_host(parsed.hostname):
+        raise ValueError(f"Blocked private or local URL host: {url!r}")
+
+
+class _SafeSession(requests.Session):
+    """Session enforcing SSRF and scheme checks before following redirects."""
+
+    def resolve_redirects(self, resp, req, **kwargs):  # type: ignore[override]
+        for next_req in super().resolve_redirects(resp, req, **kwargs):
+            if next_req.url:
+                _validate_http_url(next_req.url)
+            yield next_req
+
+
 def _get_session() -> requests.Session:
     """Return a thread-local pooled HTTP session."""
     session = getattr(_THREAD_LOCAL, "session", None)
     if session is None:
-        session = requests.Session()
+        session = _SafeSession()
         session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
         adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         _THREAD_LOCAL.session = session
+        weakref.finalize(session, session.close)
         with _SESSION_LOCK:
             _CREATED_SESSIONS.add(session)
     return session
@@ -64,20 +107,28 @@ def _resolve_retry_after(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        delay = float(value)
     except ValueError:
         pass
+    else:
+        if not math.isfinite(delay):
+            return None
+        return min(_MAX_RETRY_AFTER_SECONDS, max(0.0, delay))
     try:
         retry_at = parsedate_to_datetime(value)
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
     if retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=timezone.utc)
-    return max(0.0, retry_at.timestamp() - time.time())
+    delay = retry_at.timestamp() - time.time()
+    if not math.isfinite(delay):
+        return None
+    return min(_MAX_RETRY_AFTER_SECONDS, max(0.0, delay))
 
 
 def _sleep_with_jitter(base_seconds: float, *, jitter_max: float = 0.35) -> None:
-    time.sleep(max(0.0, base_seconds) + random.uniform(0.0, jitter_max))
+    safe_base = max(0.0, base_seconds) if math.isfinite(base_seconds) else 0.0
+    time.sleep(safe_base + random.uniform(0.0, jitter_max))
 
 
 def retry_request(
@@ -89,14 +140,23 @@ def retry_request(
     headers: dict[str, str] | None = None,
     session: requests.Session | None = None,
     data: bytes | str | dict[str, object] | None = None,
+    stream: bool = False,
 ) -> requests.Response:
     """HTTP request with retry/backoff for transient failures."""
+    _validate_http_url(url)
     client = session if session is not None else _get_session()
     attempts = max(1, retries)
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            response = client.request(method, url, timeout=timeout, headers=headers, data=data)
+            req_kwargs: dict[str, object] = {
+                "timeout": timeout,
+                "headers": headers,
+                "data": data,
+            }
+            if stream:
+                req_kwargs["stream"] = True
+            response = client.request(method, url, **req_kwargs)
             if response.status_code in {429, 503} and attempt < attempts:
                 retry_after = _resolve_retry_after(response.headers.get("Retry-After"))
                 response.close()
@@ -105,12 +165,32 @@ def retry_request(
                 continue
             if response.status_code == 404:
                 return response
-            if 500 <= response.status_code < 600 and attempt < attempts:
+            if (500 <= response.status_code < 600 or response.status_code == 408) and attempt < attempts:
                 response.close()
                 _sleep_with_jitter(float(attempt))
                 continue
-            response.raise_for_status()
+            if 400 <= response.status_code < 500 and response.status_code not in {408, 429}:
+                err = requests.HTTPError(
+                    f"{response.status_code} Client Error for url: {url}",
+                    response=response,
+                )
+                response.close()
+                raise err
+            try:
+                response.raise_for_status()
+            except Exception:
+                response.close()
+                raise
             return response
+        except (requests.exceptions.InvalidURL, requests.exceptions.InvalidSchema):
+            raise
+        except requests.HTTPError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if isinstance(status, int) and 400 <= status < 500 and status not in {408, 429}:
+                raise
+            last_exc = exc
+            if attempt < attempts:
+                _sleep_with_jitter(float(attempt))
         except requests.RequestException as exc:
             last_exc = exc
             if attempt < attempts:
@@ -125,6 +205,7 @@ def retry_get(
     *,
     headers: dict[str, str] | None = None,
     session: requests.Session | None = None,
+    stream: bool = False,
 ) -> requests.Response:
     """HTTP GET with retry loop. Returns response on success and raises on final failure."""
     return retry_request(
@@ -134,7 +215,34 @@ def retry_get(
         timeout=timeout,
         headers=headers,
         session=session,
+        stream=stream,
     )
+
+
+def _read_bounded_bytes(response: requests.Response, max_bytes: int) -> bytes:
+    headers = getattr(response, "headers", None)
+    if headers:
+        raw_len = headers.get("Content-Length")
+        if raw_len is not None:
+            try:
+                content_len = int(raw_len)
+            except (TypeError, ValueError):
+                content_len = -1
+            if content_len > max_bytes:
+                raise ValueError(f"HTTP response Content-Length {content_len} exceeds limit {max_bytes}")
+    iter_fn = getattr(response, "iter_content", None)
+    if callable(iter_fn):
+        chunks = bytearray()
+        for chunk in iter_fn(chunk_size=65536):
+            if chunk:
+                chunks.extend(chunk)
+                if len(chunks) > max_bytes:
+                    raise ValueError(f"HTTP response body exceeds limit of {max_bytes} bytes")
+        return bytes(chunks)
+    data = response.content
+    if data is not None and len(data) > max_bytes:
+        raise ValueError(f"HTTP response body exceeds limit of {max_bytes} bytes")
+    return data
 
 
 def fetch_bytes(
@@ -144,13 +252,16 @@ def fetch_bytes(
     *,
     headers: dict[str, str] | None = None,
     session: requests.Session | None = None,
+    max_bytes: int = _MAX_RESPONSE_BYTES,
 ) -> bytes | None:
     """HTTP GET returning bytes, or None on 404. Retries 429/5xx/timeouts."""
-    response = retry_get(url, retries=retries, timeout=timeout, headers=headers, session=session)
+    response = retry_get(
+        url, retries=retries, timeout=timeout, headers=headers, session=session, stream=True,
+    )
     try:
         if response.status_code == 404:
             return None
-        return response.content
+        return _read_bounded_bytes(response, max_bytes)
     finally:
         close = getattr(response, "close", None)
         if callable(close):
@@ -171,7 +282,7 @@ def fetch_text(
     return data.decode(encoding, errors="replace") if data else None
 
 
-_XLS_SIGNATURES = (b"PK", b"\xd0\xcf\x11\xe0")
+_XLS_SIGNATURES = XLS_SIGNATURES
 _HTML_PREFIXES = (b"<!doctype", b"<html", b"<head", b"<body", b"<script", b"<!--")
 _NON_DIGIT_RE = re.compile(r"[^0-9]")
 _WAYBACK_TS_RE = re.compile(r"\d{4,14}")
@@ -180,9 +291,9 @@ _WAYBACK_TS_RE = re.compile(r"\d{4,14}")
 def _signature_from_extension(url: str) -> bytes | None:
     lower = urlparse(url).path.lower()
     if lower.endswith(".pdf"):
-        return b"%PDF"
+        return PDF_MAGIC
     if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return b"PK"
+        return XLSX_MAGIC
     return None
 
 
@@ -196,10 +307,11 @@ def _matches_signature(
     if signature_check == "auto":
         lower = urlparse(url).path.lower()
         if lower.endswith(".xls"):
-            return data.startswith(_XLS_SIGNATURES)
-        ext_sig = _signature_from_extension(url)
-        if ext_sig is not None:
-            return data.startswith(ext_sig)
+            return data.startswith(XLS_SIGNATURES)
+        if lower.endswith(".xlsx"):
+            return data.startswith(XLSX_MAGIC)
+        if lower.endswith(".pdf"):
+            return data.startswith(PDF_MAGIC)
         if not lower.endswith((".html", ".htm")):
             head = data.lstrip()[:64].lower()
             if head.startswith(_HTML_PREFIXES):
@@ -207,7 +319,9 @@ def _matches_signature(
         return True
     if isinstance(signature_check, (bytes, bytearray)):
         return data.startswith(bytes(signature_check))
-    return True
+    if signature_check is None:
+        return True
+    raise ValueError(f"Unsupported signature_check value: {signature_check!r}")
 
 
 def _should_try_wayback(timestamp_yyyymm: str | None) -> bool:
@@ -222,7 +336,7 @@ def _should_try_wayback(timestamp_yyyymm: str | None) -> bool:
     except ValueError:
         return True
     if not (1 <= month <= 12):
-        return True
+        return False
     now = datetime.now(timezone.utc)
     return (year, month) < (now.year, now.month)
 
@@ -236,12 +350,11 @@ def _fetch_wayback_snapshot(
     timeout: int = 30,
     log: Callable[[str], None] | None = None,
 ) -> bytes | None:
-    now_ym = datetime.now(timezone.utc).strftime("%Y%m")
-    timestamp = (timestamp_yyyymm or now_ym).replace("-", "")
-    if not _WAYBACK_TS_RE.fullmatch(timestamp):
-        if log:
+    timestamp = (timestamp_yyyymm or "").replace("-", "")
+    if not timestamp or not _WAYBACK_TS_RE.fullmatch(timestamp):
+        if timestamp_yyyymm and log:
             log(f"WARN invalid wayback timestamp {timestamp_yyyymm!r}; using today")
-        timestamp = now_ym
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m")
     api_url = (
         f"https://archive.org/wayback/available?url={requests.utils.quote(url, safe=':/')}"
         f"&timestamp={timestamp}"
@@ -268,14 +381,24 @@ def _fetch_wayback_snapshot(
         return None
     snapshots = payload.get("archived_snapshots")
     closest = snapshots.get("closest") if isinstance(snapshots, dict) else None
-    if not isinstance(closest, dict):
+    if not isinstance(closest, dict) or closest.get("available") is False:
         return None
     snapshot_url = closest.get("url")
     snapshot_ts = closest.get("timestamp")
-    if not snapshot_url:
+    if not snapshot_url or not isinstance(snapshot_url, str):
         if log:
             log(f"WARN wayback has no snapshot for {url}")
         return None
+    parsed_snap = urlparse(snapshot_url)
+    snap_host = (parsed_snap.hostname or "").lower()
+    if parsed_snap.scheme.lower() not in {"http", "https"} or (
+        snap_host not in {"web.archive.org", "archive.org"} and not snap_host.endswith(".archive.org")
+    ):
+        if log:
+            log(f"WARN rejecting untrusted wayback snapshot URL: {snapshot_url!r}")
+        return None
+    if parsed_snap.scheme.lower() == "http":
+        snapshot_url = parsed_snap._replace(scheme="https").geturl()
     if log:
         log(f"INFO wayback snapshot ts={snapshot_ts} url={snapshot_url}")
     try:
@@ -338,14 +461,16 @@ def _accept_probe_payload(
     if not data:
         return None
     if convert_xls:
-        if data.startswith(b"\xd0\xcf\x11\xe0"):
+        if data.startswith(XLS_BIFF_MAGIC):
             if log:
                 log(f"INFO downloaded legacy XLS from {url}; converting to XLSX")
             return ensure_xlsx(data, log=log)
-        if not data.startswith(b"PK"):
+        if not data.startswith(XLSX_MAGIC):
             if log:
                 log(f"WARN {url} returned non-Excel content; skipping")
             return None
+        if signature_check in ("auto", XLSX_MAGIC, None):
+            return data
     if not _matches_signature(data, url, signature_check):
         if log:
             log(f"WARN {url} failed signature check")
@@ -363,6 +488,16 @@ def _record_probe(
 ) -> None:
     if report is not None and report_key is not None:
         report.add_probe(report_key, url, status=status, reason=reason)
+
+
+def _record_live_failure(
+    report: DiscoveryReport | None,
+    report_key: str | None,
+    url: str,
+    live_failures: dict[str, tuple[str, str]],
+) -> None:
+    status, reason = live_failures[url]
+    _record_probe(report, report_key, url, status=status, reason=reason)
 
 
 def _record_probe_hit(
@@ -420,8 +555,7 @@ def probe_url_variants(
 
     if not try_wayback:
         for url in urls:
-            status, reason = live_failures.get(url, ("fail", "fetch-failed"))
-            _record_probe(report, report_key, url, status=status, reason=reason)
+            _record_live_failure(report, report_key, url, live_failures)
         if log and wayback_timestamp:
             log(f"INFO skipping Wayback lookup for current/future period {wayback_timestamp}")
         return None
@@ -442,6 +576,5 @@ def probe_url_variants(
                 report, report_key, url, matched_url, "wayback", f"INFO downloaded from Wayback for {url}", log
             )
             return accepted
-        status, reason = live_failures.get(url, ("fail", "fetch-failed"))
-        _record_probe(report, report_key, url, status=status, reason=reason)
+        _record_live_failure(report, report_key, url, live_failures)
     return None

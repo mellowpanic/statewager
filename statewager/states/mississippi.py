@@ -13,7 +13,9 @@ from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_ca
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
+    MONTH_ABBR,
     StateMonthResult,
+    build_region_extra,
     build_state_logger,
     finalize_state_month,
     format_iso_month,
@@ -21,17 +23,14 @@ from ..model import (
     log_skip,
     resolve_fetch_months,
 )
-from ..parse import ensure_xlsx, is_number, open_xlsx_workbook
+from ..parse import clean_lower, ensure_xlsx, is_number, is_xls_bytes, open_xlsx_workbook
 
 STATE_NAME = "Mississippi"
 LAUNCH_DATE: date | None = None
+REGION_ORDER = ["Central", "Coastal", "Northern"]
+_REGION_BY_LOWER: frozenset[str] = frozenset(name.lower() for name in REGION_ORDER)
 EXTRA_HEADERS: list[str] = [
-    "Central Handle",
-    "Central Revenue",
-    "Coastal Handle",
-    "Coastal Revenue",
-    "Northern Handle",
-    "Northern Revenue",
+    header for region in REGION_ORDER for header in (f"{region} Handle", f"{region} Revenue")
 ]
 HAS_DETAILS = False
 
@@ -44,7 +43,6 @@ URL_VARIANT_TEMPLATES = [
     "https://www.msgamingcommission.com/files/monthly_reports/{mm}{yy}_Sports_Wagering.xlsx_.xls",
 ]
 BASE_URL = URL_VARIANT_TEMPLATES[0]
-REGION_ORDER = ["Central", "Coastal", "Northern"]
 
 _DEFAULT_LOG = build_state_logger("MS")
 
@@ -87,8 +85,8 @@ def parse_state_totals(
         for sheet in workbook.worksheets:
             region_name = None
             for row in sheet.iter_rows(values_only=True):
-                label = str(row[0] if row else "").strip().lower()
-                if region_name is None and label in {"central", "coastal", "northern"}:
+                label = clean_lower(row[0] if row else "")
+                if label in _REGION_BY_LOWER:
                     region_name = str(row[0]).strip()
                 if "overall for state" in label or "overall for region" in label:
                     handle = row[2] if len(row) > 2 else None
@@ -145,10 +143,10 @@ def fetch(
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
     results: list[StateMonthResult] = []
     for mdate in target_dates:
-        mm = mdate.strftime("%m")
-        yy = mdate.strftime("%y")
-        yyyy = mdate.strftime("%Y")
-        label = mdate.strftime("%b %Y")
+        mm = f"{mdate.month:02d}"
+        yy = f"{mdate.year % 100:02d}"
+        yyyy = f"{mdate.year}"
+        label = f"{MONTH_ABBR[mdate.month]} {mdate.year}"
         iso_month = format_iso_month(mdate.year, mdate.month)
         source_url = BASE_URL.format(mm=mm, yy=yy)
         try:
@@ -167,7 +165,7 @@ def fetch(
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {label}",
                     fetch_error_message=f"could not download Mississippi workbook for {label}",
-                    validate=lambda payload: payload.startswith((b"PK", b"\xd0\xcf\x11\xe0")),
+                    validate=is_xls_bytes,
                     cache_ttl_seconds=recent_cache_ttl(mdate.year, mdate.month),
                     offline=offline,
                 )
@@ -177,15 +175,7 @@ def fetch(
                 log_skip(logger, label, "workbook unavailable or unparseable")
                 continue
             handle, revenue, regions = parsed
-            region_map = {
-                region_name: (region_handle, region_revenue)
-                for region_name, region_handle, region_revenue in regions
-            }
-            extra: dict[str, float | None] = {}
-            for region_name in REGION_ORDER:
-                region_handle, region_revenue = region_map.get(region_name, (None, None))
-                extra[f"{region_name} Handle"] = region_handle
-                extra[f"{region_name} Revenue"] = region_revenue
+            extra = build_region_extra(regions, REGION_ORDER)
             item = finalize_state_month(
                 state=STATE_NAME,
                 iso_month=iso_month,

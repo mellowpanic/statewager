@@ -18,6 +18,7 @@ from ..cache import cache_path, find_local_month_file, load_cached_or_fetch, rec
 from ..discover import DiscoveryReport, crawl_anchors, extract_month_label, parse_text_month
 from ..http import fetch_with_wayback_fallback
 from ..model import (
+    MONTH_ABBR,
     StateMonthResult,
     build_operator_results,
     build_state_logger,
@@ -25,9 +26,19 @@ from ..model import (
     format_iso_month,
     log_month_result,
     log_skip,
+    parse_month_spec,
     resolve_fetch_months,
 )
-from ..parse import PDFPLUMBER_LOCK, clean_lower, collapse_ws, extract_pdf_text, extract_pdf_text_with_ocr, parse_dollar
+from ..parse import (
+    PDF_MAGIC,
+    PDFPLUMBER_LOCK,
+    clean_lower,
+    collapse_ws,
+    extract_pdf_text,
+    extract_pdf_text_with_ocr,
+    is_pdf_bytes,
+    parse_dollar,
+)
 
 STATE_NAME = "Kansas"
 LAUNCH_DATE: date | None = date(2022, 9, 1)
@@ -163,27 +174,20 @@ def scrape_pdf_urls(
         href = unescape(link.get("href", "").strip())
         if not href.lower().endswith(".pdf"):
             if report is not None and href:
-                report.add_classification(
-                    href, title=link.get("title", ""), text=link.get("text", ""), reason="not-pdf",
-                )
+                report.add_unmatched_link(link, "not-pdf", href=href)
             continue
         match = pdf_name_re.search(href)
         if match:
             year, month_num = int(match.group(1)), int(match.group(2))
             if not (1 <= month_num <= 12):
                 continue
-            label = datetime(year, month_num, 1).strftime("%b %Y")
+            label = f"{MONTH_ABBR[month_num]} {year}"
         else:
             meta = " ".join(unescape(link.get(key, "")) for key in ("title", "text"))
             label = parse_text_month(meta) or extract_month_label(" ".join([href, meta]))
             if not label:
                 if report is not None:
-                    report.add_classification(
-                        href,
-                        title=link.get("title", ""),
-                        text=link.get("text", ""),
-                        reason="no-month-token",
-                    )
+                    report.add_unmatched_link(link, "no-month-token", href=href)
                 continue
         full_url = urljoin(KS_LOTTERY_BASE, href)
         urls[label] = full_url
@@ -207,9 +211,9 @@ def build_download_url(
     hash_value = hashes.get(label)
     if not hash_value:
         return None
-    month = datetime.strptime(label, "%b %Y")
+    month = parse_month_spec(label)
     log(f"INFO using hardcoded {kind} hash for {label}")
-    return f"{KS_LOTTERY_BASE}/media/{hash_value}/{filename_prefix}-{month:%Y-%m}.pdf"
+    return f"{KS_LOTTERY_BASE}/media/{hash_value}/{filename_prefix}-{month.year}-{month.month:02d}.pdf"
 
 
 normalize_pdf_label = clean_lower
@@ -219,19 +223,14 @@ def _extract_handle_and_revenue_from_line(line: str) -> tuple[float | None, floa
     tokens = AMOUNT_TOKEN_RE.findall(line)
     if "subtotal -" in normalize_pdf_label(line) and tokens and tokens[0] == "-":
         tokens = tokens[1:]
-    if len(tokens) >= 6:
-        handle = parse_dollar(tokens[0])
-        if handle is None:
-            return None, None
-        revenue = 0.0 if tokens[5] == "-" else parse_dollar(tokens[5])
-        return handle, revenue
-    if len(tokens) >= 2:
-        handle = parse_dollar(tokens[0])
-        if handle is None:
-            return None, None
-        revenue = 0.0 if tokens[1] == "-" else parse_dollar(tokens[1])
-        return handle, revenue
-    return None, None
+    rev_idx = 5 if len(tokens) >= 6 else (1 if len(tokens) >= 2 else None)
+    if rev_idx is None:
+        return None, None
+    handle = parse_dollar(tokens[0])
+    if handle is None:
+        return None, None
+    revenue = 0.0 if tokens[rev_idx] == "-" else parse_dollar(tokens[rev_idx])
+    return handle, revenue
 
 
 _HAS_DIGIT_RE = re.compile(r"\d")
@@ -333,16 +332,25 @@ class _KsPdfPageCache:
         self.log = log
         self._has_raw = False
         self._raw_text: str | None = None
+        self._has_label = False
+        self._label_hint: str | None = None
         self._has_pdf = False
         self._has_pages = False
         self._tables: list[list[list[str | None]]] = []
         self._page_text = ""
+        self._flat_rows: list[list[object]] | None = None
 
     def raw_text(self) -> str | None:
         if not self._has_raw:
             self._raw_text = _extract_pdftotext_raw(self.data)
             self._has_raw = True
         return self._raw_text
+
+    def label_hint(self) -> str | None:
+        if not self._has_label:
+            self._label_hint = parse_text_month(self.raw_text() or "")
+            self._has_label = True
+        return self._label_hint
 
     def pdf_page0(self) -> tuple[bool, list[list[list[str | None]]], str]:
         if not self._has_pdf:
@@ -359,13 +367,13 @@ class _KsPdfPageCache:
                     self.log(f"WARN could not parse Kansas PDF with pdfplumber: {exc}")
         return self._has_pages, self._tables, self._page_text
 
-
-def _extract_pdf_label(text: str) -> str | None:
-    return parse_text_month(text)
-
-
-def _flatten_table_rows(tables: list[list[list[object]]]) -> list[list[object]]:
-    return [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
+    def flattened_rows(self) -> tuple[bool, list[list[object]]]:
+        has_pages, tables, _text = self.pdf_page0()
+        if not has_pages:
+            return False, []
+        if self._flat_rows is None:
+            self._flat_rows = [r for t in tables for r in t if any(c and str(c).strip() for c in r)]
+        return True, self._flat_rows
 
 
 def _count_usable_words(text: str) -> int:
@@ -418,7 +426,7 @@ def parse_detail_pdf(
     """Parse Kansas detail splits."""
     cache = _page_cache or _KsPdfPageCache(data, log)
     fallback_text = cache.raw_text()
-    label = _extract_pdf_label(fallback_text or "") or month_label
+    label = cache.label_hint() or month_label
     usable_word_counts: list[int] = []
     if fallback_text:
         usable_word_counts.append(_count_usable_words(fallback_text))
@@ -453,10 +461,7 @@ def parse_detail_pdf(
 
 
 def _parse_ks_cell_amount(value: object) -> float:
-    text = str(value or "").strip()
-    if not text or text == "-":
-        return 0.0
-    parsed = parse_dollar(text)
+    parsed = parse_dollar(value)
     return 0.0 if parsed is None else parsed
 
 
@@ -492,7 +497,7 @@ def parse_detail_operators(
     """Extract per-(casino, provider) retail + online wagers and net revenues from Kansas detail PDFs."""
     cache = _page_cache or _KsPdfPageCache(data, log)
     fallback_text = cache.raw_text()
-    label = _extract_pdf_label(fallback_text or "") or month_label
+    label = cache.label_hint() or month_label
     if label in DETAIL_OPERATOR_OVERRIDES:
         return list(DETAIL_OPERATOR_OVERRIDES[label])
 
@@ -500,28 +505,26 @@ def parse_detail_operators(
     order: list[str] = []
 
     if pdfplumber is not None:
-        has_pages, tables, _text = cache.pdf_page0()
-        if has_pages:
-            rows = _flatten_table_rows(tables)
-            if len(rows) >= 10:
-                section = "retail"
-                for row in rows:
-                    c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
-                    c2_low = str(row[2] if len(row) > 2 else "").lower()
-                    if "casino" in c0 or "settled" in c2_low:
-                        continue
-                    if "subtotal - retail" in c0:
-                        section = "online"
-                        continue
-                    if "subtotal - online" in c0 or c0 == "totals":
-                        break
-                    casino = collapse_ws(row[0])
-                    provider = collapse_ws(row[1] if len(row) > 1 else "")
-                    if not casino or not provider:
-                        continue
-                    handle = _parse_ks_cell_amount(row[2] if len(row) > 2 else None)
-                    revenue = _parse_ks_cell_amount(row[7] if len(row) > 7 else None)
-                    _record_ks_operator_row(merged, order, casino, provider, section, handle, revenue)
+        has_pages, rows = cache.flattened_rows()
+        if has_pages and len(rows) >= 10:
+            section = "retail"
+            for row in rows:
+                c0 = normalize_pdf_label(row[0] if len(row) > 0 else "")
+                c2_low = str(row[2] if len(row) > 2 else "").lower()
+                if "casino" in c0 or "settled" in c2_low:
+                    continue
+                if "subtotal - retail" in c0:
+                    section = "online"
+                    continue
+                if "subtotal - online" in c0 or c0 == "totals":
+                    break
+                casino = collapse_ws(row[0])
+                provider = collapse_ws(row[1] if len(row) > 1 else "")
+                if not casino or not provider:
+                    continue
+                handle = _parse_ks_cell_amount(row[2] if len(row) > 2 else None)
+                revenue = _parse_ks_cell_amount(row[7] if len(row) > 7 else None)
+                _record_ks_operator_row(merged, order, casino, provider, section, handle, revenue)
 
     if not merged and fallback_text:
         section = "retail"
@@ -547,24 +550,33 @@ def parse_detail_operators(
     output: list[tuple[str, float, float, float | None, float | None, float | None, float | None]] = []
     for key in order:
         rh, rr, mh, mr = merged[key]
-        output.append(
-            (
-                key,
-                (rh or 0.0) + (mh or 0.0),
-                (rr or 0.0) + (mr or 0.0),
-                rh,
-                rr,
-                mh,
-                mr,
-            )
-        )
+        total_h = (rh or 0.0) + (mh or 0.0)
+        total_r = (rr or 0.0) + (mr or 0.0)
+        if total_h == 0.0 and total_r == 0.0:
+            continue
+        output.append((key, total_h, total_r, rh, rr, mh, mr))
     return output
 
 
-def _ks_fiscal_key(casino: str, provider: str) -> str:
+def _ks_fiscal_key(casino: str, provider: str | None = None) -> str:
+    if provider is None:
+        if " - " not in casino:
+            return clean_lower(casino)
+        casino, provider = casino.split(" - ", 1)
     clean_c = clean_lower(casino)
     clean_p = _BET365_SPACE_RE.sub("BET365", collapse_ws(provider)).lower()
     return f"{clean_c} - {clean_p}"
+
+
+def _ks_fiscal_values(
+    raw_wagers: object,
+    raw_prizes: object,
+    raw_promo: object,
+    raw_tax: object,
+) -> tuple[float, float, float]:
+    wagers = _parse_ks_cell_amount(raw_wagers)
+    prizes = _parse_ks_cell_amount(raw_prizes)
+    return wagers - abs(prizes), abs(_parse_ks_cell_amount(raw_promo)), _parse_ks_cell_amount(raw_tax)
 
 
 def parse_summary_fiscal(
@@ -604,6 +616,7 @@ def parse_summary_fiscal(
     if state_tax is None:
         fallback_text = cache.raw_text()
         if fallback_text:
+            op_taxes.clear()
             for raw_line in fallback_text.splitlines():
                 low, casino, provider, tokens = _parse_ks_operator_text_line(raw_line)
                 if "fiscal year" in low:
@@ -660,17 +673,17 @@ def parse_detail_fiscal(
     dict[str, tuple[float | None, float | None, float | None]],
 ]:
     """Extract ``((gross_rev, promo, tax), {canonical_op_key: (gross_rev, promo, tax)})`` from Kansas detail PDFs."""
+    del month_label
     cache = _page_cache or _KsPdfPageCache(data, log)
     state_fiscal: tuple[float | None, float | None, float | None] = (None, None, None)
     op_buckets: dict[str, list[float]] = {}
 
     if pdfplumber is not None:
-        has_pages, tables, _text = cache.pdf_page0()
+        has_pages, rows = cache.flattened_rows()
         if has_pages:
-            rows = _flatten_table_rows(tables)
             w_col, p_col, pr_col, tx_col = 2, 3, 4, 9
             for row in rows:
-                if len(row) >= 10 and "casino" in normalize_pdf_label(row[0] or ""):
+                if len(row) >= 7 and "casino" in normalize_pdf_label(row[0] or ""):
                     for idx, cell in enumerate(row):
                         htxt = normalize_pdf_label(cell or "")
                         if "settled" in htxt and "wager" in htxt:
@@ -687,11 +700,7 @@ def parse_detail_fiscal(
                 c0 = normalize_pdf_label(row[0] or "")
                 if "subtotal -" in c0:
                     continue
-                wagers = _parse_ks_cell_amount(row[w_col])
-                prizes = _parse_ks_cell_amount(row[p_col])
-                gross_rev = wagers - abs(prizes)
-                promo = abs(_parse_ks_cell_amount(row[pr_col]))
-                tax = _parse_ks_cell_amount(row[tx_col])
+                gross_rev, promo, tax = _ks_fiscal_values(row[w_col], row[p_col], row[pr_col], row[tx_col])
                 if c0 == "totals":
                     state_fiscal = (gross_rev, promo, tax)
                     break
@@ -703,19 +712,17 @@ def parse_detail_fiscal(
     if state_fiscal == (None, None, None):
         fallback_text = cache.raw_text()
         if fallback_text:
+            op_buckets.clear()
             for raw_line in fallback_text.splitlines():
                 low, casino, provider, tokens = _parse_ks_operator_text_line(raw_line)
                 if "subtotal -" in low or len(tokens) < 7:
                     continue
-                wagers = _parse_ks_cell_amount(tokens[0])
-                prizes = _parse_ks_cell_amount(tokens[1])
-                promo = abs(_parse_ks_cell_amount(tokens[2]))
-                tax = _parse_ks_cell_amount(tokens[-1])
+                gross_rev, promo, tax = _ks_fiscal_values(tokens[0], tokens[1], tokens[2], tokens[-1])
                 if low.startswith("totals"):
-                    state_fiscal = (wagers - abs(prizes), promo, tax)
+                    state_fiscal = (gross_rev, promo, tax)
                     break
                 if casino and provider:
-                    _add_ks_fiscal(op_buckets, _ks_fiscal_key(casino, provider), wagers - abs(prizes), promo, tax)
+                    _add_ks_fiscal(op_buckets, _ks_fiscal_key(casino, provider), gross_rev, promo, tax)
 
     op_fiscal = {k: (v[0], v[1], v[2]) for k, v in op_buckets.items()}
     return state_fiscal, op_fiscal
@@ -781,7 +788,7 @@ def fetch(
                     logger(f"INFO {label}: no detail PDF discovered; leaving split columns blank")
                 return None
             fetched_url[:] = [target_url]
-            downloaded = fetch_with_wayback_fallback(target_url, timestamp_yyyymm=ts_ym, signature_check=b"%PDF", log=logger)
+            downloaded = fetch_with_wayback_fallback(target_url, timestamp_yyyymm=ts_ym, signature_check=PDF_MAGIC, log=logger)
             if report is not None:
                 report.add_probe(
                     f"{label}:{kind}",
@@ -799,7 +806,7 @@ def fetch(
             cache_hit_message=f"INFO using cached {tag} for {label}",
             fetch_success_message=f"INFO {label}: downloaded {kind} PDF",
             fetch_error_message=f"could not download Kansas {kind} PDF for {label}",
-            validate=lambda payload: payload.startswith(b"%PDF"),
+            validate=is_pdf_bytes,
             cache_ttl_seconds=ttl_seconds,
             offline=offline,
         )
@@ -808,7 +815,7 @@ def fetch(
     for mdate in target_dates:
         month = mdate.month
         year = mdate.year
-        label = mdate.strftime("%b %Y")
+        label = f"{MONTH_ABBR[month]} {year}"
         iso_month = format_iso_month(year, month)
         ts_ym = f"{year}{month:02d}"
         ttl_seconds = recent_cache_ttl(year, month)
@@ -846,7 +853,7 @@ def fetch(
                     summary_data_bytes = summary_data
                     summary_cache = _KsPdfPageCache(summary_data, logger)
                     summary_parsed = parse_summary_pdf(summary_data, log=logger, _page_cache=summary_cache)
-                    chosen_url = url or KS_SUMMARY_PAGE
+                    chosen_url = url
                     if summary_parsed is None:
                         logger(f"WARN {label}: PDF parse returned no totals")
 
@@ -867,10 +874,8 @@ def fetch(
                 ttl_seconds=ttl_seconds,
             )
 
-            summary_tax, summary_op_tax = (
-                parse_summary_fiscal(summary_data_bytes, log=logger, _page_cache=summary_cache)
-                if summary_data_bytes
-                else (None, {})
+            summary_tax, summary_op_tax = parse_summary_fiscal(
+                summary_data_bytes, log=logger, _page_cache=summary_cache,
             )
             state_gross_rev: float | None = None
             state_promo: float | None = None
@@ -905,12 +910,7 @@ def fetch(
                     raw_ops = parse_detail_operators(detail_data, label, log=logger, _page_cache=detail_cache)
                     enriched_ops = []
                     for op_tuple in raw_ops:
-                        op_key = op_tuple[0]
-                        if " - " in op_key:
-                            c_part, p_part = op_key.split(" - ", 1)
-                            canon_key = _ks_fiscal_key(c_part, p_part)
-                        else:
-                            canon_key = op_key.lower()
+                        canon_key = _ks_fiscal_key(op_tuple[0])
                         op_gross, op_promo, op_tax = detail_op_fiscal.get(canon_key, (None, None, None))
                         if op_tax is None:
                             op_tax = summary_op_tax.get(canon_key)

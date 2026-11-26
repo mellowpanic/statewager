@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 import io
+import os
 import re
 from typing import Callable, Optional, Tuple
 
@@ -12,22 +13,45 @@ try:
 except ImportError:
     pdfplumber = None
 
-from ..cache import cache_path, find_local_file, load_cache, load_cached_or_fetch, recent_fy_cache_ttl, save_cache
-from ..discover import AnchorParser, DiscoveryReport, crawl_anchors, extract_month_label
+from ..cache import (
+    cache_age_seconds,
+    cache_path,
+    find_local_file,
+    load_cache,
+    load_cached_or_fetch,
+    recent_cache_ttl,
+    recent_fy_cache_ttl,
+    refresh_cached_if_stale,
+    try_save_cache,
+)
+from ..discover import DiscoveryReport, crawl_anchors, extract_month_label, parse_anchors
 from ..http import fetch_text, fetch_with_wayback_fallback
 from ..model import (
+    _DC_SLOTS,
+    MONTH_ABBR,
+    MONTH_NAMES,
+    OperatorDetailTuple,
     StateMonthResult,
     build_operator_results,
     build_state_logger,
     finalize_state_month,
     fiscal_year_july,
     format_iso_month,
+    format_month_label,
     log_month_result,
     log_skip,
     month_yyyymm,
+    parse_month_spec,
     resolve_fetch_months,
 )
-from ..parse import PDFPLUMBER_LOCK, extract_pdf_text, parse_dollar, strip_superscripts
+from ..parse import (
+    PDF_MAGIC,
+    PDFPLUMBER_LOCK,
+    extract_pdf_text,
+    is_pdf_bytes,
+    parse_dollar,
+    strip_superscripts,
+)
 
 STATE_NAME = "Iowa"
 LAUNCH_DATE: date | None = None
@@ -64,10 +88,10 @@ _COMPACT_LABEL_RE = re.compile(
 )
 
 IowaMetrics = Tuple[float, float, Optional[float], Optional[float], Optional[float], Optional[float]]
-IowaDetailRow = Tuple[str, float, float, Optional[float], Optional[float], Optional[float], Optional[float]]
+IowaDetailRow = OperatorDetailTuple
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, **_DC_SLOTS)
 class ParsedIowaMetrics:
     metrics: IowaMetrics
     layout: str
@@ -124,6 +148,11 @@ def _parse_fy_media_links(links: list[dict[str, str]]) -> dict[tuple[int, int], 
         if not id_match:
             continue
         label = link.get("text") or link.get("title") or ""
+        label_low = f"{label} {link.get('title', '')}".lower()
+        if "sports" not in label_low or any(
+            excluded in label_low for excluded in ("fantasy", "advanced deposit", "amend")
+        ):
+            continue
         fy_key: tuple[int, int] | None = None
         range_match = _FY_RANGE_RE.search(label)
         if range_match:
@@ -162,7 +191,7 @@ def download_pdf(
     return fetch_with_wayback_fallback(
         media_download_url(media_id),
         timestamp_yyyymm=month_yyyymm(label_hint),
-        signature_check=b"%PDF",
+        signature_check=PDF_MAGIC,
         log=log,
     )
 
@@ -178,10 +207,7 @@ def discover_media_ids(log: Callable[[str], None] = _DEFAULT_LOG) -> dict[str, i
         return found
     if not html:
         return found
-    parser = AnchorParser()
-    parser.feed(html)
-    parser.close()
-    for link in parser.links:
+    for link in parse_anchors(html, url=PUBLICATIONS_URL, log=log):
         href = link.get("href", "")
         id_match = _MEDIA_HREF_RE.search(href)
         if not id_match:
@@ -202,7 +228,7 @@ def discover_media_ids(log: Callable[[str], None] = _DEFAULT_LOG) -> dict[str, i
             if not match:
                 continue
             try:
-                label = datetime.strptime(f"{match.group(1)} {match.group(2)}", "%B %Y").strftime("%b %Y")
+                label = format_month_label(parse_month_spec(f"{match.group(1)} {match.group(2)}"))
             except ValueError:
                 continue
             found.setdefault(label, int(media_id))
@@ -229,26 +255,27 @@ def parse_text_blob(text: str) -> tuple[float, float] | None:
     return None
 
 
-_TOTALS_WORD_RE = re.compile(r"\bTOTALS\b")
+_TOTALS_WORD_RE = re.compile(r"\bTOTALS\b", re.IGNORECASE)
+_TOTALS_BOUNDARY_RE = re.compile("|".join(re.escape(marker) for marker in TOTALS_BOUNDARY_MARKERS), re.IGNORECASE)
+_ROW_TOTAL_RE_CACHE: dict[str, re.Pattern[str]] = {
+    lbl: re.compile(re.escape(lbl), re.IGNORECASE) for lbl in (*TOTALS_LABELS, "STATE TAX")
+}
 
 
-def _totals_block_end(text: str, start: int) -> int:
-    upper = text.upper()
-    end_candidates = [upper.find(marker, start) for marker in TOTALS_BOUNDARY_MARKERS]
-    valid = [index for index in end_candidates if index >= 0]
-    return min(valid) if valid else len(text)
+def _totals_block_end(text: str, start: int, *, upper: str | None = None) -> int:
+    match = _TOTALS_BOUNDARY_RE.search(text, start)
+    return match.start() if match else len(text)
 
 
-def _find_statewide_totals_block(text: str) -> str | None:
-    upper = text.upper()
+def _find_statewide_totals_block(text: str, *, upper: str | None = None) -> str | None:
     candidates: list[tuple[int, int, int, int, str]] = []
-    for match in _TOTALS_WORD_RE.finditer(upper):
+    for match in _TOTALS_WORD_RE.finditer(text):
         start = match.start()
-        line_start = upper.rfind("\n", 0, start) + 1
+        line_start = text.rfind("\n", 0, start) + 1
         line_prefix = text[line_start:start].strip()
         end = _totals_block_end(text, start)
         block = text[start:end]
-        block_upper = upper[start:end]
+        block_upper = block.upper()
         label_count = sum(1 for label in TOTALS_LABELS if label in block_upper)
         if label_count < 2:
             continue
@@ -262,43 +289,48 @@ def _find_statewide_totals_block(text: str) -> str | None:
     return candidates[0][4]
 
 
-def _extract_row_total(block: str, label: str) -> float | None:
-    upper = block.upper()
-    label_pos = upper.find(label)
-    if label_pos < 0:
+def _extract_row_total(block: str, label: str, *, upper: str | None = None) -> float | None:
+    label_re = _ROW_TOTAL_RE_CACHE.get(label) or re.compile(re.escape(label), re.IGNORECASE)
+    match = label_re.search(block)
+    if match is None:
         return None
-    next_positions = [
-        upper.find(next_label, label_pos + len(label))
-        for next_label in TOTALS_LABELS
-        if next_label != label
-    ]
-    next_positions = [pos for pos in next_positions if pos > label_pos]
+    label_pos = match.start()
+    search_from = match.end()
+    next_positions = []
+    for next_label in TOTALS_LABELS:
+        if next_label == label:
+            continue
+        next_re = _ROW_TOTAL_RE_CACHE.get(next_label) or re.compile(re.escape(next_label), re.IGNORECASE)
+        next_match = next_re.search(block, search_from)
+        if next_match is not None:
+            next_positions.append(next_match.start())
     segment = block[label_pos: min(next_positions) if next_positions else None]
     values = [parse_dollar(token) for token in MONEY_RE.findall(segment)]
     parsed = [value for value in values if value is not None]
     return parsed[-1] if parsed else None
 
 
-def _parse_labeled_totals_block(block: str) -> ParsedIowaMetrics | None:
-    total_handle = _extract_row_total(block, TOTAL_HANDLE_LABEL)
-    total_revenue = _extract_row_total(block, TOTAL_REVENUE_LABEL)
+def _parse_labeled_totals_block(block: str, *, upper: str | None = None) -> ParsedIowaMetrics | None:
+    block_upper = upper if upper is not None else block.upper()
+    total_handle = _extract_row_total(block, TOTAL_HANDLE_LABEL, upper=block_upper)
+    total_revenue = _extract_row_total(block, TOTAL_REVENUE_LABEL, upper=block_upper)
     if total_handle is None or total_revenue is None:
         return None
     return ParsedIowaMetrics(
         metrics=(
             total_handle,
             total_revenue,
-            _extract_row_total(block, RETAIL_HANDLE_LABEL),
-            _extract_row_total(block, RETAIL_REVENUE_LABEL),
-            _extract_row_total(block, INTERNET_HANDLE_LABEL),
-            _extract_row_total(block, INTERNET_REVENUE_LABEL),
+            _extract_row_total(block, RETAIL_HANDLE_LABEL, upper=block_upper),
+            _extract_row_total(block, RETAIL_REVENUE_LABEL, upper=block_upper),
+            _extract_row_total(block, INTERNET_HANDLE_LABEL, upper=block_upper),
+            _extract_row_total(block, INTERNET_REVENUE_LABEL, upper=block_upper),
         ),
         layout="labeled-totals",
-        tax=_extract_row_total(block, "STATE TAX"),
+        tax=_extract_row_total(block, "STATE TAX", upper=block_upper),
     )
 
 
-def _parse_compact_totals_block(block: str) -> ParsedIowaMetrics | None:
+def _parse_compact_totals_block(block: str, *, upper: str | None = None) -> ParsedIowaMetrics | None:
     first_label_match = _COMPACT_LABEL_RE.search(block)
     first_value_match = MONEY_RE.search(block)
     if not first_value_match or (first_label_match and first_label_match.start() < first_value_match.start()):
@@ -310,7 +342,8 @@ def _parse_compact_totals_block(block: str) -> ParsedIowaMetrics | None:
     ]
     if len(parsed) < 8:
         return None
-    tax = parsed[9] if len(parsed) >= 10 and "STATE TAX" in block.upper() else None
+    block_upper = upper if upper is not None else block.upper()
+    tax = parsed[9] if len(parsed) >= 10 and "STATE TAX" in block_upper else None
     return ParsedIowaMetrics(
         metrics=(parsed[1], parsed[0], parsed[4], parsed[3], parsed[7], parsed[6]),
         layout="compact-totals",
@@ -318,14 +351,18 @@ def _parse_compact_totals_block(block: str) -> ParsedIowaMetrics | None:
     )
 
 
-def parse_totals_block(text: str) -> ParsedIowaMetrics | None:
-    block = _find_statewide_totals_block(text)
+def parse_totals_block(text: str, *, upper: str | None = None) -> ParsedIowaMetrics | None:
+    block = _find_statewide_totals_block(text, upper=upper)
     if block is None:
         return None
-    parsed = _parse_labeled_totals_block(block)
+    block_upper = block.upper()
+    parsed = _parse_labeled_totals_block(block, upper=block_upper)
     if parsed is not None:
         return parsed
-    return _parse_compact_totals_block(block)
+    return _parse_compact_totals_block(block, upper=block_upper)
+
+
+_REPORT_MARKER_RE = re.compile(r"SPORTS WAGERING REVENUE REPORT -- ", re.IGNORECASE)
 
 
 def parse_month_section(
@@ -334,16 +371,26 @@ def parse_month_section(
     log: Callable[[str], None] = _DEFAULT_LOG,
     *,
     missing_level: str = "WARN",
+    text_upper: str | None = None,
 ) -> ParsedIowaMetrics | None:
-    heading_label = datetime.strptime(label, "%b %Y").strftime("%B %Y").upper()
+    parsed_label = parse_month_spec(label)
+    heading_label = f"{MONTH_NAMES[parsed_label.month].upper()} {parsed_label.year}"
     heading = f"SPORTS WAGERING REVENUE REPORT -- {heading_label}"
-    start = text.upper().find(heading)
-    if start < 0:
+    start_match = re.search(re.escape(heading), text, re.IGNORECASE)
+    if start_match is None:
         log(f"{missing_level} Iowa archive section not found for {label}")
         return None
-    next_marker = text.upper().find("SPORTS WAGERING REVENUE REPORT -- ", start + len(heading))
-    section = text[start: next_marker if next_marker >= 0 else None]
-    parsed = parse_totals_block(section)
+    start = start_match.start()
+    next_marker: int | None = None
+    for marker_match in _REPORT_MARKER_RE.finditer(text, start_match.end()):
+        after = text[marker_match.end():marker_match.end() + len(heading_label)]
+        if after.upper() == heading_label:
+            continue
+        next_marker = marker_match.start()
+        break
+    section = text[start:next_marker]
+    section_upper = section.upper()
+    parsed = parse_totals_block(section, upper=section_upper)
     if parsed is not None:
         return parsed
     totals = parse_text_blob(section)
@@ -391,7 +438,7 @@ def _extract_details_from_page(
     if not kind or not month_banner or any(tok in month_banner for tok in ("FISCAL", "THROUGH", "FYTD")):
         return kind, month_banner
     try:
-        label = datetime.strptime(month_banner.title(), "%B %Y").strftime("%b %Y")
+        label = format_month_label(parse_month_spec(month_banner))
     except ValueError:
         return kind, month_banner
 
@@ -453,6 +500,8 @@ def _extract_details_from_page(
                 continue
             hv = parse_dollar(cols_h[col_idx]["text"])
             rw = min(cols_r, key=lambda w: abs(w["x1"] - col_x1[col_idx]))
+            if abs(rw["x1"] - col_x1[col_idx]) > 15.0:
+                continue
             rv = parse_dollar(rw["text"])
             if hv is None or rv is None or (hv == 0.0 and rv == 0.0):
                 continue
@@ -498,7 +547,7 @@ def _extract_iowa_text_and_detail_map(
 ) -> tuple[str | None, dict[str, list[IowaDetailRow]]]:
     text, detail_map = _extract_iowa_text_and_details(data, log=log)
     if not text:
-        text = extract_pdf_text(data, log=log)
+        text = extract_pdf_text(data, use_pdfplumber=False, log=log)
     return text, detail_map
 
 
@@ -558,18 +607,15 @@ def _load_cached_monthly_pdf(
 ) -> bytes | None:
     canonical = cache_path(cache_dir, f"iowa_splits_{year}_{month:02d}.pdf")
     data = load_cache(canonical)
-    if data and data.startswith(b"%PDF"):
+    if is_pdf_bytes(data):
         log(f"INFO using cached monthly PDF for {label}")
         return data
     legacy = cache_path(cache_dir, f"iowa_{year}_{month:02d}.pdf")
     data = load_cache(legacy)
-    if data and data.startswith(b"%PDF"):
+    if is_pdf_bytes(data):
         log(f"INFO using legacy cached monthly PDF for {label}")
         if migrate_legacy and canonical and canonical != legacy:
-            try:
-                save_cache(canonical, data)
-            except OSError as exc:
-                log(f"WARN could not migrate cache {legacy} -> {canonical}: {exc}")
+            try_save_cache(canonical, data, log=log, message_prefix=f"WARN could not migrate cache {legacy} ->")
         return data
     return None
 
@@ -584,27 +630,45 @@ def _fetch_monthly_pdf_with_lookup(
     offline: bool = False,
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> bytes | None:
-    cached = _load_cached_monthly_pdf(
-        year, month, label, cache_dir, migrate_legacy=not offline, log=log,
-    )
-    if cached is not None:
-        return cached
-    if offline:
-        return None
-    media_id = media_lookup.get(label)
-    if media_id is None:
-        log(f"WARN no IRGC media ID known for {label}")
-        return None
-    data = download_pdf(media_id, label_hint=label, log=log)
-    if data is None:
-        log(f"WARN could not download Iowa monthly PDF for {label}")
-        return None
+    ttl_seconds = recent_cache_ttl(year, month)
     canonical = cache_path(cache_dir, f"iowa_splits_{year}_{month:02d}.pdf")
-    try:
-        save_cache(canonical, data)
-    except OSError as exc:
-        log(f"WARN could not write cache {canonical}: {exc}")
-    return data
+    stale_legacy: bytes | None = None
+    if canonical is None or not os.path.isfile(canonical):
+        legacy = _load_cached_monthly_pdf(
+            year, month, label, cache_dir, migrate_legacy=False, log=log,
+        )
+        if legacy is not None:
+            legacy_path = cache_path(cache_dir, f"iowa_{year}_{month:02d}.pdf")
+            age = cache_age_seconds(legacy_path)
+            if offline or ttl_seconds is None or (age is not None and age <= ttl_seconds):
+                if not offline and canonical and canonical != legacy_path:
+                    try_save_cache(
+                        canonical,
+                        legacy,
+                        log=log,
+                        message_prefix=f"WARN could not migrate cache {legacy_path} ->",
+                    )
+                return legacy
+            stale_legacy = legacy
+
+    def _download_monthly() -> bytes | None:
+        media_id = media_lookup.get(label)
+        if media_id is None:
+            log(f"WARN no IRGC media ID known for {label}")
+            return None
+        return download_pdf(media_id, label_hint=label, log=log)
+
+    loaded = load_cached_or_fetch(
+        cache_file=canonical,
+        fetcher=_download_monthly,
+        log=log,
+        cache_hit_message=f"INFO using cached monthly PDF for {label}",
+        fetch_error_message=f"could not download Iowa monthly PDF for {label}",
+        validate=is_pdf_bytes,
+        cache_ttl_seconds=ttl_seconds,
+        offline=offline,
+    )
+    return loaded if loaded is not None else stale_legacy
 
 
 def build_archive_lookup(
@@ -617,42 +681,80 @@ def build_archive_lookup(
 ) -> dict[str, ParsedIowaMetrics]:
     fy_map = fy_lookup if fy_lookup is not None else FY_MEDIA_IDS
     archive_lookup: dict[str, ParsedIowaMetrics] = {}
-    needed_fys = sorted({fiscal_year_july(year, month) for month, year, _ in months if fiscal_year_july(year, month) in fy_map})
+    months_with_fy = [(month, year, label, fiscal_year_july(year, month)) for month, year, label in months]
+    needed_fys = sorted({fy for _m, _y, _lbl, fy in months_with_fy if fy in fy_map})
     for fy in needed_fys:
         try:
             media_id = fy_map[fy]
             archive_path = cache_path(cache_dir, f"iowa_fy_{fy[0]}_{fy[1]}_archive.pdf")
+            fy_ttl = recent_fy_cache_ttl(fy[1])
+            was_cached = bool(archive_path and os.path.isfile(archive_path))
+            fetch_called = [False]
+
+            def _download_archive(mid: int = media_id, called: list[bool] = fetch_called) -> bytes | None:
+                called[0] = True
+                return download_pdf(mid, log=log)
+
             data = load_cached_or_fetch(
                 cache_file=archive_path,
-                fetcher=lambda mid=media_id: download_pdf(mid, log=log),
+                fetcher=_download_archive,
                 log=log,
                 cache_hit_message=f"INFO using cached FY archive PDF for {fy[0]}-{fy[1]}",
                 fetch_error_message=f"could not download Iowa FY archive PDF media/{media_id}",
-                validate=lambda payload: payload.startswith(b"%PDF"),
-                cache_ttl_seconds=recent_fy_cache_ttl(fy[1]),
+                validate=is_pdf_bytes,
+                cache_ttl_seconds=fy_ttl,
                 offline=offline,
             )
             if data is None:
                 log(f"WARN could not load FY archive PDF media/{media_id}")
                 continue
-            text, detail_lookup = _extract_iowa_text_and_detail_map(data, log=log)
-            if not text:
-                log(f"WARN could not extract text from Iowa FY archive {fy[0]}-{fy[1]}")
-                continue
-            missing_level = "INFO" if recent_fy_cache_ttl(fy[1]) is not None else "WARN"
-            for month, year, label in months:
-                if fiscal_year_july(year, month) != fy or label in archive_lookup:
-                    continue
-                parsed = parse_month_section(text, label, log=log, missing_level=missing_level)
-                if parsed is not None:
-                    archive_lookup[label] = ParsedIowaMetrics(
-                        metrics=parsed.metrics,
-                        layout=parsed.layout,
-                        details=tuple(detail_lookup.get(label, ())),
-                        tax=parsed.tax,
+            missing_level = "INFO" if fy_ttl is not None else "WARN"
+            fy_labels = [label for _m, _y, label, month_fy in months_with_fy if month_fy == fy]
+
+            def _populate_from_archive(pdf_bytes: bytes) -> list[str]:
+                text, detail_lookup = _extract_iowa_text_and_detail_map(pdf_bytes, log=log)
+                if not text:
+                    log(f"WARN could not extract text from Iowa FY archive {fy[0]}-{fy[1]}")
+                    return fy_labels
+                missing: list[str] = []
+                for lbl in fy_labels:
+                    if lbl in archive_lookup:
+                        continue
+                    parsed = parse_month_section(
+                        text, lbl, log=log, missing_level=missing_level,
                     )
-                else:
-                    log(f"{missing_level} Iowa FY archive did not yield totals for {label}")
+                    if parsed is not None:
+                        archive_lookup[lbl] = ParsedIowaMetrics(
+                            metrics=parsed.metrics,
+                            layout=parsed.layout,
+                            details=tuple(detail_lookup.get(lbl, ())),
+                            tax=parsed.tax,
+                        )
+                    else:
+                        missing.append(lbl)
+                return missing
+
+            missing_fy_labels = _populate_from_archive(data)
+            if (
+                missing_fy_labels
+                and was_cached
+                and not fetch_called[0]
+                and not offline
+                and archive_path
+                and fy_ttl is not None
+            ):
+                refreshed = refresh_cached_if_stale(
+                    archive_path,
+                    data,
+                    fetcher=_download_archive,
+                    validate=is_pdf_bytes,
+                    offline=offline,
+                    log=log,
+                )
+                if refreshed is not None:
+                    missing_fy_labels = _populate_from_archive(refreshed)
+            for lbl in missing_fy_labels:
+                log(f"{missing_level} Iowa FY archive did not yield totals for {lbl}")
         except Exception as exc:
             log(f"WARN failed Iowa FY archive processing for {fy[0]}-{fy[1]}: {exc}")
     return archive_lookup
@@ -671,7 +773,7 @@ def fetch(
     """Fetch and parse Iowa monthly sports wagering results."""
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
-    months = [(mdate.month, mdate.year, mdate.strftime("%b %Y")) for mdate in target_dates]
+    months = [(mdate.month, mdate.year, f"{MONTH_ABBR[mdate.month]} {mdate.year}") for mdate in target_dates]
     fy_lookup = dict(FY_MEDIA_IDS)
     if not offline:
         requested_fys = {fiscal_year_july(year, month) for month, year, _ in months}

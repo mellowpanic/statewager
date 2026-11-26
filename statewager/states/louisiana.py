@@ -19,9 +19,11 @@ from ..discover import (
     classify_cumulative_filename,
     classify_sportsbook_filename,
     crawl_anchors,
+    extract_month_label,
 )
 from ..http import fetch_with_wayback_fallback
 from ..model import (
+    MONTH_ABBR,
     StateMonthResult,
     build_state_logger,
     finalize_state_month,
@@ -34,7 +36,7 @@ from ..model import (
     resolve_fetch_months,
     sum_optional,
 )
-from ..parse import is_number, open_xlsx_workbook
+from ..parse import XLSX_MAGIC, is_number, is_xlsx_bytes, open_xlsx_workbook
 
 STATE_NAME = "Louisiana"
 LAUNCH_DATE: date | None = None
@@ -48,7 +50,6 @@ REPORTS_URL = (
 _DEFAULT_LOG = build_state_logger("LA")
 _LA_CACHE_FILE_RE = re.compile(r"^louisiana_(20\d{2})_(0[1-9]|1[0-2])_(mobile|retail)\.xlsx$", re.IGNORECASE)
 _CACHE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
-_LABEL_HINT_RE = re.compile(r"([A-Za-z]{3})[\s\-_]+(\d{4})")
 
 
 def discover_remote_links(
@@ -62,12 +63,12 @@ def discover_remote_links(
     if report is not None:
         report.add_index(REPORTS_URL, anchor_count=len(links))
     per_month: dict[str, dict[str, list[str]]] = {}
-    cumulative: dict[str, list[tuple[int, str]]] = {}
+    cumulative: dict[str, list[tuple[tuple[int, int, int], str]]] = {}
     for link in links:
         href = unescape(link.get("href", "").strip())
         if ".xlsx" not in href.lower():
             if report is not None and href:
-                report.add_classification(href, title=link.get("title", ""), text=link.get("text", ""), reason="not-xlsx")
+                report.add_unmatched_link(link, "not-xlsx", href=href)
             continue
         full_url = urljoin(REPORTS_URL, href)
         title = link.get("title", "")
@@ -80,23 +81,34 @@ def discover_remote_links(
                 urls.append(full_url)
             if report is not None:
                 report.add_anchor(f"{label}:{channel}", full_url)
+            cum_class = classify_cumulative_filename(full_url, title=title, text=text, exclude_per_month=False)
+            if cum_class:
+                months, cum_channel = cum_class
+                max_year = max(int(month.split()[-1]) for month in months)
+                try:
+                    pm_dt = parse_month_spec(label)
+                    sort_key = (max_year, pm_dt.year, pm_dt.month)
+                except ValueError:
+                    sort_key = (max_year, 0, 0)
+                for month_label in months:
+                    cumulative.setdefault(f"{month_label}:{cum_channel}", []).append((sort_key, full_url))
             continue
         cum_class = classify_cumulative_filename(full_url, title=title, text=text)
         if cum_class:
             months, channel = cum_class
             max_year = max(int(month.split()[-1]) for month in months)
             for month_label in months:
-                cumulative.setdefault(f"{month_label}:{channel}", []).append((max_year, full_url))
+                cumulative.setdefault(f"{month_label}:{channel}", []).append(((max_year, 0, 0), full_url))
             if report is not None:
                 report.add_anchor(f"cumulative:{channel}", full_url)
             continue
         if report is not None:
-            report.add_classification(full_url, title=title, text=text, reason="no-sportsbook-month")
+            report.add_unmatched_link(link, "no-sportsbook-month", href=full_url)
     cumulative_sorted: dict[str, list[str]] = {}
     for key, entries in cumulative.items():
         seen: set[str] = set()
         ordered: list[str] = []
-        for _, url in sorted(entries, key=lambda pair: -pair[0]):
+        for _, url in sorted(entries, key=lambda pair: pair[0], reverse=True):
             if url not in seen:
                 seen.add(url)
                 ordered.append(url)
@@ -129,7 +141,7 @@ def _parse_workbook_all_months_core(
                     continue
                 if not is_number(handle) or not is_number(revenue) or handle in (0, -1):
                     continue
-                label = month_cell.strftime("%b %Y")
+                label = f"{MONTH_ABBR[month_cell.month]} {month_cell.year}"
                 if label not in results:
                     results[label] = (float(handle), float(revenue))
                     promo = abs(float(row[3])) if len(row) > 3 and is_number(row[3]) else None
@@ -147,6 +159,15 @@ def parse_workbook_fiscal_all_months(
     return fiscal_results
 
 
+def _la_cache_info(
+    cache_dir: str | None,
+    url: str,
+    label_hint: str,
+) -> tuple[str, str | None]:
+    cache_filename = _CACHE_SAFE_RE.sub("_", f"{label_hint}_{os.path.basename(urlparse(url).path)}")
+    return cache_filename, cache_path(cache_dir, cache_filename)
+
+
 def _load_one(
     url_or_path: str,
     cache_dir: str | None,
@@ -162,10 +183,8 @@ def _load_one(
         except Exception as exc:
             log(f"WARN could not read local file {url_or_path}: {exc}")
             return None
-    cache_filename = _CACHE_SAFE_RE.sub("_", f"{label_hint}_{os.path.basename(urlparse(url_or_path).path)}")
-    cache_file = cache_path(cache_dir, cache_filename)
-    label_match = _LABEL_HINT_RE.search(label_hint)
-    timestamp = month_yyyymm(label_match.group(0).replace("_", " ").replace("-", " ")) if label_match else None
+    cache_filename, cache_file = _la_cache_info(cache_dir, url_or_path, label_hint)
+    timestamp = month_yyyymm(extract_month_label(label_hint))
     ttl_seconds = (
         recent_fy_cache_ttl(fiscal_year_july(int(timestamp[:4]), int(timestamp[4:6]))[1])
         if timestamp
@@ -177,14 +196,14 @@ def _load_one(
         fetcher=lambda: fetch_with_wayback_fallback(
             url_or_path,
             timestamp_yyyymm=timestamp,
-            signature_check=b"PK",
+            signature_check=XLSX_MAGIC,
             log=log,
         ),
         log=log,
         cache_hit_message=f"INFO using cached source for {label_hint}: {cache_filename}",
         fetch_success_message=f"INFO downloaded {label_hint}: {url_or_path}",
         fetch_error_message=f"could not download {label_hint} from {url_or_path}",
-        validate=lambda payload: payload.startswith(b"PK"),
+        validate=is_xlsx_bytes,
         cache_ttl_seconds=ttl_seconds,
         offline=offline,
     )
@@ -215,8 +234,11 @@ def _scan_local_dir(local_dir: str) -> tuple[dict[str, dict[str, list[str]]], di
     if not os.path.isdir(local_dir):
         return per_month, cumulative
     for entry in sorted(os.listdir(local_dir)):
-        if entry.lower().endswith(".xlsx"):
-            _index_xlsx_entry(entry, os.path.join(local_dir, entry), per_month, cumulative)
+        if not entry.lower().endswith(".xlsx"):
+            continue
+        full_path = os.path.join(local_dir, entry)
+        if os.path.isfile(full_path):
+            _index_xlsx_entry(entry, full_path, per_month, cumulative)
     return per_month, cumulative
 
 
@@ -234,11 +256,13 @@ def _scan_cache_dir(
         if not entry.lower().endswith(".xlsx"):
             continue
         full_path = os.path.join(cache_dir, entry)
+        if not os.path.isfile(full_path):
+            continue
         la_match = _LA_CACHE_FILE_RE.match(entry)
         if la_match:
             year, month_num = int(la_match.group(1)), int(la_match.group(2))
             channel = la_match.group(3).lower()
-            label = datetime(year, month_num, 1).strftime("%b %Y")
+            label = f"{MONTH_ABBR[month_num]} {year}"
             per_month.setdefault(label, {}).setdefault(channel, []).append(full_path)
             dated_channel_files.setdefault(channel, []).append(((year, month_num), full_path))
             continue
@@ -306,15 +330,19 @@ def _resolve_month_data_with_fiscal(
     def load_and_parse(
         source: str, label_hint: str,
     ) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float | None, float | None]]]:
-        if source in workbook_cache:
-            return workbook_cache[source]
+        cache_key = source if source.startswith("http") else f"file:{os.path.abspath(source)}"
+        if cache_key in workbook_cache:
+            return workbook_cache[cache_key]
         data = _load_one(source, cache_dir, label_hint, offline=offline, log=log)
-        if data is None:
-            workbook_cache[source] = ({}, {})
-            return {}, {}
-        parsed, fiscal = _parse_workbook_all_months_core(data, log=log)
-        workbook_cache[source] = (parsed, fiscal)
-        return parsed, fiscal
+        parsed_pair: tuple[dict[str, tuple[float, float]], dict[str, tuple[float | None, float | None]]] = (
+            _parse_workbook_all_months_core(data, log=log) if data is not None else ({}, {})
+        )
+        workbook_cache[cache_key] = parsed_pair
+        if source.startswith("http") and cache_dir:
+            _cname, cfile = _la_cache_info(cache_dir, source, label_hint)
+            if cfile and os.path.isfile(cfile):
+                workbook_cache[f"file:{os.path.abspath(cfile)}"] = parsed_pair
+        return parsed_pair
 
     for label in sorted(target_labels, key=parse_month_spec):
         for channel in ("mobile", "retail"):
@@ -326,8 +354,8 @@ def _resolve_month_data_with_fiscal(
                 sources.extend(cached_cumulative.get(f"{label}:{channel}", []))
             else:
                 sources.extend(remote_per_month.get(label, {}).get(channel, []))
-                sources.extend(cached_per_month.get(label, {}).get(channel, []))
                 sources.extend(remote_cumulative.get(f"{label}:{channel}", []))
+                sources.extend(cached_per_month.get(label, {}).get(channel, []))
                 sources.extend(cached_cumulative.get(f"{label}:{channel}", []))
             seen: set[str] = set()
             ordered_sources = [src for src in sources if not (src in seen or seen.add(src))]
@@ -379,7 +407,7 @@ def fetch(
         raise RuntimeError("openpyxl is required to fetch Louisiana sports wagering data")
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
-    months = [(mdate.month, mdate.year, mdate.strftime("%b %Y")) for mdate in target_dates]
+    months = [(mdate.month, mdate.year, f"{MONTH_ABBR[mdate.month]} {mdate.year}") for mdate in target_dates]
     target_labels = {label for _, _, label in months}
     resolved, resolved_sources, resolved_fiscal = _resolve_month_data_with_fiscal(
         target_labels, local_dir, cache_dir, offline=offline, report=report, log=logger,

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import csv
 from datetime import date, datetime
-import io
 import os
 import re
 from typing import Callable
@@ -11,10 +10,12 @@ from urllib.parse import urljoin
 
 import requests
 
-from ..cache import cache_age_seconds, cache_path, load_cache, recent_cache_ttl, save_cache
+from ..cache import cache_age_seconds, cache_path, load_cache, recent_cache_ttl, try_save_cache
 from ..discover import DiscoveryReport, crawl_anchors, extract_month_label
 from ..http import fetch_with_wayback_fallback, probe_url_variants, retry_request
 from ..model import (
+    MONTH_ABBR,
+    MONTH_NAMES,
     StateMonthResult,
     build_operator_results,
     build_state_logger,
@@ -24,8 +25,9 @@ from ..model import (
     log_skip,
     month_yyyymm,
     resolve_fetch_months,
+    sum_optional,
 )
-from ..parse import collapse_ws, extract_pdf_text, parse_dollar
+from ..parse import PDF_MAGIC, clean_lower, collapse_ws, extract_pdf_text, is_pdf_bytes, parse_dollar
 
 STATE_NAME = "Illinois"
 LAUNCH_DATE: date | None = None
@@ -51,6 +53,19 @@ _VIEWSTATEGEN_RE = re.compile(r'name="__VIEWSTATEGENERATOR"[^>]*value="([^"]+)"'
 _EVENTVAL_RE = re.compile(r'name="__EVENTVALIDATION"[^>]*value="([^"]+)"')
 _NUM_TOKEN_RE = re.compile(r"[+\-\u2212]?\(?\$?[\d,]+\.?\d*\)?")
 _DEFAULT_LOG = build_state_logger("IL")
+
+
+def _legacy_template_vars(month_name: str, year: str) -> dict[str, str]:
+    return {
+        "month": month_name,
+        "year": year,
+        "month_lower": month_name.lower(),
+        "abbr": month_name[:3],
+    }
+
+
+def _legacy_pdf_url(month_name: str, year: str) -> str:
+    return LEGACY_PDF_TEMPLATES[0].format(**_legacy_template_vars(month_name, year))
 
 
 def discover_igb_pdf_urls(
@@ -89,7 +104,7 @@ def download_pdf(
     discovered_url = resolved_urls.get(label)
     if discovered_url:
         data = fetch_with_wayback_fallback(
-            discovered_url, timestamp_yyyymm=timestamp, signature_check=b"%PDF", log=log,
+            discovered_url, timestamp_yyyymm=timestamp, signature_check=PDF_MAGIC, log=log,
         )
         if report is not None:
             report.add_probe(
@@ -98,16 +113,15 @@ def download_pdf(
                 status="ok" if data else "fail",
                 reason="scraped-link" if data else "fetch-failed",
             )
-        if data and data.startswith(b"%PDF"):
+        if data:
             if matched_url is not None:
                 matched_url[:] = [discovered_url]
             log(f"INFO downloaded PDF via scraped link for {label}: {discovered_url}")
             return data
-    abbr = month_name[:3]
     return probe_url_variants(
         LEGACY_PDF_TEMPLATES,
-        {"month": month_name, "year": year, "month_lower": month_name.lower(), "abbr": abbr},
-        signature_check=b"%PDF",
+        _legacy_template_vars(month_name, year),
+        signature_check=PDF_MAGIC,
         wayback_timestamp=timestamp,
         log=log,
         report=report,
@@ -205,6 +219,14 @@ def post_report_csv(
             active_session.close()
 
 
+def _first_amount_over(line: str, threshold: float, *, use_abs: bool = False) -> float | None:
+    for token in _NUM_TOKEN_RE.findall(line):
+        amount = parse_dollar(token)
+        if amount is not None and (abs(amount) if use_abs else amount) > threshold:
+            return amount
+    return None
+
+
 def parse_pdf(data: bytes, log: Callable[[str], None] = _DEFAULT_LOG) -> tuple[float, float] | None:
     text = extract_pdf_text(data, log=log)
     if not text:
@@ -214,17 +236,9 @@ def parse_pdf(data: bytes, log: Callable[[str], None] = _DEFAULT_LOG) -> tuple[f
     for line in text.splitlines():
         lower = line.lower()
         if handle is None and "total handle" in lower:
-            for token in _NUM_TOKEN_RE.findall(line):
-                amount = parse_dollar(token)
-                if amount is not None and amount > 1_000_000:
-                    handle = amount
-                    break
+            handle = _first_amount_over(line, 1_000_000)
         if agr is None and ("adjusted gross receipt" in lower or "agr" in lower):
-            for token in _NUM_TOKEN_RE.findall(line):
-                amount = parse_dollar(token)
-                if amount is not None and abs(amount) > 100_000:
-                    agr = amount
-                    break
+            agr = _first_amount_over(line, 100_000, use_abs=True)
     if handle is not None and agr is not None:
         return handle, agr
     log("WARN Illinois PDF parse returned incomplete totals")
@@ -232,12 +246,27 @@ def parse_pdf(data: bytes, log: Callable[[str], None] = _DEFAULT_LOG) -> tuple[f
 
 
 def classify_location_type(value: object) -> str | None:
-    text = str(value or "").strip().lower()
+    text = clean_lower(value)
     if text == "in-person wagering":
         return "retail"
     if text == "online wagering":
         return "mobile"
     return None
+
+
+def _add_licensee_channel(
+    by_licensee: dict[str, dict[str, float | bool]],
+    licensee: str,
+    location_type: str,
+    metric_key: str,
+    value: float,
+) -> None:
+    rec = by_licensee.setdefault(
+        licensee,
+        {"rh": 0.0, "mh": 0.0, "rr": 0.0, "mr": 0.0, "has_retail": False, "has_mobile": False},
+    )
+    rec[metric_key] = float(rec[metric_key]) + value
+    rec[f"has_{location_type}"] = True
 
 
 def _scan_cash_csv(
@@ -254,7 +283,9 @@ def _scan_cash_csv(
     retail_handle = 0.0
     mobile_handle = 0.0
     by_licensee: dict[str, dict[str, float | bool]] = {}
-    reader = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
+    reader = csv.DictReader(lines[header_index:])
+    if reader.fieldnames:
+        reader.fieldnames = [name.strip() if name else "" for name in reader.fieldnames]
     for row in reader:
         location_type = classify_location_type(row.get("Location Type"))
         tier1 = parse_dollar(row.get("Tier 1 Handle"))
@@ -264,17 +295,13 @@ def _scan_cash_csv(
         handle = (tier1 or 0.0) + (tier2 or 0.0)
         if location_type == "retail":
             retail_handle += handle
+            key = "rh"
         else:
             mobile_handle += handle
+            key = "mh"
         licensee = collapse_ws(row.get("Licensee"))
         if licensee:
-            rec = by_licensee.setdefault(
-                licensee,
-                {"rh": 0.0, "mh": 0.0, "has_retail": False, "has_mobile": False},
-            )
-            key = "rh" if location_type == "retail" else "mh"
-            rec[key] = float(rec[key]) + handle
-            rec[f"has_{location_type}"] = True
+            _add_licensee_channel(by_licensee, licensee, location_type, key, handle)
     total_handle = retail_handle + mobile_handle
     totals = (total_handle, retail_handle, mobile_handle) if total_handle > 0 else None
     return totals, by_licensee, True
@@ -295,9 +322,11 @@ def _scan_accrual_csv(
     header_index = next((i for i, line in enumerate(lines) if "Location Type" in line and "State AGR" in line), None)
     if header_index is None:
         return None, None, {}, {}, False, False, 0
-    reader = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
+    reader = csv.DictReader(lines[header_index:])
+    if reader.fieldnames:
+        reader.fieldnames = [name.strip() if name else "" for name in reader.fieldnames]
     tax_cols = ("State Tax", "Cook County Tax", "Sports Wager Tax")
-    fieldnames = {name.strip() for name in (reader.fieldnames or []) if name}
+    fieldnames = {name for name in (reader.fieldnames or []) if name}
     has_tax_cols = any(col in fieldnames for col in tax_cols)
 
     retail_agr = 0.0
@@ -318,20 +347,15 @@ def _scan_accrual_csv(
             agr_rows += 1
             if location_type == "retail":
                 retail_agr += state_agr
+                key = "rr"
             else:
                 mobile_agr += state_agr
+                key = "mr"
             if licensee:
-                rec = by_licensee.setdefault(
-                    licensee,
-                    {"rr": 0.0, "mr": 0.0, "has_retail": False, "has_mobile": False},
-                )
-                key = "rr" if location_type == "retail" else "mr"
-                rec[key] = float(rec[key]) + state_agr
-                rec[f"has_{location_type}"] = True
+                _add_licensee_channel(by_licensee, licensee, location_type, key, state_agr)
         if has_tax_cols:
-            parsed_parts = [parse_dollar(row.get(col)) for col in tax_cols]
-            if any(val is not None for val in parsed_parts):
-                row_tax = sum(val for val in parsed_parts if val is not None)
+            row_tax = sum_optional(*(parse_dollar(row.get(col)) for col in tax_cols))
+            if row_tax is not None:
                 total_tax += row_tax
                 tax_rows += 1
                 if licensee:
@@ -394,8 +418,6 @@ def parse_accrual_tax(
 
 def _local_target_tokens(month_name: str, year: str) -> set[str]:
     return {
-        f"{month_name}{year}swreport".lower(),
-        f"{month_name[:3]}{year}swreport".lower(),
         f"{month_name}{year}".lower(),
         f"{month_name[:3]}{year}".lower(),
     }
@@ -431,9 +453,17 @@ def _scan_local_month_files(
     return cash_data, accrual_data, pdf_paths
 
 
-def _parse_csv_pair_full(
-    cash_csv: bytes | None,
-    accrual_csv: bytes | None,
+def _assemble_csv_pair(
+    cash_scan: tuple[tuple[float, float, float] | None, dict[str, dict[str, float | bool]], bool] | None,
+    accrual_scan: tuple[
+        tuple[float, float, float] | None,
+        float | None,
+        dict[str, dict[str, float | bool]],
+        dict[str, float],
+        bool,
+        bool,
+        int,
+    ] | None,
     label: str,
     log: Callable[[str], None],
 ) -> tuple[
@@ -441,14 +471,14 @@ def _parse_csv_pair_full(
     float | None,
     list[tuple[object, ...]],
 ] | None:
-    if not (cash_csv and accrual_csv):
+    if cash_scan is None or accrual_scan is None:
         return None
-    cash_totals, cash_ops, c_found = _scan_cash_csv(cash_csv)
+    cash_totals, cash_ops, c_found = cash_scan
     if not c_found:
         log("WARN Illinois cash CSV header row not found")
     elif cash_totals is None:
         log("WARN Illinois cash CSV parse produced no handle totals")
-    agr_totals, state_tax, accrual_ops, op_taxes, a_found, has_tax_cols, tax_rows = _scan_accrual_csv(accrual_csv)
+    agr_totals, state_tax, accrual_ops, op_taxes, a_found, has_tax_cols, tax_rows = accrual_scan
     if not a_found:
         log("WARN Illinois accrual CSV header row not found")
     elif agr_totals is None:
@@ -471,6 +501,21 @@ def _parse_csv_pair_full(
     )
 
 
+def _parse_csv_pair_full(
+    cash_csv: bytes | None,
+    accrual_csv: bytes | None,
+    label: str,
+    log: Callable[[str], None],
+) -> tuple[
+    tuple[float, float, float, float, float, float],
+    float | None,
+    list[tuple[object, ...]],
+] | None:
+    if not (cash_csv and accrual_csv):
+        return None
+    return _assemble_csv_pair(_scan_cash_csv(cash_csv), _scan_accrual_csv(accrual_csv), label, log)
+
+
 def fetch(
     month_start: str | date | datetime | tuple[int, int],
     month_end: str | date | datetime | tuple[int, int] | None = None,
@@ -488,21 +533,7 @@ def fetch(
     discovered_pdf_urls: dict[str, str] | None = None
     aem_session: requests.Session | None = None
     aem_tokens: tuple[str, str, str] | None = None
-    aem_bootstrapped = False
-
-    def _legacy_pdf_url(month_name: str, year: str) -> str:
-        return LEGACY_PDF_TEMPLATES[0].format(
-            month=month_name,
-            year=year,
-            month_lower=month_name.lower(),
-            abbr=month_name[:3],
-        )
-
-    def _try_save_cache(path: str | None, payload: bytes) -> None:
-        try:
-            save_cache(path, payload)
-        except OSError as exc:
-            logger(f"WARN could not write cache {path}: {exc}")
+    aem_bootstrap_attempts = 0
 
     def _fetch_aem_pair(
         month_name: str,
@@ -514,14 +545,16 @@ def fetch(
         cash_path: str | None,
         accrual_path: str | None,
     ) -> tuple[bytes | None, bytes | None]:
-        nonlocal aem_session, aem_tokens, aem_bootstrapped
-        if (not cash_csv or not accrual_csv) and not aem_bootstrapped:
+        nonlocal aem_session, aem_tokens, aem_bootstrap_attempts
+        if (not cash_csv or not accrual_csv) and aem_tokens is None and aem_bootstrap_attempts < 2:
+            if aem_session is not None:
+                aem_session.close()
             aem_session = requests.Session()
             aem_tokens = _bootstrap_aem_tokens(aem_session, log=logger)
-            aem_bootstrapped = True
-        for stype, cur, cpath, kind_label in (
-            ("TypeCash", cash_csv, cash_path, "detail"),
-            ("TypeAccrual", accrual_csv, accrual_path, "tax"),
+            aem_bootstrap_attempts += 1
+        for stype, cur, cpath, kind_label, scanner in (
+            ("TypeCash", cash_csv, cash_path, "detail", _scan_cash_csv),
+            ("TypeAccrual", accrual_csv, accrual_path, "tax", _scan_accrual_csv),
         ):
             if cur:
                 continue
@@ -531,7 +564,11 @@ def fetch(
                 else None
             )
             if fetched:
-                _try_save_cache(cpath, fetched)
+                if scanner(fetched)[0] is None:
+                    logger(f"WARN fetched Illinois {kind_label} CSV for {label} failed validation; ignoring")
+                    fetched = None
+                else:
+                    try_save_cache(cpath, fetched, log=logger)
             else:
                 logger(f"WARN could not fetch Illinois {kind_label} CSV for {label}")
             if stype == "TypeCash":
@@ -562,7 +599,7 @@ def fetch(
         if not data:
             logger(f"WARN could not download Illinois legacy PDF for {label}")
             return None
-        _try_save_cache(legacy_path, data)
+        try_save_cache(legacy_path, data, log=logger)
         pdf_totals = parse_pdf(data, log=logger)
         if pdf_totals is None:
             logger(f"WARN {label}: legacy PDF did not yield totals")
@@ -571,10 +608,10 @@ def fetch(
 
     try:
         for mdate in target_dates:
-            month_name = mdate.strftime("%B")
-            year = mdate.strftime("%Y")
-            month_num = mdate.strftime("%m")
-            label = mdate.strftime("%b %Y")
+            month_name = MONTH_NAMES[mdate.month]
+            year = f"{mdate.year}"
+            month_num = f"{mdate.month:02d}"
+            label = f"{MONTH_ABBR[mdate.month]} {mdate.year}"
             iso_month = format_iso_month(mdate.year, mdate.month)
             try:
                 logger(f"INFO processing {label}")
@@ -606,35 +643,49 @@ def fetch(
                                 break
                 cached_cash = None
                 cached_accrual = None
-                stale_cash = None
-                stale_accrual = None
+                stale_cash_scan = None
+                stale_accrual_scan = None
+                cash_scan = None
+                accrual_scan = None
                 cash_path = cache_path(cache_dir, f"illinois_{year}_{month_num}_detail.csv")
                 accrual_path = cache_path(cache_dir, f"illinois_{year}_{month_num}_tax.csv")
                 ttl_seconds = recent_cache_ttl(mdate.year, mdate.month)
-                if parsed_tuple is None:
-                    cached_cash = load_cache(cash_path)
-                    if cached_cash and _scan_cash_csv(cached_cash)[0] is None:
-                        logger(f"WARN invalid cached detail CSV for {label}; ignoring")
-                        cached_cash = None
-                    elif cached_cash:
-                        logger(f"INFO using cached detail CSV for {label}")
-                    cached_accrual = load_cache(accrual_path)
-                    if cached_accrual and _scan_accrual_csv(cached_accrual)[0] is None:
-                        logger(f"WARN invalid cached tax CSV for {label}; ignoring")
-                        cached_accrual = None
-                    elif cached_accrual:
-                        logger(f"INFO using cached tax CSV for {label}")
+
+                def _load_csv_cache(path: str | None, scanner, kind_label: str):
+                    payload = load_cache(path)
+                    if not payload:
+                        return None, None, None
+                    scan = scanner(payload)
+                    if scan[0] is None:
+                        logger(f"WARN invalid cached {kind_label} CSV for {label}; ignoring")
+                        return None, None, None
                     if not offline and ttl_seconds is not None:
-                        if cached_cash and (age := cache_age_seconds(cash_path)) is not None and age > ttl_seconds:
-                            stale_cash, cached_cash = cached_cash, None
-                        if cached_accrual and (age := cache_age_seconds(accrual_path)) is not None and age > ttl_seconds:
-                            stale_accrual, cached_accrual = cached_accrual, None
-                    _unpack_csv(_parse_csv_pair_full(cached_cash, cached_accrual, label, logger))
+                        age = cache_age_seconds(path)
+                        if age is not None and age > ttl_seconds:
+                            return None, None, scan
+                    logger(f"INFO using cached {kind_label} CSV for {label}")
+                    return payload, scan, None
+
+                def _resolve_scan(scan, stale_scan, fresh_bytes, scanner):
+                    if scan is not None:
+                        return scan
+                    if not fresh_bytes and stale_scan is not None:
+                        return stale_scan
+                    return scanner(fresh_bytes) if fresh_bytes else None
+
+                if parsed_tuple is None:
+                    cached_cash, cash_scan, stale_cash_scan = _load_csv_cache(
+                        cash_path, _scan_cash_csv, "detail",
+                    )
+                    cached_accrual, accrual_scan, stale_accrual_scan = _load_csv_cache(
+                        accrual_path, _scan_accrual_csv, "tax",
+                    )
+                    _unpack_csv(_assemble_csv_pair(cash_scan, accrual_scan, label, logger))
                 cached_pdf = None
                 legacy_path = cache_path(cache_dir, f"illinois_{year}_{month_num}_legacy.pdf")
                 if parsed_tuple is None:
                     cached_pdf = load_cache(legacy_path)
-                    if cached_pdf and not cached_pdf.startswith(b"%PDF"):
+                    if cached_pdf and not is_pdf_bytes(cached_pdf):
                         logger(f"WARN invalid cached legacy PDF for {label}; ignoring")
                         cached_pdf = None
                     elif cached_pdf:
@@ -648,7 +699,7 @@ def fetch(
                         pdf_res = _fetch_legacy_pdf(month_name, year, label, legacy_path=legacy_path)
                         if pdf_res is not None:
                             parsed_tuple, source_url = pdf_res
-                    if parsed_tuple is None and not (cached_cash and cached_accrual):
+                    if parsed_tuple is None:
                         cash_csv, accrual_csv = _fetch_aem_pair(
                             month_name,
                             year,
@@ -658,9 +709,11 @@ def fetch(
                             cash_path=cash_path,
                             accrual_path=accrual_path,
                         )
-                        _unpack_csv(
-                            _parse_csv_pair_full(cash_csv or stale_cash, accrual_csv or stale_accrual, label, logger)
+                        final_cash_scan = _resolve_scan(cash_scan, stale_cash_scan, cash_csv, _scan_cash_csv)
+                        final_accrual_scan = _resolve_scan(
+                            accrual_scan, stale_accrual_scan, accrual_csv, _scan_accrual_csv,
                         )
+                        _unpack_csv(_assemble_csv_pair(final_cash_scan, final_accrual_scan, label, logger))
                 if parsed_tuple is None:
                     log_skip(logger, label, "no parseable local export, legacy PDF, or CSV form result")
                     continue

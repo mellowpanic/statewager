@@ -2,9 +2,25 @@
 from __future__ import annotations
 
 import csv
+import datetime
+import functools
 import inspect
+import io
+import json
+import math
+import os
 import pathlib
+import re
+import shutil
+import subprocess
+import threading
+import time
+import zipfile
 
+import pytest
+import requests
+
+import publish.__main__ as pub_main
 from publish import (
     CSV_HEADERS,
     merge_state_results,
@@ -14,21 +30,112 @@ from publish import (
     write_index_html,
     write_state_csv,
 )
-from statewager import StateMonthResult
+from publish.__main__ import main as publish_main, publish_all
+from publish.csv_writer import (
+    DETAIL_CSV_HEADERS,
+    PublishedDetailRow,
+    _parse_opt_float,
+    extract_published_details,
+    merge_detail_results,
+    read_detail_csv,
+    write_combined_detail_csv,
+    write_state_detail_csv,
+    write_status_json,
+)
+from publish.site import _safe_inline_json
+from statewager import StateMonthResult, http as sw_http, quality
+from statewager.cache import (
+    cache_path,
+    find_local_month_file,
+    load_cache,
+    load_cached_or_fetch,
+    recent_cache_ttl,
+    recent_fy_cache_ttl,
+    refresh_cached_if_stale,
+    try_save_cache,
+)
 from statewager.discover import (
+    AnchorParser,
     classify_cumulative_filename,
     classify_sportsbook_filename,
     extract_month_label,
     normalize_filename,
+    parse_text_month,
 )
+from statewager.http import _matches_signature
 from statewager.model import (
     CORE_RESULT_FIELDS,
+    OperatorMonthResult,
+    finalize_state_month,
     find_stale_months,
+    fiscal_year_july,
     format_month_label,
     hold_pct,
     label_to_iso_month,
+    month_yyyymm,
+    parse_month_spec,
+    reconcile_components,
+    resolve_fetch_months,
+    safe_float,
 )
-from statewager.states import ALL_STATES, iowa, load_state_module, missouri, pennsylvania
+from statewager.operators import BRAND_ORDER, classify_operator_brand, normalize_operator_name
+from statewager.parse import extract_pdf_text, open_xlsx_workbook, parse_dollar
+from statewager.states import (
+    ALL_STATES,
+    STATE_ABBR_TO_SLUG,
+    illinois,
+    indiana,
+    iowa,
+    kansas,
+    load_state_module,
+    louisiana,
+    mississippi,
+    missouri,
+    nevada,
+    ohio,
+    pennsylvania,
+)
+
+_EXPECTED_DETAIL_SLUGS = {
+    "illinois",
+    "indiana",
+    "iowa",
+    "kansas",
+    "missouri",
+    "ohio",
+    "pennsylvania",
+}
+
+
+def _state_row(
+    state: str,
+    month: str,
+    handle: float,
+    revenue: float,
+    hold: float | None = None,
+    source_url: str | None = None,
+    **extra: object,
+) -> StateMonthResult:
+    return StateMonthResult(
+        state=state,
+        month=month,
+        handle=handle,
+        revenue=revenue,
+        hold=hold_pct(handle, revenue) if hold is None else hold,
+        retail_handle=None,
+        retail_revenue=None,
+        retail_hold=None,
+        mobile_handle=None,
+        mobile_revenue=None,
+        mobile_hold=None,
+        source_url=source_url,
+        **extra,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _default_html() -> str:
+    return render_index_html()
 
 
 def test_all_ten_state_modules_expose_fetch_signature() -> None:
@@ -272,13 +379,13 @@ class TestFindStaleMonths:
 
 def test_publish_incremental_merge_preserves_older_months(tmp_path: pathlib.Path) -> None:
     data_dir = tmp_path / "data"
-    old_dec = StateMonthResult("Ohio", "2024-12", 500.0, 50.0, 10.0, None, None, None, None, None, None, "u0")
-    old_mar = StateMonthResult("Ohio", "2025-03", 600.0, 60.0, 10.0, None, None, None, None, None, None, "u1")
+    old_dec = _state_row("Ohio", "2024-12", 500.0, 50.0, source_url="u0")
+    old_mar = _state_row("Ohio", "2025-03", 600.0, 60.0, source_url="u1")
     csv_path = write_state_csv(str(data_dir), "ohio", [old_dec, old_mar])
 
     existing = read_state_csv(csv_path)
-    fresh_mar = StateMonthResult("Ohio", "2025-03", 750.0, 75.0, 10.0, None, None, None, None, None, None, "u2")
-    fresh_apr = StateMonthResult("Ohio", "2025-04", 700.0, 70.0, 10.0, None, None, None, None, None, None, "u3")
+    fresh_mar = _state_row("Ohio", "2025-03", 750.0, 75.0, source_url="u2")
+    fresh_apr = _state_row("Ohio", "2025-04", 700.0, 70.0, source_url="u3")
     merged = merge_state_results(existing, [fresh_mar, fresh_apr])
     assert [r.month for r in merged] == ["2024-12", "2025-03", "2025-04"]
     assert merged[0].handle == 500.0
@@ -310,9 +417,7 @@ def test_pennsylvania_fy27_filter_and_option_parsing() -> None:
 
 
 def test_render_index_html_has_partial_month_controls() -> None:
-    import re
-
-    html_text = render_index_html()
+    html_text = _default_html()
     assert "includePartial" in html_text
     assert "expectedStatesForMonth" in html_text
     month_m = re.search(r'<th[^>]*data-col="month"[^>]*>Month</th>', html_text)
@@ -329,10 +434,6 @@ def test_missouri_pdf_name_re_matches_underscores_and_revised() -> None:
 
 
 def test_cache_path_traversal_zero_byte_and_stale_refresh(tmp_path) -> None:
-    import os
-    import pytest
-    from statewager.cache import cache_path, load_cached_or_fetch, refresh_cached_if_stale
-
     base = str(tmp_path)
     for bad in ("", "../secret.pdf", "/etc/passwd", "sub/../../secret.pdf"):
         with pytest.raises(ValueError):
@@ -418,18 +519,6 @@ def test_cache_path_traversal_zero_byte_and_stale_refresh(tmp_path) -> None:
 
 
 def test_http_signature_discover_model_and_quality_guards(monkeypatch) -> None:
-    import datetime
-    import math
-    from statewager import quality
-    from statewager.discover import extract_month_label
-    from statewager.http import _matches_signature
-    from statewager.model import (
-        fiscal_year_july,
-        hold_pct,
-        parse_month_spec,
-        safe_float,
-    )
-
     assert _matches_signature(b"<!doctype html><html></html>", "https://example.com/a.pdf", "auto") is False
     assert _matches_signature(b"<!doctype html><html></html>", "https://example.com/download", "auto") is False
     assert _matches_signature(b"<html>ok</html>", "https://example.com/a.html", "auto") is True
@@ -467,11 +556,6 @@ def test_http_signature_discover_model_and_quality_guards(monkeypatch) -> None:
 
 
 def test_state_edge_cases_and_csv_null_roundtrip(tmp_path) -> None:
-    from publish.csv_writer import read_state_csv, write_state_csv
-    from statewager.model import StateMonthResult
-    from statewager.parse import parse_dollar
-    from statewager.states import illinois, kansas, nevada
-
     assert parse_dollar("-3455.1100") == -3455.11
     assert parse_dollar(-3455.11) == -3455.11
     assert illinois._NUM_TOKEN_RE.search("-$1,234.56") is not None
@@ -523,8 +607,6 @@ def test_state_edge_cases_and_csv_null_roundtrip(tmp_path) -> None:
 
 
 def test_operator_normalization_and_brand_classification() -> None:
-    from statewager.operators import BRAND_ORDER, classify_operator_brand, normalize_operator_name
-
     assert normalize_operator_name("JACK CLEVELAND (BETJACK)") == "Jack Cleveland - BetJack"
     assert normalize_operator_name("FANATICS-AMERISTAR KC") == "Fanatics - Ameristar KC"
     assert normalize_operator_name("KS CROSSING - CAESAR'S") == "Kansas Crossing - Caesars"
@@ -551,7 +633,7 @@ def test_operator_normalization_and_brand_classification() -> None:
     assert classify_operator_brand("Hillside (Iowa) LLC", state="Iowa") == "bet365"
     assert classify_operator_brand("Ameristar Casino (Retail)", state="Iowa") == "Other / Retail Venue"
     assert classify_operator_brand("Kansas Star - Bet365", state="Kansas") == "bet365"
-    assert classify_operator_brand("HOLLYWOOD - THE SCORE", state="Missouri") in {"PENN / ESPN Bet", "Other / Retail Venue"}
+    assert classify_operator_brand("HOLLYWOOD - THE SCORE", state="Missouri") == "PENN / ESPN Bet"
     assert classify_operator_brand("HOLLYWOOD - THESCORE", state="Missouri") == "PENN / ESPN Bet"
     assert classify_operator_brand("Valley Forge Casino", state="Pennsylvania") == "FanDuel"
     assert BRAND_ORDER[0] == "DraftKings"
@@ -559,34 +641,13 @@ def test_operator_normalization_and_brand_classification() -> None:
 
 
 def test_seven_states_expose_has_details() -> None:
-    from statewager.states import ALL_STATES, load_state_module
-
     detail_slugs = {
         slug for slug in ALL_STATES if getattr(load_state_module(slug), "HAS_DETAILS", False)
     }
-    assert detail_slugs == {
-        "illinois",
-        "indiana",
-        "iowa",
-        "kansas",
-        "missouri",
-        "ohio",
-        "pennsylvania",
-    }
+    assert detail_slugs == _EXPECTED_DETAIL_SLUGS
 
 
 def test_detail_csv_extraction_dedup_merge_and_write(tmp_path) -> None:
-    from publish.csv_writer import (
-        DETAIL_CSV_HEADERS,
-        PublishedDetailRow,
-        extract_published_details,
-        merge_detail_results,
-        read_detail_csv,
-        write_combined_detail_csv,
-        write_state_detail_csv,
-    )
-    from statewager.model import OperatorMonthResult, StateMonthResult, finalize_state_month
-
     # finalize_state_month prefers publish_details during publish while preserving details for downstream consumers.
     indiana_res = finalize_state_month(
         state="Indiana",
@@ -667,11 +728,7 @@ def test_detail_csv_extraction_dedup_merge_and_write(tmp_path) -> None:
 
 
 def test_index_html_has_entity_dropdown_and_detail_columns() -> None:
-    import json
-    import re
-    from publish.site import render_index_html
-
-    html = render_index_html()
+    html = _default_html()
     assert 'id="entitySelect"' in html
     assert 'id="detailCsvLink"' in html
     assert 'id="kpiRowsLabel"' in html
@@ -682,22 +739,12 @@ def test_index_html_has_entity_dropdown_and_detail_columns() -> None:
     m = re.search(r"const DETAIL_STATES = new Set\((\[.*?\])\);", html)
     assert m is not None
     detail_states = set(json.loads(m.group(1)))
-    assert detail_states == {
-        "illinois",
-        "indiana",
-        "iowa",
-        "kansas",
-        "missouri",
-        "ohio",
-        "pennsylvania",
-    }
+    assert detail_states == _EXPECTED_DETAIL_SLUGS
     assert "nevada" not in detail_states
 
 
 def test_indiana_spacer_columns_and_missouri_hyphen_spacing_regressions() -> None:
-    import pytest
     openpyxl = pytest.importorskip("openpyxl")
-    from statewager.states import indiana, missouri
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -725,17 +772,6 @@ def test_indiana_spacer_columns_and_missouri_hyphen_spacing_regressions() -> Non
 
 
 def test_fiscal_csv_roundtrip_and_legacy_compatibility(tmp_path: pathlib.Path) -> None:
-    from publish.csv_writer import (
-        CSV_HEADERS,
-        DETAIL_CSV_HEADERS,
-        extract_published_details,
-        read_detail_csv,
-        read_state_csv,
-        write_state_csv,
-        write_state_detail_csv,
-    )
-    from statewager.model import CORE_RESULT_FIELDS, OperatorMonthResult, finalize_state_month
-
     assert len(CORE_RESULT_FIELDS) == 12
     assert len(CSV_HEADERS) == 15
     assert CSV_HEADERS[-3:] == ["gross_revenue", "promo_deductions", "tax"]
@@ -817,10 +853,7 @@ def test_fiscal_csv_roundtrip_and_legacy_compatibility(tmp_path: pathlib.Path) -
 
 
 def test_state_fiscal_extractors(monkeypatch) -> None:
-    import io
-    import pytest
     openpyxl = pytest.importorskip("openpyxl")
-    from statewager.states import illinois, indiana, iowa, kansas, louisiana, missouri, ohio, pennsylvania
 
     # 1. Pennsylvania summary + operator fiscal block
     pa_rows = [
@@ -892,7 +925,6 @@ def test_state_fiscal_extractors(monkeypatch) -> None:
     assert ks_det_op["kansas crossing - betmgm"] == (100000.0, 20000.0, 8000.0)
 
     # 4. Louisiana workbook promo deduction & tax
-    import datetime
     wb_la = openpyxl.Workbook()
     ws_la = wb_la.active
     ws_la.append(["Month", None, "Handle", "Promo Deduct.", "Net Proceeds", "Taxes Paid 1"])
@@ -950,24 +982,10 @@ def test_state_fiscal_extractors(monkeypatch) -> None:
 
 
 def test_publish_all_partial_outage_resilience(tmp_path: pathlib.Path, monkeypatch) -> None:
-    import pytest
-    from publish.__main__ import publish_all
-    from publish.csv_writer import (
-        PublishedDetailRow,
-        read_detail_csv,
-        read_state_csv,
-        write_state_csv,
-        write_state_detail_csv,
-    )
-    from statewager.model import StateMonthResult
-    from statewager.states import nevada, ohio
-
     docs_dir = tmp_path / "docs"
     data_dir = docs_dir / "data"
     details_dir = data_dir / "details"
-    existing_oh = StateMonthResult(
-        "Ohio", "2026-02", 500.0, 50.0, 10.0, None, None, None, None, None, None, "u0", 50.0, 5.0, None,
-    )
+    existing_oh = _state_row("Ohio", "2026-02", 500.0, 50.0, source_url="u0", gross_revenue=50.0, promo_deductions=5.0)
     write_state_csv(str(data_dir), "ohio", [existing_oh])
     write_state_detail_csv(
         str(details_dir),
@@ -979,11 +997,7 @@ def test_publish_all_partial_outage_resilience(tmp_path: pathlib.Path, monkeypat
     monkeypatch.setattr(
         nevada,
         "fetch",
-        lambda *_a, **_kw: [
-            StateMonthResult(
-                "Nevada", "2026-03", 800.0, 60.0, 7.5, None, None, None, None, None, None, "https://nv.gov",
-            )
-        ],
+        lambda *_a, **_kw: [_state_row("Nevada", "2026-03", 800.0, 60.0, source_url="https://nv.gov")],
     )
 
     by_state = publish_all(
@@ -1028,9 +1042,7 @@ def test_publish_all_partial_outage_resilience(tmp_path: pathlib.Path, monkeypat
 
 
 def test_viewer_html_features_and_workflow_file() -> None:
-    from publish.site import render_index_html
-
-    html = render_index_html()
+    html = _default_html()
     for marker in (
         'id="freshnessBar"',
         'id="windowSelect"',
@@ -1073,15 +1085,6 @@ def test_viewer_html_features_and_workflow_file() -> None:
 
 
 def test_critique_core_fixes_and_single_pass_parsers(tmp_path: pathlib.Path, monkeypatch) -> None:
-    import datetime
-    import pytest
-    from publish.__main__ import main as publish_main
-    from publish.csv_writer import _parse_opt_float
-    from statewager.discover import AnchorParser
-    from statewager.model import parse_month_spec
-    from statewager.operators import classify_operator_brand, normalize_operator_name
-    from statewager.states import STATE_ABBR_TO_SLUG, iowa, load_state_module, louisiana, missouri
-
     # parse_month_spec validation & variant formats
     assert parse_month_spec("Mar-2026") == datetime.date(2026, 3, 1)
     assert parse_month_spec("2026-03-15") == datetime.date(2026, 3, 1)
@@ -1156,19 +1159,6 @@ def test_critique_core_fixes_and_single_pass_parsers(tmp_path: pathlib.Path, mon
 
 
 def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) -> None:
-    import datetime
-    import json
-    import os
-    import pytest
-    import publish.__main__ as pub_main
-    from publish.csv_writer import PublishedDetailRow, merge_detail_results, read_detail_csv, write_state_detail_csv
-    from publish.site import _safe_inline_json, render_index_html
-    from statewager import http as sw_http
-    from statewager.cache import cache_path, recent_cache_ttl, recent_fy_cache_ttl
-    from statewager.model import finalize_state_month, hold_pct
-    from statewager.operators import normalize_operator_name
-    from statewager.states import indiana, iowa, kansas, missouri, nevada, ohio, pennsylvania
-
     # 1. cache_path rejects "." and symlink escapes while accepting clean subpaths
     cache_root = tmp_path / "cache_root"
     cache_root.mkdir()
@@ -1278,21 +1268,13 @@ def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) ->
     # publish_all: --no-merge keeps existing ohio (when 0 rows for one state) + untouched nevada
     docs_dir = tmp_path / "docs"
     data_dir = docs_dir / "data"
-    write_state_csv(
-        str(data_dir),
-        "nevada",
-        [StateMonthResult("Nevada", "2026-02", 500.0, 50.0, 10.0, None, None, None, None, None, None, None)],
-    )
-    write_state_csv(
-        str(data_dir),
-        "ohio",
-        [StateMonthResult("Ohio", "2026-02", 600.0, 60.0, 10.0, None, None, None, None, None, None, None)],
-    )
+    write_state_csv(str(data_dir), "nevada", [_state_row("Nevada", "2026-02", 500.0, 50.0)])
+    write_state_csv(str(data_dir), "ohio", [_state_row("Ohio", "2026-02", 600.0, 60.0)])
     monkeypatch.setattr(ohio, "fetch", lambda *_a, **_kw: [])
     monkeypatch.setattr(
         missouri,
         "fetch",
-        lambda *_a, **_kw: [StateMonthResult("Missouri", "2026-02", 400.0, 40.0, 10.0, None, None, None, None, None, None, None)],
+        lambda *_a, **_kw: [_state_row("Missouri", "2026-02", 400.0, 40.0)],
     )
     res_map = pub_main.publish_all(
         month_start="2026-02",
@@ -1338,7 +1320,7 @@ def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) ->
     # 6. viewer inline JSON escaping & ARIA/safety markers
     escaped = _safe_inline_json("</script>&\u2028\u2029")
     assert "</" not in escaped and "&" not in escaped and "\\u2028" in escaped and "\\u2029" in escaped
-    html = render_index_html()
+    html = _default_html()
     assert "TABLE_COLUMNS.some((c) => c.key === sc)" in html
     assert 'aria-controls="comparePanel"' in html
     assert 'aria-live="polite"' in html
@@ -1356,14 +1338,6 @@ def test_adversarial_reviews_regressions(tmp_path: pathlib.Path, monkeypatch) ->
 
 
 def test_maintenance_status_json_and_recheck_months(tmp_path: pathlib.Path, monkeypatch) -> None:
-    import datetime
-    import json
-    import pytest
-    import publish.__main__ as pub_main
-    from publish.csv_writer import write_status_json
-    from publish.site import render_index_html
-    from statewager.states import iowa, nevada
-
     # Iowa FY archive missing sections log INFO for current FY and WARN for closed FY
     today = datetime.date.today()
     cur_fy_end = today.year + (1 if today.month >= 7 else 0)
@@ -1393,16 +1367,16 @@ def test_maintenance_status_json_and_recheck_months(tmp_path: pathlib.Path, monk
         str(recheck_data),
         "nevada",
         [
-            StateMonthResult("Nevada", "2026-07", 100.0, 10.0, 10.0, None, None, None, None, None, None, None),
-            StateMonthResult("Nevada", "2026-08", 110.0, 11.0, 10.0, None, None, None, None, None, None, None),
-            StateMonthResult("Nevada", "2026-09", 120.0, 12.0, 10.0, None, None, None, None, None, None, None),
+            _state_row("Nevada", "2026-07", 100.0, 10.0),
+            _state_row("Nevada", "2026-08", 110.0, 11.0),
+            _state_row("Nevada", "2026-09", 120.0, 12.0),
         ],
     )
     seen_spans: list[tuple[object, object]] = []
 
     def _fake_nv_fetch(ms, me, **_kw):
         seen_spans.append((ms, me))
-        return [StateMonthResult("Nevada", "2026-09", 125.0, 12.5, 10.0, None, None, None, None, None, None, None)]
+        return [_state_row("Nevada", "2026-09", 125.0, 12.5)]
 
     monkeypatch.setattr(nevada, "fetch", _fake_nv_fetch)
     pub_main.publish_all(
@@ -1431,7 +1405,7 @@ def test_maintenance_status_json_and_recheck_months(tmp_path: pathlib.Path, monk
     assert status_2["data_updated_at"] == status_1["data_updated_at"]
 
     # When CSV bytes change, hash and data_updated_at update
-    updated_rows = [StateMonthResult("Nevada", "2026-10", 130.0, 13.0, 10.0, None, None, None, None, None, None, None)]
+    updated_rows = [_state_row("Nevada", "2026-10", 130.0, 13.0)]
     write_combined_csv(str(recheck_data), nv_rows + updated_rows)
     write_status_json(str(recheck_data), nv_rows + updated_rows, [], [("nevada", "Nevada")], now_utc=later)
     status_3 = json.loads(status_path.read_text(encoding="utf-8"))
@@ -1443,12 +1417,936 @@ def test_maintenance_status_json_and_recheck_months(tmp_path: pathlib.Path, monk
         pub_main.main(["--recheck-months", "0"])
 
     # Viewer HTML includes status.json recency hook & freshness badge
-    html = render_index_html()
+    html = _default_html()
     assert "data/status.json" in html
     assert "freshness-updated" in html
     assert "fetchStatusMeta" in html
 
 
+def test_critique_r4_pa_retry_and_try_save_cache(tmp_path: pathlib.Path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def _fake_fetch_text(url, **_kw):
+        calls.append(url)
+        if url == pennsylvania.REVENUE_PAGE:
+            raise RuntimeError("primary index down")
+        return ""
+
+    monkeypatch.setattr(pennsylvania, "fetch_text", _fake_fetch_text)
+    monkeypatch.setattr(
+        pennsylvania,
+        "crawl_anchors",
+        lambda url, **_kw: calls.append(f"crawl:{url}") or [
+            {"href": "/sites/default/files/2026-09.xlsx", "title": "", "text": "Sep 2026"},
+            {"href": pennsylvania._absolute_url("/sites/default/files/2026-09.xlsx"), "title": "", "text": "Dup"},
+        ],
+    )
+    pa_logs: list[str] = []
+    anchors = pennsylvania.crawl_revenue_index(log=pa_logs.append, target_fys={(2026, 2027)})
+    assert calls[0] == pennsylvania.REVENUE_PAGE
+    assert f"crawl:{pennsylvania.REVENUE_PAGE}" not in calls
+    assert any("WARN could not fetch anchor index" in m for m in pa_logs)
+    assert len(anchors) == 1
+
+    # try_save_cache logs WARN and returns False when OSError occurs
+    save_logs: list[str] = []
+    monkeypatch.setattr("statewager.cache.save_cache", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk full")))
+    assert try_save_cache(str(tmp_path / "x.bin"), b"abc", log=save_logs.append) is False
+    assert any("WARN could not write cache" in m for m in save_logs)
+
+
+def test_adversarial_r1_core_security_and_edge_cases(tmp_path: pathlib.Path, monkeypatch) -> None:
+    # 1. HTTP: Retry-After bounds/Inf, SSRF host & Wayback guards, non-retryable 403, bounded response, _matches_signature
+    assert sw_http._resolve_retry_after("inf") is None
+    assert sw_http._resolve_retry_after("-inf") is None
+    assert sw_http._resolve_retry_after("86400") == sw_http._MAX_RETRY_AFTER_SECONDS
+    assert sw_http._should_try_wayback("2026-13") is False
+
+    for bad_url in ("file:///etc/passwd", "http://127.0.0.1/secret", "http://169.254.169.254/latest/meta-data/"):
+        with pytest.raises(ValueError):
+            sw_http.retry_request("GET", bad_url)
+
+    with pytest.raises(ValueError, match="Unsupported signature_check"):
+        _matches_signature(b"%PDF", "https://example.com/a.pdf", "pdf")
+
+    class _StreamResp:
+        def __init__(self, status_code: int, headers: dict[str, str], chunks: list[bytes]) -> None:
+            self.status_code = status_code
+            self.headers = headers
+            self._chunks = chunks
+            self.closed = False
+
+        def iter_content(self, chunk_size: int = 65536):
+            del chunk_size
+            yield from self._chunks
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError(response=self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    calls_403: list[str] = []
+
+    class _FakeSession:
+        def request(self, _m, u, **_kw):
+            calls_403.append(u)
+            return _StreamResp(403, {}, [])
+
+    with pytest.raises(requests.HTTPError):
+        sw_http.retry_request("GET", "https://example.com/forbidden", retries=3, session=_FakeSession())  # type: ignore[arg-type]
+    assert len(calls_403) == 1
+
+    monkeypatch.setattr(sw_http, "retry_get", lambda *_a, **_kw: _StreamResp(200, {}, [b"abc", b"defg"]))
+    with pytest.raises(ValueError, match="exceeds limit"):
+        sw_http.fetch_bytes("https://example.com/big", max_bytes=5)
+
+    wb_urls: list[str] = []
+
+    def _fake_wb_text(_u, **_kw):
+        return json.dumps({"archived_snapshots": {"closest": {"available": False, "url": "http://127.0.0.1/"}}})
+
+    monkeypatch.setattr(sw_http, "fetch_text", _fake_wb_text)
+    assert sw_http._fetch_wayback_snapshot("https://example.com/r.pdf") is None
+
+    monkeypatch.setattr(
+        sw_http,
+        "fetch_text",
+        lambda *_a, **_kw: json.dumps({"archived_snapshots": {"closest": {"available": True, "url": "http://169.254.169.254/x"}}}),
+    )
+    assert sw_http._fetch_wayback_snapshot("https://example.com/r.pdf") is None
+
+    monkeypatch.setattr(
+        sw_http,
+        "fetch_text",
+        lambda *_a, **_kw: json.dumps({"archived_snapshots": {"closest": {"available": True, "url": "http://web.archive.org/web/202501/https://example.com/r.pdf"}}}),
+    )
+    monkeypatch.setattr(sw_http, "fetch_bytes", lambda u, **_kw: wb_urls.append(u) or b"%PDF-1.4")
+    assert sw_http._fetch_wayback_snapshot("https://example.com/r.pdf") == b"%PDF-1.4"
+    assert wb_urls == ["https://web.archive.org/web/202501/https://example.com/r.pdf"]
+
+    # 2. Cache: self-symlink rejection, find_local_month_file word boundary, refresh_cached_if_stale mtime & OSError
+    croot = tmp_path / "cache"
+    croot.mkdir()
+    os.symlink(".", str(croot / "self_link"))
+    with pytest.raises(ValueError):
+        cache_path(str(croot), "self_link")
+
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    (local_dir / "summary_2025_02.pdf").write_bytes(b"%PDF")
+    assert find_local_month_file(str(local_dir), 2025, 3, ".pdf") is None
+    (local_dir / "march_2025_report.pdf").write_bytes(b"%PDF-MAR")
+    matched_local = find_local_month_file(str(local_dir), 2025, 3, ".PDF")
+    assert matched_local is not None and matched_local[1] == b"%PDF-MAR"
+
+    stale_file = tmp_path / "stale.bin"
+    stale_file.write_bytes(b"same")
+    old_ts = time.time() - 7200
+    os.utime(stale_file, (old_ts, old_ts))
+    assert refresh_cached_if_stale(str(stale_file), b"same", max_age_seconds=60, fetcher=lambda: b"same") is None
+    assert stale_file.stat().st_mtime > old_ts
+    os.utime(stale_file, (old_ts, old_ts))
+    monkeypatch.setattr("statewager.cache.save_cache", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("ro fs")))
+    ref_logs: list[str] = []
+    assert refresh_cached_if_stale(
+        str(stale_file), b"same", max_age_seconds=60, fetcher=lambda: b"updated", log=ref_logs.append,
+    ) == b"updated"
+    assert any("WARN could not write cache" in m for m in ref_logs)
+
+    # 3. Parse: XLSX ZIP bomb / invalid archive guard + PDF page range validation
+    bomb_buf = io.BytesIO()
+    with zipfile.ZipFile(bomb_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/big.xml", b"0" * (12 * 1024 * 1024))
+    bomb_logs: list[str] = []
+    with open_xlsx_workbook(bomb_buf.getvalue(), openpyxl_mod=object(), log=bomb_logs.append) as wb_none:
+        assert wb_none is None
+    assert any("compression ratio" in m for m in bomb_logs)
+    with pytest.raises(ValueError):
+        extract_pdf_text(b"%PDF", first_page=0)
+    with pytest.raises(ValueError):
+        extract_pdf_text(b"%PDF", first_page=3, last_page=1)
+
+    # 4. Discover: boundary fixes & per-month cumulative exclusion
+    assert extract_month_label("2025_04_marketing.xlsx") == "Apr 2025"
+    assert extract_month_label("report_904_2025.pdf") is None
+    assert extract_month_label("report_03_202599.pdf") is None
+    assert extract_month_label("03_12_2025.pdf") is None
+    assert extract_month_label("dismay_2025.pdf") is None
+    assert extract_month_label("2025_mayo.pdf") is None
+    assert parse_text_month("September 202501") is None
+    assert classify_cumulative_filename("fy24-25_mobile_sb_apr_2025.xlsx") is None
+
+    # 5. Quality: Kansas vs Arkansas boundary, HTML entity unescape, NaN/Inf/zero-baseline, single-flight fetch
+    sh_html = (
+        "<h2>Arkansas Sports Betting</h2><table><tr><th>Month</th><th>Handle</th><th>Revenue</th></tr>"
+        "<tr><td>Apr 2026</td><td>$1&nbsp;</td><td>$1</td></tr></table>"
+        "<h2><span>Kansas</span> Sports Betting</h2><table><tr><th>Month</th><th>Handle</th><th>Revenue</th></tr>"
+        "<tr><td>Apr 2026</td><td>&nbsp;$2,000,000</td><td>$200,000</td></tr></table>"
+    )
+    monkeypatch.setattr(quality, "fetch_text", lambda *_a, **_kw: sh_html)
+    quality._SPORTSHANDLE_HTML_CACHE.clear()
+    ks_sh = quality.query_aggregator_sportshandle("Kansas")
+    assert ks_sh == {"Apr 2026": (2_000_000.0, 200_000.0)}
+    fetch_calls = 0
+
+    def _slow_loader() -> str:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        time.sleep(0.02)
+        return "ok"
+
+    tmp_cache: dict[tuple[str, object], str] = {}
+    barrier = threading.Barrier(4)
+    out_vals: list[str | None] = []
+
+    def _worker() -> None:
+        barrier.wait()
+        out_vals.append(quality._cached_source_fetch(tmp_cache, "https://example.test", _slow_loader, _slow_loader))
+
+    threads = [threading.Thread(target=_worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert fetch_calls == 1 and out_vals == ["ok"] * 4
+
+    monkeypatch.setattr(quality, "_aggregator_lookup", lambda *_a, **_kw: (100_000.0, 10_000.0))
+    assert quality.validate_against_aggregators("Kansas", "Apr 2026", float("nan"), 10_000.0) is False
+    assert quality.check_anomaly("Kansas", "Apr 2026", 10_000_000.0, 0.0, [(0.0, 0.0)] * 3) is False
+
+    # 6. Operators & Model edge cases
+    assert classify_operator_brand("Hard Rock Casino (Retail)", state="iowa") == "Other / Retail Venue"
+    assert classify_operator_brand("Fairmount Park, Inc.", state="il") == "FanDuel"
+    assert classify_operator_brand("HARRAH\u2019S HOOSIER PARK", state="Indiana") == "Caesars"
+    assert normalize_operator_name("FAIRMOUNT PARK, INC.,") == "Fairmount Park, Inc.,"
+    assert normalize_operator_name("CROWN IA GAMING LLC. - DRAFTKINGS") == "Crown IA Gaming LLC - DraftKings"
+    assert normalize_operator_name("CASINO IN OHIO") == "Casino in Ohio"
+    assert normalize_operator_name("BELTERRA PARK-FANDUEL") == "Belterra Park - FanDuel"
+
+    assert month_yyyymm((None, 1)) is None
+    with pytest.raises(ValueError):
+        parse_month_spec((2025, True))
+    with pytest.raises(ValueError):
+        fiscal_year_july(2025, 13)
+    assert resolve_fetch_months(
+        "2025-01", "2025-02", launch_date=datetime.datetime(2024, 1, 15, 12, 0),
+    ) == [datetime.date(2025, 1, 1), datetime.date(2025, 2, 1)]
+    neg_logs: list[str] = []
+    rh_rec, _rr_rec, _mh_rec, _mr_rec = reconcile_components(
+        "OH", 100.0, 10.0, None, None, 150.0, 20.0, log=neg_logs.append,
+    )
+    assert rh_rec is None and any("negative retail handle" in m for m in neg_logs)
+    strict_bad = finalize_state_month(
+        state="Ohio",
+        iso_month="2026-02",
+        handle=100.0,
+        revenue=10.0,
+        mobile_handle=150.0,
+        mobile_revenue=20.0,
+        strict_split_pct=0.05,
+    )
+    assert strict_bad is not None and strict_bad.retail_handle is None and strict_bad.mobile_handle is None
+
+
+def test_public_tree_excludes_private_tokens() -> None:
+    root = pathlib.Path(__file__).resolve().parent.parent
+    forbidden = (
+        "write_to_" + "sheet",
+        "g" + "og",
+        "run_" + "gog",
+        "bo" + "yd",
+        "1A2" + "a8zz",
+        "kr" + "im",
+        "jo" + "ey",
+        "open" + "claw",
+    )
+    pattern = re.compile("|".join(re.escape(tok) for tok in forbidden), re.IGNORECASE)
+    for folder in ("statewager", "publish", "docs"):
+        for path in sorted((root / folder).rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                match = pattern.search(text)
+                assert match is None, f"Forbidden token {match.group(0)!r} found in {path}"
+
+
+def test_adversarial_r2_state_parsers_and_cache(tmp_path: pathlib.Path, monkeypatch) -> None:
+    from contextlib import contextmanager
+
+    class _MockSheet:
+        def __init__(self, title: str, rows: list[tuple[object, ...]]) -> None:
+            self.title = title
+            self._rows = rows
+
+        def iter_rows(self, values_only: bool = True):
+            del values_only
+            return iter(self._rows)
+
+    class _MockWorkbook:
+        def __init__(self, sheets: list[_MockSheet]) -> None:
+            self.worksheets = sheets
+            self.sheetnames = [s.title for s in sheets]
+
+        def __getitem__(self, key: str) -> _MockSheet:
+            return next(s for s in self.worksheets if s.title == key)
+
+    # 1. Missouri: apostrophe stripping, subtitle immunity, STATE TOTALS reset
+    assert missouri.detail_operator_key("Barstool's") == missouri.detail_operator_key("Barstools")
+    mo_pages = [
+        "\n".join([
+            "SPORTS WAGERING RETAIL STATISTICAL REPORT",
+            "ALPHA CASINO",
+            "Feb-26  $100.00  $90.00  $10.00",
+            "STATE TOTALS MTD:  $100.00  $90.00  $10.00",
+            "Page 2",
+            "SPORTS WAGERING MOBILE STATISTICAL REPORT",
+            "BETA MOBILE - Mobile Jan-26  $50.00  $45.00  $5.00",
+            "Interactive Division Feb-26",
+            "Feb-26  $200.00  $180.00  $20.00  $2.00",
+            "STATE TOTALS MTD:  $200.00  $180.00  $20.00  $2.00",
+            "STATE TOTALS:  $999.00  $888.00  $99.00  $9.00",
+            "SPORTS WAGERING GROSS RECEIPTS & TAX REPORT",
+            "STATISTICAL REPORT SUMMARY",
+        ])
+    ]
+    stat_totals, mo_details, _sg, state_tax, _og, _ot = missouri._scan_missouri_pages(mo_pages, 2026, 2)
+    assert stat_totals["stat_retail"] == (100.0, 10.0)
+    assert stat_totals["stat_mobile"] == (200.0, 20.0)
+    assert state_tax == 2.0
+    by_mo_op = {row[0]: row for row in mo_details}
+    assert "BETA MOBILE" in by_mo_op and by_mo_op["BETA MOBILE"][5:7] == (200.0, 20.0)
+    assert "Interactive Division" not in by_mo_op
+
+    # 2. Kansas: narrow detail header table + clear partial op_buckets on fallback
+    class _FakeKsCache:
+        def __init__(self) -> None:
+            self._rows = [
+                ["Casino", "Platform", "Settled Wagers", "Prizes", "Promotional", "Net", "State Share"],
+                ["Boot Hill", "DraftKings", "$1,000", "$900", "$10", "$90", "$9"],
+                ["Totals", "", "$1,000", "$900", "$10", "$90", "$9"],
+            ]
+
+        def flattened_rows(self):
+            return True, self._rows
+
+        def raw_text(self):
+            return None
+
+    monkeypatch.setattr(kansas, "pdfplumber", object())
+    ks_state_f, ks_ops_f = kansas.parse_detail_fiscal(b"%PDF", "Mar 2026", _page_cache=_FakeKsCache())
+    assert ks_state_f == (100.0, 10.0, 9.0)
+    assert "boot hill - draftkings" in ks_ops_f
+
+    class _PartialFailKsCache:
+        def flattened_rows(self):
+            return True, [
+                ["Casino", "Platform", "Settled Wagers", "Prizes", "Promotional", "Net", "State Share"],
+                ["Boot Hill Stale", "FanDuel", "$500", "$400", "$5", "$95", "$9"],
+            ]
+
+        def raw_text(self):
+            return (
+                "Hollywood Fresh (BetMGM) $100 $1000 $900 $10 $90 $9\n"
+                "Totals $1000 $900 $10 $90 $9\n"
+            )
+
+    ks_partial_state, ks_partial_ops = kansas.parse_detail_fiscal(
+        b"%PDF", "Mar 2026", _page_cache=_PartialFailKsCache(),
+    )
+    assert "boot hill stale - fanduel" not in ks_partial_ops
+    assert ks_partial_state is not None
+
+    # 3. Illinois: stripped headers & unvalidated HTTP CSV must not clobber stale cache
+    cash_bytes = (
+        "Sport Level, Licensee , Location Type , Tier 1 Handle , Tier 2 Handle \n"
+        "Pro, Alpha Book , Online Wagering , $100 , $50 \n"
+    ).encode("utf-8")
+    accr_bytes = (
+        "Location Type , Licensee , State AGR , State Tax \n"
+        "Online Wagering , Alpha Book , $15 , $3 \n"
+    ).encode("utf-8")
+    assert illinois._scan_cash_csv(cash_bytes)[0] == (150.0, 0.0, 150.0)
+    assert illinois._scan_accrual_csv(accr_bytes)[0] == (15.0, 0.0, 15.0)
+
+    il_cache = tmp_path / "il_cache"
+    il_cache.mkdir()
+    recent_date = datetime.date.today().replace(day=1)
+    recent_ym = f"{recent_date.year}_{recent_date.month:02d}"
+    detail_file = il_cache / f"illinois_{recent_ym}_detail.csv"
+    tax_file = il_cache / f"illinois_{recent_ym}_tax.csv"
+    detail_file.write_bytes(cash_bytes)
+    tax_file.write_bytes(accr_bytes)
+    stale_ts = time.time() - 30 * 86400
+    os.utime(detail_file, (stale_ts, stale_ts))
+    os.utime(tax_file, (stale_ts, stale_ts))
+    monkeypatch.setattr(illinois, "_bootstrap_aem_tokens", lambda *_a, **_kw: ("p", "r", "v"))
+    monkeypatch.setattr(illinois, "post_report_csv", lambda *_a, **_kw: b"<html>error page</html>")
+    il_res = illinois.fetch(
+        (recent_date.year, recent_date.month),
+        cache_dir=str(il_cache),
+        log=lambda _m: None,
+    )
+    assert len(il_res) == 1 and il_res[0].handle == 150.0 and il_res[0].revenue == 15.0
+    assert detail_file.read_bytes() == cash_bytes
+
+    # 4. Indiana & Ohio: consecutive header rows + subtotal exclusion & single fetch
+    in_wb = _MockWorkbook([
+        _MockSheet("SW Summary", [
+            ("Operator", "Handle", None, None),
+            (None, None, "Taxable AGR", None),
+            ("TOTAL", 500.0, 50.0, None),
+        ])
+    ])
+    assert indiana.parse_summary_totals(in_wb) == (500.0, 50.0)
+
+    # Check subtotal exclusion when fallback branch reached before Online subtotal sets section=None
+    oh_sheet2 = _MockSheet("Jan2026", [
+        ("Type A Proprietors - Online Sports Gaming", None, None, None, None, None),
+        ("Type B Proprietors - Retail Sports Gaming", None, None, None, None, None),
+        ("Retail Prop", 40.0, 0.0, 0.0, 0.0, 4.0),
+        ("Subtotal Type B Retail", 40.0, 0.0, 0.0, 0.0, 4.0),
+        ("Type A Proprietors - Online Sports Gaming", None, None, None, None, None),
+        ("Subtotal Extra", 60.0, 0.0, 0.0, 0.0, 6.0),
+        ("Total Online and Retail", 100.0, 0.0, 0.0, 0.0, 10.0),
+    ])
+    oh_parsed = ohio._parse_month_sheet_with_fiscal(oh_sheet2)
+    assert oh_parsed is None  # Online subtotal wasn't seen so returns None, and Subtotal Extra wasn't added
+    oh_sheet3 = _MockSheet("Jan2026", [
+        ("Type A Proprietors - Online Sports Gaming", None, None, None, None, None),
+        ("Online Prop", 60.0, 0.0, 0.0, 0.0, 6.0),
+        ("Subtotal Type A Online", 60.0, 0.0, 0.0, 0.0, 6.0),
+        ("Type B Proprietors - Retail Sports Gaming", None, None, None, None, None),
+        ("Retail Prop", 40.0, 0.0, 0.0, 0.0, 4.0),
+        ("Subtotal Type B Retail", 40.0, 0.0, 0.0, 0.0, 4.0),
+        ("Total Online and Retail", 100.0, 0.0, 0.0, 0.0, 10.0),
+    ])
+    oh_core, _, _, _ = ohio._parse_month_sheet_with_fiscal(oh_sheet3)
+    assert [d[0] for d in oh_core[6]] == ["Online Prop", "Retail Prop"]
+
+    # Ohio single download guard on expired cache missing month
+    oh_cache = tmp_path / "oh_cache"
+    oh_cache.mkdir()
+    oh_cfile = oh_cache / f"ohio_{recent_date.year}_cumulative.xlsx"
+    oh_cfile.write_bytes(b"PK\x03\x04old")
+    os.utime(oh_cfile, (stale_ts, stale_ts))
+    oh_dl_calls: list[int] = []
+    monkeypatch.setattr(ohio, "openpyxl", object())
+    monkeypatch.setattr(
+        ohio,
+        "download_cumulative_workbook",
+        lambda *_a, **_kw: oh_dl_calls.append(1) or b"PK\x03\x04new",
+    )
+    monkeypatch.setattr(ohio, "_parse_cumulative_xlsx_with_fiscal", lambda *_a, **_kw: ({}, {}))
+    ohio.fetch((recent_date.year, recent_date.month), cache_dir=str(oh_cache), log=lambda _m: None)
+    assert len(oh_dl_calls) == 1
+
+    # 5. Pennsylvania: .xlsx-only discovery, relative URL, month patterns, dynamic short operator blocks
+    assert pennsylvania._is_fy_summary_anchor(
+        "/sites/default/files/fy25-26-monthly-sports-wagering-report-summary.pdf",
+        "",
+        "FY 25-26 Monthly Sports Wagering Summary",
+    ) is None
+    assert pennsylvania._is_fy_summary_anchor(
+        "/sites/default/files/FY2025-2026_Sports_Wagering_Monthly_Summary.xlsx?v=1",
+        "",
+        "FY 2025-2026 Monthly Sports Wagering Summary",
+    ) == (2025, 2026)
+    assert pennsylvania._absolute_url("reports/fy26.xlsx") == (
+        "https://gamingcontrolboard.pa.gov/news-and-transparency/reports/fy26.xlsx"
+    )
+    pa_cols = pennsylvania.parse_month_columns(
+        [("Op", "July 2025", "Sept 2025", "Augusta", "January 2026")],
+        2025,
+        2026,
+    )
+    assert pa_cols == {1: "Jul 2025", 2: "Sep 2025", 4: "Jan 2026"}
+    pa_rows = [
+        ("OpShort", None),
+        ("Total Sports Wagering", None),
+        ("Handle*", 100.0),
+        ("Revenue", 10.0),
+        ("Promotional Credits", 2.0),
+        ("Retail Sports Wagering", None),
+        ("Handle*", 100.0),
+        ("Revenue", 10.0),
+        ("OpSecond", None),
+        ("Total Sports Wagering", None),
+        ("Handle*", 200.0),
+        ("Revenue", 20.0),
+        ("Online Sports Wagering", None),
+        ("Handle*", 200.0),
+        ("Revenue", 20.0),
+    ]
+    blocks = list(pennsylvania._iter_operator_blocks(pa_rows))
+    assert blocks == [(0, "OpShort"), (8, "OpSecond")]
+    pa_det = pennsylvania.parse_detail_metrics(pa_rows, 2025, 2026, col_to_label={1: "Jul 2025"})
+    assert len(pa_det["Jul 2025"]) == 2
+    assert pa_det["Jul 2025"][0][3:7] == (100.0, 10.0, None, None)
+    assert pa_det["Jul 2025"][1][3:7] == (None, None, 200.0, 20.0)
+    assert pennsylvania._extract_fiscal_block(pa_rows, 8, {1: "Jul 2025"}) == {"Jul 2025": (20.0, None, None)}
+
+    # 6. Nevada: negative Win, placeholder %-change slot, None mobile split, per-report TTL
+    assert nevada.parse_sports_line("Sports Pool (2) 10 10 -125 -50.0 -2.5", "Sports Pool (2)") == (5_000_000.0, -125_000.0)
+    assert nevada.parse_sports_line("Sports Pool (2) 10 10 \u2212125 -50.0 \u22122.5", "Sports Pool (2)") == (
+        5_000_000.0,
+        -125_000.0,
+    )
+    assert nevada.parse_sports_row_values(
+        ["Sports Pool (2)", 180, 180, 45_000, "-", 5.0, 120_000, 10.0, 5.2],
+        "Sports Pool (2)",
+    ) == pytest.approx((900_000_000.0, 45_000_000.0))
+    assert nevada._with_mobile_splits(100.0, 10.0, None, []) == (100.0, 10.0, None, None, None, None, [])
+
+    nv_cache = tmp_path / "nv_cache"
+    nv_cache.mkdir()
+    nv_xlsx = nv_cache / f"nevada_{recent_ym}.xlsx"
+    nv_pdf = nv_cache / f"nevada_{recent_ym}.pdf"
+    nv_xlsx.write_bytes(b"PK\x03\x04stale")
+    nv_pdf.write_bytes(b"%PDF-1.4 fresh")
+    os.utime(nv_xlsx, (stale_ts, stale_ts))
+    monkeypatch.setattr(nevada, "discover_report_urls", lambda **_kw: {})
+    monkeypatch.setattr(
+        nevada,
+        "parse_report_bytes",
+        lambda kind, data, **_kw: (200.0, 20.0, 50.0, 5.0, 150.0, 15.0, []) if kind == "pdf" else None,
+    )
+    nv_res = nevada.fetch((recent_date.year, recent_date.month), cache_dir=str(nv_cache), log=lambda _m: None)
+    assert len(nv_res) == 1 and nv_res[0].source_url is None and nv_res[0].handle == 200.0
+
+    # 7. Iowa: FY link filtering, repeated same-month headings + ß/ﬁ ligatures, x-tolerance
+    ia_fy_links = iowa._parse_fy_media_links([
+        {"href": "/media/1/download", "text": "FY2026 Fantasy Sports Archive", "title": ""},
+        {"href": "/media/2/download", "text": "FY2026 Advanced Deposit Wagering", "title": ""},
+        {"href": "/media/3/download", "text": "FY2026 Sports Wagering Amended", "title": ""},
+        {"href": "/media/4/download", "text": "FY2026 Casino Gaming Archive", "title": ""},
+        {"href": "/media/5/download", "text": "FY2026 Sports Wagering Revenue Archive", "title": ""},
+    ])
+    assert ia_fy_links == {(2025, 2026): 5}
+    ia_text = (
+        "\ufb01 ß Preamble\n"
+        "SPORTS WAGERING REVENUE REPORT -- OCTOBER 2025\n"
+        "Page 1 intro\n"
+        "SPORTS WAGERING REVENUE REPORT -- OCTOBER 2025\n"
+        "TOTALS\n"
+        "SPORTS WAGERING NET RECEIPTS $1,000.00\n"
+        "SPORTS WAGERING HANDLE $10,000.00\n"
+        "RETAIL HANDLE $2,000.00\n"
+        "RETAIL NET RECEIPTS $200.00\n"
+        "INTERNET HANDLE $8,000.00\n"
+        "INTERNET NET RECEIPTS $800.00\n"
+        "SPORTS WAGERING REVENUE REPORT -- NOVEMBER 2025\n"
+    )
+    ia_parsed = iowa.parse_month_section(ia_text, "Oct 2025")
+    assert ia_parsed is not None and ia_parsed.metrics[:2] == (10_000.0, 1_000.0)
+    ia_details: dict[str, list[tuple[str, float, float, float | None, float | None, float | None, float | None]]] = {}
+
+    class _MockIaPage:
+        def extract_words(self, **_kw) -> list[dict[str, object]]:
+            return [
+                {"text": "Alpha", "top": 10.0, "x0": 110.0, "x1": 160.0},
+                {"text": "Beta", "top": 10.0, "x0": 240.0, "x1": 290.0},
+                {"text": "RETAIL", "top": 30.0, "x0": 10.0, "x1": 45.0},
+                {"text": "HANDLE", "top": 30.0, "x0": 50.0, "x1": 90.0},
+                {"text": "$100.00", "top": 30.0, "x0": 120.0, "x1": 160.0},
+                {"text": "$200.00", "top": 30.0, "x0": 250.0, "x1": 290.0},
+                {"text": "RETAIL", "top": 50.0, "x0": 10.0, "x1": 40.0},
+                {"text": "NET", "top": 50.0, "x0": 42.0, "x1": 60.0},
+                {"text": "RECEIPTS", "top": 50.0, "x0": 62.0, "x1": 95.0},
+                {"text": "$20.00", "top": 50.0, "x0": 250.0, "x1": 290.0},
+            ]
+
+    iowa._extract_details_from_page(
+        _MockIaPage(),
+        "SPORTS WAGERING REVENUE REPORT -- OCTOBER 2025",
+        None,
+        None,
+        ia_details,
+    )
+    assert ia_details["Oct 2025"] == [("Beta (Retail)", 200.0, 20.0, 200.0, 20.0, None, None)]
+
+    # 8. Discover & Louisiana: dir-date immunity, fy2026, FY rolling ranking, remote_cumulative before cache
+    assert classify_sportsbook_filename(
+        "https://lsp.org/wp-content/uploads/2025/09/fy26_mobile_sb.xlsx",
+        text="FY26 Mobile Sportsbook",
+    ) is None
+    cum_2026 = classify_cumulative_filename(
+        "https://lsp.org/wp-content/uploads/2025/09/fy2026_mobile_sb.xlsx",
+        text="FY2026 Mobile Sportsbook",
+    )
+    assert cum_2026 is not None and cum_2026[1] == "mobile" and "Sep 2025" in cum_2026[0]
+    monkeypatch.setattr(
+        louisiana,
+        "crawl_anchors",
+        lambda *_a, **_kw: [
+            {"href": "/wp-content/uploads/2026/10/fy27_mobile_sb_2026_10.xlsx", "title": "", "text": "FY27 Oct 2026"},
+            {"href": "/wp-content/uploads/2026/12/fy27_mobile_sb_2026_12.xlsx", "title": "", "text": "FY27 Dec 2026"},
+        ],
+    )
+    la_pm, la_cum = louisiana.discover_remote_links(log=lambda _m: None)
+    assert "Oct 2026" in la_pm and la_cum["Jul 2026:mobile"][0].endswith("2026_12.xlsx")
+
+    # 9. Mississippi multi-region on one sheet & cache.load_cache OSError
+    ms_wb = _MockWorkbook([
+        _MockSheet("Combined", [
+            ("Coastal", None, None, None, None),
+            ("Overall for Region", None, 100.0, None, 10.0),
+            ("Central", None, None, None, None),
+            ("Overall for Region", None, 200.0, None, 20.0),
+            ("Overall for State", None, 300.0, None, 30.0),
+        ])
+    ])
+
+    @contextmanager
+    def _ms_ctx(*_a, **_kw):
+        yield ms_wb
+
+    monkeypatch.setattr(mississippi, "openpyxl", object())
+    monkeypatch.setattr(mississippi, "open_xlsx_workbook", _ms_ctx)
+    ms_total_h, ms_total_r, ms_details = mississippi.parse_state_totals(b"PK\x03\x04dummy")
+    assert (ms_total_h, ms_total_r) == (300.0, 30.0)
+    assert [(r[0], r[1], r[2]) for r in ms_details] == [("Coastal", 100.0, 10.0), ("Central", 200.0, 20.0)]
+
+    monkeypatch.setattr("statewager.cache._read_cache_with_age", lambda _p: (_ for _ in ()).throw(PermissionError("denied")))
+    assert load_cache(str(tmp_path / "forbidden.bin")) is None
+
+
+def test_adversarial_r3_publish_workflows_and_viewer(tmp_path: pathlib.Path, monkeypatch) -> None:
+    root = pathlib.Path(__file__).resolve().parent.parent
+
+    # 1. Workflows: CI least-privilege permissions + no rebase over generated docs
+    wf_dir = root / ".github" / "workflows"
+    if wf_dir.is_dir():
+        ci_text = (wf_dir / "ci.yml").read_text(encoding="utf-8")
+        assert "permissions:\n  contents: read" in ci_text
+        assert "persist-credentials: false" in ci_text
+        refresh_text = (wf_dir / "refresh-data.yml").read_text(encoding="utf-8")
+        assert "git pull --rebase" not in refresh_text
+        assert "git reset --hard origin/main" in refresh_text
+        assert "--cache-dir" in refresh_text
+
+    # 2. merge_detail_results & publish_all(..., merge_existing=True) preserve prior source_url on fallback
+    prev_det = PublishedDetailRow(
+        state="Ohio", month="2026-02", operator="Alpha Book", brand="DraftKings",
+        handle=100.0, revenue=10.0, hold=10.0, source_url="https://oh.gov/feb26.xlsx",
+    )
+    fresh_det = PublishedDetailRow(
+        state="Ohio", month="2026-02", operator="Alpha Book", brand="DraftKings",
+        handle=120.0, revenue=12.0, hold=10.0, source_url=None,
+    )
+    fresh_other_op = PublishedDetailRow(
+        state="Ohio", month="2026-02", operator="Beta Book", brand="FanDuel",
+        handle=80.0, revenue=8.0, hold=10.0, source_url=None,
+    )
+    merged_det = merge_detail_results([prev_det], [fresh_det, fresh_other_op])
+    assert all(row.source_url == "https://oh.gov/feb26.xlsx" for row in merged_det)
+
+    docs_dir = tmp_path / "docs_r3"
+    data_dir = docs_dir / "data"
+    det_dir = data_dir / "details"
+    write_state_csv(
+        str(data_dir),
+        "ohio",
+        [_state_row("Ohio", "2026-02", 100.0, 10.0, source_url="https://oh.gov/cached_feb26.xlsx")],
+    )
+    write_state_detail_csv(
+        str(det_dir),
+        "ohio",
+        [
+            PublishedDetailRow(
+                state="Ohio",
+                month="2026-02",
+                operator="Alpha Book",
+                brand="DraftKings",
+                handle=100.0,
+                revenue=10.0,
+                hold=10.0,
+                source_url="https://oh.gov/cached_feb26.xlsx",
+            )
+        ],
+    )
+    fallback_res = _state_row(
+        "Ohio",
+        "2026-02",
+        105.0,
+        11.0,
+        hold=10.48,
+        source_url=None,
+        details=[
+            OperatorMonthResult(
+                month="2026-02",
+                operator="Alpha Book",
+                handle=105.0,
+                revenue=11.0,
+                hold=10.48,
+            )
+        ],
+    )
+    monkeypatch.setattr(ohio, "fetch", lambda *_a, **_kw: [fallback_res])
+    pub_main.publish_all(
+        month_start="2026-02",
+        month_end="2026-02",
+        states=["ohio"],
+        cache_dir=str(tmp_path / "c_r3"),
+        docs_dir=str(docs_dir),
+        merge_existing=True,
+        quiet=True,
+    )
+    persisted_det = read_detail_csv(str(det_dir / "ohio.csv"))
+    persisted_all_det = read_detail_csv(str(det_dir / "all.csv"))
+    assert persisted_det and persisted_det[0].source_url == "https://oh.gov/cached_feb26.xlsx"
+    assert persisted_all_det and persisted_all_det[0].source_url == "https://oh.gov/cached_feb26.xlsx"
+
+    # 3. Headless Node DOM harness against real docs/index.html + docs/data/
+    node_bin = shutil.which("node")
+    docs_root = root / "docs"
+    if node_bin and (docs_root / "data" / "details" / "all.csv").is_file():
+        harness = r"""
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+const assert = require("assert");
+
+const docsRoot = process.argv[1];
+const html = fs.readFileSync(path.join(docsRoot, "index.html"), "utf8");
+const m = html.match(/<script>\s*([\s\S]*?)\s*<\/script>/);
+assert(m, "missing <script> block");
+const monthReSrc = m[1].match(/const MONTH_RE = [^;]+;/);
+const addMonthsSrc = m[1].match(/function addMonths\([\s\S]*?\n      \}/);
+const moStartSrc = m[1].match(/function missouriEffectiveStart\([\s\S]*?\n      \}/);
+assert(monthReSrc && addMonthsSrc && moStartSrc, "missing addMonths/missouriEffectiveStart");
+const pureCtx = vm.createContext({});
+vm.runInContext(`${monthReSrc[0]}\n${addMonthsSrc[0]}\n${moStartSrc[0]}`, pureCtx);
+assert.strictEqual(pureCtx.missouriEffectiveStart(1), "2025-12");
+assert.strictEqual(pureCtx.missouriEffectiveStart(3), "2026-02");
+assert.strictEqual(pureCtx.missouriEffectiveStart(12), "2026-11");
+
+function makeClassList() {
+  const s = new Set();
+  return {
+    add: (...xs) => xs.forEach((x) => s.add(x)),
+    remove: (...xs) => xs.forEach((x) => s.delete(x)),
+    toggle: (x, force) => {
+      if (force === undefined) { if (s.has(x)) { s.delete(x); return false; } s.add(x); return true; }
+      if (force) s.add(x); else s.delete(x);
+      return !!force;
+    },
+    contains: (x) => s.has(x),
+  };
+}
+
+function makeEl(tag, id = "") {
+  return {
+    tagName: tag.toUpperCase(),
+    id,
+    _text: "",
+    _value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    children: [],
+    attrs: {},
+    style: {},
+    classList: makeClassList(),
+    listeners: new Map(),
+    get textContent() { return this._text; },
+    set textContent(v) { this._text = String(v ?? ""); this.children = []; },
+    get text() { return this._text; },
+    set text(v) { this._text = String(v ?? ""); },
+    set innerHTML(v) { if (v === "") this.children = []; },
+    get innerHTML() { return ""; },
+    get value() {
+      if (this.tagName === "SELECT" && !this._value && this.options.length) return this.options[0].value;
+      return this._value;
+    },
+    set value(v) { this._value = String(v ?? ""); },
+    get options() {
+      const out = [];
+      const walk = (n) => {
+        for (const c of n.children || []) {
+          if (c.tagName === "OPTION") out.push(c);
+          else walk(c);
+        }
+      };
+      walk(this);
+      return out;
+    },
+    get selectedIndex() {
+      const idx = this.options.findIndex((o) => o.value === this.value);
+      return idx >= 0 ? idx : 0;
+    },
+    appendChild(child) {
+      if (child.tagName === "#FRAGMENT") {
+        child.children.forEach((c) => this.children.push(c));
+        child.children = [];
+      } else {
+        this.children.push(child);
+      }
+      return child;
+    },
+    remove() {},
+    contains(t) { return t === this || this.children.some((c) => c.contains && c.contains(t)); },
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+    addEventListener(t, fn) {
+      if (!this.listeners.has(t)) this.listeners.set(t, []);
+      this.listeners.get(t).push(fn);
+    },
+    dispatchEvent(t, ev = {}) {
+      const e = Object.assign({ type: t, target: this, stopPropagation() {}, preventDefault() {} }, ev);
+      for (const fn of this.listeners.get(t) || []) fn(e);
+    },
+    click() { this.dispatchEvent("click"); },
+    focus() {},
+    querySelectorAll() { return []; },
+  };
+}
+
+const byId = new Map();
+const getEl = (id, tag = "div") => (byId.has(id) || byId.set(id, makeEl(tag, id)), byId.get(id));
+
+const stateSel = getEl("stateSelect", "select");
+stateSel.appendChild(Object.assign(makeEl("option"), { value: "__ALL__", textContent: "All States (Combined)" }));
+for (const slug of ["illinois", "indiana", "iowa", "kansas", "louisiana", "mississippi", "missouri", "nevada", "ohio", "pennsylvania"]) {
+  stateSel.appendChild(Object.assign(makeEl("option"), { value: slug, textContent: slug[0].toUpperCase() + slug.slice(1) }));
+}
+const winSel = getEl("windowSelect", "select");
+for (const [v, t] of [["1", "Monthly"], ["3", "Rolling 3M"], ["12", "TTM (12M)"]]) {
+  winSel.appendChild(Object.assign(makeEl("option"), { value: v, textContent: t }));
+}
+const metSel = getEl("metricSelect", "select");
+for (const v of ["handle", "revenue", "hold", "mobile_handle", "retail_handle", "promo_deductions", "tax", "yoy_handle", "yoy_revenue", "handle_share", "revenue_share"]) {
+  metSel.appendChild(Object.assign(makeEl("option"), { value: v, textContent: v }));
+}
+getEl("entitySelect", "select");
+getEl("includePartial", "input").checked = false;
+
+const ctx = vm.createContext({
+  console, Math, Date, Map, Set, Array, Object, Number, String, Boolean, JSON, URLSearchParams, setTimeout, clearTimeout,
+  document: {
+    getElementById: (id) => getEl(id),
+    querySelectorAll: () => [],
+    createElement: (tag) => makeEl(tag),
+    createElementNS: (_ns, tag) => makeEl(tag),
+    createDocumentFragment: () => makeEl("#FRAGMENT"),
+    createTextNode: (t) => ({ tagName: "#TEXT", textContent: String(t) }),
+    addEventListener() {},
+    body: makeEl("body"),
+    activeElement: null,
+  },
+  window: { location: { search: "", pathname: "/", hash: "", href: "https://example.test/" }, history: { replaceState() {} } },
+  navigator: {},
+  fetch: async (url) => {
+    const filePath = path.join(docsRoot, url.split("?")[0]);
+    if (!fs.existsSync(filePath)) return { ok: false, status: 404, async text() { return ""; }, async json() { return {}; } };
+    const txt = fs.readFileSync(filePath, "utf8");
+    return { ok: true, status: 200, async text() { return txt; }, async json() { return JSON.parse(txt); } };
+  },
+});
+
+vm.runInContext(m[1], ctx);
+
+(async () => {
+  await new Promise((r) => setTimeout(r, 80));
+  const flush = () => new Promise((r) => setTimeout(r, 40));
+  const countRects = () => {
+    let c = 0;
+    const walk = (n) => {
+      if (n?.tagName === "RECT" && n.listeners.has("mousemove")) c += 1;
+      (n?.children || []).forEach(walk);
+    };
+    walk(getEl("chartSvg"));
+    return c;
+  };
+
+  // All States + TTM (12M) + brand:DraftKings must yield complete 6-state months (2026-02..2026-09)
+  const entSel = getEl("entitySelect");
+  winSel.value = "12";
+  winSel.dispatchEvent("change");
+  entSel.value = "brand:DraftKings";
+  entSel.dispatchEvent("change");
+  await flush();
+  assert.strictEqual(getEl("fromMonth").value, "2026-02");
+  assert(getEl("toMonth").value >= "2026-09");
+  assert(countRects() >= 8);
+  assert(!getEl("chartNote").textContent.includes("partial"));
+
+  // All States + Rolling 3M + DraftKings must include 2025-12 and 2026-01
+  winSel.value = "3";
+  winSel.dispatchEvent("change");
+  await flush();
+  const months3m = Array.from(new Set(getEl("tableBody").children.map((tr) => tr.children[0]?.textContent)));
+  assert(months3m.includes("2025-12") && months3m.includes("2026-01"));
+  assert.strictEqual(countRects(), 17);
+
+  // Compare Brands + All States + YoY Handle Growth must exclude 2025-03..2025-06 partial baselines
+  entSel.value = "__STATE_TOTAL__";
+  entSel.dispatchEvent("change");
+  winSel.value = "1";
+  winSel.dispatchEvent("change");
+  await flush();
+  getEl("compareBtn").click();
+  await flush();
+  for (const lbl of getEl("compareList").children) {
+    const cb = lbl.children[0];
+    if (cb && (cb.getAttribute("data-name") === "DraftKings" || cb.getAttribute("data-name") === "FanDuel")) {
+      cb.checked = true;
+      cb.dispatchEvent("change");
+    }
+  }
+  metSel.value = "yoy_handle";
+  metSel.dispatchEvent("change");
+  await flush();
+  const yoyTicks = [];
+  const walkTicks = (n) => {
+    if (n?.tagName === "TEXT" && /^\d{4}-\d{2}$/.test(n.textContent)) yoyTicks.push(n.textContent);
+    (n?.children || []).forEach(walkTicks);
+  };
+  walkTicks(getEl("chartSvg"));
+  assert(yoyTicks.length > 0 && yoyTicks.every((m) => m >= "2025-07"));
+
+  // Ohio -> FanDuel -> Rolling 3M -> Retail Handle must omit all-null retail windows rather than plotting $0
+  getEl("compareClearBtn").click();
+  getEl("compareBtn").click();
+  stateSel.value = "ohio";
+  stateSel.dispatchEvent("change");
+  await flush();
+  entSel.value = "brand:FanDuel";
+  entSel.dispatchEvent("change");
+  winSel.value = "3";
+  winSel.dispatchEvent("change");
+  metSel.value = "retail_handle";
+  metSel.dispatchEvent("change");
+  await flush();
+  const ohBars = countRects();
+  assert(ohBars > 0 && ohBars < getEl("tableBody").children.length);
+
+  // Selecting BetJack in Ohio Compare Brands then switching to Kansas must prune BetJack
+  winSel.value = "1";
+  winSel.dispatchEvent("change");
+  metSel.value = "handle";
+  metSel.dispatchEvent("change");
+  getEl("compareBtn").click();
+  await flush();
+  for (const lbl of getEl("compareList").children) {
+    const cb = lbl.children[0];
+    if (cb && cb.getAttribute("data-name") === "BetJack") {
+      cb.checked = true;
+      cb.dispatchEvent("change");
+    }
+  }
+  assert.strictEqual(getEl("compareBtn").textContent, "Compare (1)");
+  stateSel.value = "kansas";
+  stateSel.dispatchEvent("change");
+  await flush();
+  assert.strictEqual(getEl("compareBtn").textContent, "Compare (0)");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+        proc = subprocess.run([node_bin, "-e", harness, str(docs_root)], capture_output=True, text=True)
+        assert proc.returncode == 0, f"Node harness failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 

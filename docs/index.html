@@ -275,6 +275,7 @@
       border: 1px solid var(--border);
       border-radius: 6px;
       font-size: 0.9rem;
+      font-family: inherit;
       background: var(--panel);
       color: var(--text);
     }
@@ -550,7 +551,9 @@
   <script>
     (function () {
       const DETAIL_STATES = new Set(["illinois", "indiana", "iowa", "kansas", "missouri", "ohio", "pennsylvania"]);
+      const DETAIL_STATE_COUNT = DETAIL_STATES.size;
       const BRAND_ORDER = ["DraftKings", "FanDuel", "BetMGM", "Fanatics", "Caesars", "bet365", "PENN / ESPN Bet", "BetRivers", "Hard Rock Bet", "betPARX", "Circa Sports", "Bally Bet", "BetJack", "Other / Retail Venue"];
+      const DEFAULT_BRAND = BRAND_ORDER[BRAND_ORDER.length - 1];
       const SERIES_COLORS = [
         "#2563eb", "#dc2626", "#16a34a", "#d97706", "#9333ea",
         "#0891b2", "#db2777", "#4f46e5", "#65a30d", "#64748b"
@@ -562,6 +565,7 @@
       let activeStateRows = [];
       let activeDetailRows = [];
       let activeRows = [];
+      let activeAvail = { hasRetail: false, hasMobile: false, hasPromo: false, hasTax: false };
       let windowedActiveRows = [];
       let windowedDetailRows = [];
       let lastRenderedRows = [];
@@ -626,6 +630,51 @@
       const tableBody = document.getElementById("tableBody");
       const chartSvg = document.getElementById("chartSvg");
       const tooltip = document.getElementById("tooltip");
+      const SORT_THS = Array.from(document.querySelectorAll("th[data-col]"));
+      const TH_BY_GROUP = [
+        ["detail-col", "detail"],
+        ["yoy-col", "showYoy"],
+        ["gross-col", "showGross"],
+        ["promo-col", "showPromo"],
+        ["tax-col", "showTax"],
+        ["channel-col", "showChannels"]
+      ].map(([cls, key]) => [key, Array.from(document.querySelectorAll(`th.${cls}`))]);
+      const STATE_SELECT_OPTIONS = Array.from(stateSelect.options).filter((o) => o.value && o.value !== "__ALL__");
+      const STATE_SLUG_BY_NAME = new Map(STATE_SELECT_OPTIONS.map((o) => [o.text, o.value]));
+      const STATE_NAME_LOOKUP = new Map();
+      STATE_SELECT_OPTIONS.forEach((o) => {
+        STATE_NAME_LOOKUP.set(o.value.toLowerCase(), o.text);
+        STATE_NAME_LOOKUP.set(o.text.toLowerCase(), o.text);
+      });
+
+      function selectedOptionText(sel) {
+        return sel.options[sel.selectedIndex]?.text || "";
+      }
+
+      function isShareMetric(metric) {
+        return metric === "handle_share" || metric === "revenue_share";
+      }
+
+      function isYoyMetric(metric) {
+        return metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
+      }
+
+      function compareAscii(a, b) {
+        return a === b ? 0 : (a < b ? -1 : 1);
+      }
+
+      function computeAvailFlags(rows) {
+        let hasRetail = false, hasMobile = false, hasPromo = false, hasTax = false;
+        for (let i = 0; i < rows.length; i++) {
+          const r = rows[i];
+          if (!hasRetail && (r.retail_handle !== null || r.retail_revenue !== null)) hasRetail = true;
+          if (!hasMobile && (r.mobile_handle !== null || r.mobile_revenue !== null)) hasMobile = true;
+          if (!hasPromo && r.promo_deductions !== null) hasPromo = true;
+          if (!hasTax && r.tax !== null) hasTax = true;
+          if (hasRetail && hasMobile && hasPromo && hasTax) break;
+        }
+        return { hasRetail, hasMobile, hasPromo, hasTax };
+      }
 
       function calcHold(h, r) {
         return (h !== null && h > 0 && r !== null) ? (r / h) * 100 : null;
@@ -696,6 +745,12 @@
         let row = [];
         let cur = "";
         let inQuotes = false;
+        const flushRow = () => {
+          row.push(cur);
+          if (row.some((c) => c.length > 0)) rows.push(row);
+          row = [];
+          cur = "";
+        };
         const n = text.length;
         for (let i = 0; i < n; i++) {
           const ch = text[i];
@@ -715,21 +770,14 @@
             cur = "";
           } else if (ch === "\r") {
             if (text[i + 1] === "\n") i++;
-            row.push(cur);
-            if (row.some((c) => c.length > 0)) rows.push(row);
-            row = [];
-            cur = "";
+            flushRow();
           } else if (ch === "\n") {
-            row.push(cur);
-            if (row.some((c) => c.length > 0)) rows.push(row);
-            row = [];
-            cur = "";
+            flushRow();
           } else {
             cur += ch;
           }
         }
-        row.push(cur);
-        if (row.some((c) => c.length > 0)) rows.push(row);
+        flushRow();
         return rows;
       }
 
@@ -738,54 +786,58 @@
         if (table.length <= 1) return [];
         const idx = new Map();
         table[0].forEach((h, i) => idx.set(h.trim(), i));
-        const col = (cols, name) => {
-          const i = idx.get(name);
-          return i !== undefined ? (cols[i] ?? "") : "";
-        };
+        const iState = idx.get("state");
+        const iMonth = idx.get("month");
+        const iOp = idx.get("operator");
+        const iBrand = idx.get("brand");
+        const iHandle = idx.get("handle");
+        const iRevenue = idx.get("revenue");
+        const iHold = idx.get("hold");
+        const iRetH = idx.get("retail_handle");
+        const iRetR = idx.get("retail_revenue");
+        const iRetHold = idx.get("retail_hold");
+        const iMobH = idx.get("mobile_handle");
+        const iMobR = idx.get("mobile_revenue");
+        const iMobHold = idx.get("mobile_hold");
+        const iGross = idx.get("gross_revenue");
+        const iPromo = idx.get("promo_deductions");
+        const iTax = idx.get("tax");
+        const iSrc = idx.get("source_url");
+        const at = (cols, colIdx) => (colIdx !== undefined ? (cols[colIdx] ?? "") : "");
         const out = [];
         for (let r = 1; r < table.length; r++) {
           const cols = table[r];
-          const state = col(cols, "state");
-          const operator = col(cols, "operator");
-          const brand = col(cols, "brand");
-          const handle = toNum(col(cols, "handle"));
-          const grossRev = toNum(col(cols, "gross_revenue"));
+          const state = at(cols, iState);
+          const operator = at(cols, iOp);
+          const brand = at(cols, iBrand);
+          const handle = toNum(at(cols, iHandle));
+          const grossRev = toNum(at(cols, iGross));
           out.push({
             state,
-            month: col(cols, "month"),
+            month: at(cols, iMonth),
             operator,
             brand,
             _ekey: `${state}\x1f${operator}\x1f${brand}`,
             handle,
-            revenue: toNum(col(cols, "revenue")),
-            hold: toNum(col(cols, "hold")),
-            retail_handle: toNum(col(cols, "retail_handle")),
-            retail_revenue: toNum(col(cols, "retail_revenue")),
-            retail_hold: toNum(col(cols, "retail_hold")),
-            mobile_handle: toNum(col(cols, "mobile_handle")),
-            mobile_revenue: toNum(col(cols, "mobile_revenue")),
-            mobile_hold: toNum(col(cols, "mobile_hold")),
+            revenue: toNum(at(cols, iRevenue)),
+            hold: toNum(at(cols, iHold)),
+            retail_handle: toNum(at(cols, iRetH)),
+            retail_revenue: toNum(at(cols, iRetR)),
+            retail_hold: toNum(at(cols, iRetHold)),
+            mobile_handle: toNum(at(cols, iMobH)),
+            mobile_revenue: toNum(at(cols, iMobR)),
+            mobile_hold: toNum(at(cols, iMobHold)),
             gross_revenue: grossRev,
             gross_hold: calcHold(handle, grossRev),
-            promo_deductions: toNum(col(cols, "promo_deductions")),
-            tax: toNum(col(cols, "tax")),
+            promo_deductions: toNum(at(cols, iPromo)),
+            tax: toNum(at(cols, iTax)),
             yoy_handle: null,
             yoy_revenue: null,
             yoy_hold_bps: null,
-            source_url: col(cols, "source_url")
+            source_url: at(cols, iSrc)
           });
         }
         return out;
-      }
-
-      function sumAllOpt(slice, field) {
-        let total = 0;
-        for (let i = 0; i < slice.length; i++) {
-          const v = slice[i][field];
-          if (v === null || v === undefined) return null;
-          total += v;
-        }
-        return total;
       }
 
       function buildWindowedRows(rows, windowMonths, detailMode) {
@@ -803,7 +855,7 @@
 
         const out = [];
         groups.forEach((byMonth) => {
-          const sortedEntries = Array.from(byMonth.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+          const sortedEntries = Array.from(byMonth.entries()).sort((a, b) => compareAscii(a[0], b[0]));
           const sortedMonths = sortedEntries.map(([m]) => m);
           const sortedRows = sortedEntries.map(([, r]) => r);
           const winByMonth = new Map();
@@ -812,36 +864,45 @@
               winByMonth.set(m, Object.assign({}, head));
               return;
             }
-            if (idx < W - 1 || sortedMonths[idx - W + 1] !== addMonths(m, -(W - 1))) {
+            const start = idx - W + 1;
+            if (start < 0 || sortedMonths[start] !== addMonths(m, -(W - 1))) {
               return;
             }
-            const slice = sortedRows.slice(idx - W + 1, idx + 1);
-            const handle = sumAllOpt(slice, "handle");
-            const revenue = sumAllOpt(slice, "revenue");
-            const grossRev = sumAllOpt(slice, "gross_revenue");
-            const retailHandle = sumAllOpt(slice, "retail_handle");
-            const retailRev = sumAllOpt(slice, "retail_revenue");
-            const mobileHandle = sumAllOpt(slice, "mobile_handle");
-            const mobileRev = sumAllOpt(slice, "mobile_revenue");
+            const sums = {
+              handle: 0, revenue: 0, gross_revenue: 0,
+              retail_handle: 0, retail_revenue: 0,
+              mobile_handle: 0, mobile_revenue: 0,
+              promo_deductions: 0, tax: 0,
+            };
+            const sumKeys = Object.keys(sums);
+            for (let k = start; k <= idx; k++) {
+              const row = sortedRows[k];
+              for (const key of sumKeys) {
+                if (sums[key] === null) continue;
+                const val = row[key];
+                if (val === null || val === undefined) sums[key] = null;
+                else sums[key] += val;
+              }
+            }
             winByMonth.set(m, {
               state: head.state,
               month: m,
               operator: head.operator,
               brand: head.brand,
               _ekey: head._ekey,
-              handle,
-              revenue,
-              hold: calcHold(handle, revenue),
-              retail_handle: retailHandle,
-              retail_revenue: retailRev,
-              retail_hold: calcHold(retailHandle, retailRev),
-              mobile_handle: mobileHandle,
-              mobile_revenue: mobileRev,
-              mobile_hold: calcHold(mobileHandle, mobileRev),
-              gross_revenue: grossRev,
-              gross_hold: calcHold(handle, grossRev),
-              promo_deductions: sumAllOpt(slice, "promo_deductions"),
-              tax: sumAllOpt(slice, "tax"),
+              handle: sums.handle,
+              revenue: sums.revenue,
+              hold: calcHold(sums.handle, sums.revenue),
+              retail_handle: sums.retail_handle,
+              retail_revenue: sums.retail_revenue,
+              retail_hold: calcHold(sums.retail_handle, sums.retail_revenue),
+              mobile_handle: sums.mobile_handle,
+              mobile_revenue: sums.mobile_revenue,
+              mobile_hold: calcHold(sums.mobile_handle, sums.mobile_revenue),
+              gross_revenue: sums.gross_revenue,
+              gross_hold: calcHold(sums.handle, sums.gross_revenue),
+              promo_deductions: sums.promo_deductions,
+              tax: sums.tax,
               yoy_handle: null,
               yoy_revenue: null,
               yoy_hold_bps: null,
@@ -925,16 +986,6 @@
         return { yoy_handle, yoy_revenue, yoy_hold_bps, matched, matchedStatesCount: matchedStates.size };
       }
 
-      function stateNameToSlugMap() {
-        const map = new Map();
-        Array.from(stateSelect.options).forEach((opt) => {
-          if (opt.value && opt.value !== "__ALL__") {
-            map.set(opt.text, opt.value);
-          }
-        });
-        return map;
-      }
-
       function renderFreshnessBar(allRows) {
         if (!allRows || !allRows.length) {
           freshnessBar.style.display = "none";
@@ -950,9 +1001,8 @@
           freshnessBar.style.display = "none";
           return;
         }
-        const monthsDesc = Array.from(latestByState.values()).sort().reverse();
-        const peerMax = monthsDesc[0];
-        const nameToSlug = stateNameToSlugMap();
+        let peerMax = "";
+        latestByState.forEach((m) => { if (m > peerMax) peerMax = m; });
         const statesSorted = Array.from(latestByState.keys()).sort((a, b) => a.localeCompare(b));
         freshnessBar.innerHTML = "";
         const label = document.createElement("span");
@@ -964,7 +1014,7 @@
           const stMonth = latestByState.get(stName);
           const lag = monthDiff(peerMax, stMonth);
           const dotCls = lag <= 0 ? "fresh" : (lag === 1 ? "lag1" : "lag2");
-          const slug = nameToSlug.get(stName) || "";
+          const slug = STATE_SLUG_BY_NAME.get(stName) || "";
           const btn = document.createElement("button");
           btn.type = "button";
           const isAct = stateSelect.value === slug && Boolean(slug);
@@ -1093,19 +1143,16 @@
       }
 
       function formatMetricValue(metric, v) {
-        if (metric === "hold" || metric === "handle_share" || metric === "revenue_share") return fmtPct(v);
+        if (metric === "hold" || isShareMetric(metric)) return fmtPct(v);
         if (metric === "yoy_handle" || metric === "yoy_revenue") return fmtSignedPct(v);
         if (metric === "yoy_hold_bps") return fmtBps(v);
         return fmtMoney(v);
       }
 
       function formatAxisTick(metric, tv) {
-        if (metric === "hold" || metric === "handle_share" || metric === "revenue_share") return `${tv.toFixed(1)}%`;
+        if (metric === "hold" || isShareMetric(metric)) return `${tv.toFixed(1)}%`;
         if (metric === "yoy_handle" || metric === "yoy_revenue") return `${tv > 0 ? "+" : ""}${tv.toFixed(0)}%`;
-        if (metric === "yoy_hold_bps") {
-          const r = Math.round(tv);
-          return `${r > 0 ? "+" : ""}${r} bps`;
-        }
+        if (metric === "yoy_hold_bps") return fmtBps(tv);
         return fmtCompactMoney(tv);
       }
 
@@ -1116,11 +1163,13 @@
       function refreshWindowedRows() {
         const winM = Number(windowSelect.value) || 1;
         const detailMode = isDetailView();
+        activeAvail = computeAvailFlags(activeRows);
         windowedActiveRows = getCachedWindowed(activeRows, winM, detailMode);
         windowedDetailRows = activeDetailRows.length
           ? (entitySelect.value === "__ALL_DETAILS__" ? windowedActiveRows : getCachedWindowed(activeDetailRows, winM, true))
           : [];
         refreshDetailStateBounds();
+        updateDetailCompletenessMeta(detailMode ? windowedActiveRows : []);
       }
 
       function updateKpis(rows) {
@@ -1198,30 +1247,43 @@
         brandLastMonth = maxMap;
       }
 
-      function expectedDetailStatesCountFromSet(month, stateCollection) {
+      function missouriEffectiveStart(winM) {
+        const w = Number(winM) || 1;
+        return w > 1 ? addMonths("2025-12", w - 1) : "2025-12";
+      }
+
+      function expectedDetailStatesCountFromSet(month, stateCollection, winM) {
+        const moStart = missouriEffectiveStart(winM !== undefined ? winM : windowSelect.value);
         let exp = 0;
         stateCollection.forEach((s) => {
-          if (s !== "Missouri" || month >= "2025-12") exp += 1;
+          if (s !== "Missouri" || month >= moStart) exp += 1;
         });
         return Math.max(1, exp);
       }
 
-      function expectedDetailStatesCount(month) {
-        return expectedDetailStatesCountFromSet(month, detailDisclosingStates);
+      function expectedDetailStatesCount(month, winM) {
+        return expectedDetailStatesCountFromSet(month, detailDisclosingStates, winM);
+      }
+
+      function expectedMultiStatePanelCount(month, allCount, hasMo, winM) {
+        const moStart = missouriEffectiveStart(winM !== undefined ? winM : windowSelect.value);
+        return Math.max(1, allCount - (hasMo && month < moStart ? 1 : 0));
       }
 
       function expectedStatesForMonth(month) {
         if (!isMultiStateView()) return 1;
+        const winM = Number(windowSelect.value) || 1;
         if (!isDetailView()) {
-          return Math.max(1, allStatesCount - (hasMissouri && month < "2025-12" ? 1 : 0));
+          return expectedMultiStatePanelCount(month, allStatesCount, hasMissouri, winM);
         }
         const ent = entitySelect.value;
         if (ent === "__ALL_DETAILS__") {
-          return expectedDetailStatesCount(month);
+          return expectedDetailStatesCount(month, winM);
         }
+        const moStart = missouriEffectiveStart(winM);
         let exp = 0;
         brandFirstMonth.forEach((bFirst, s) => {
-          if (s === "Missouri" && month < "2025-12") return;
+          if (s === "Missouri" && month < moStart) return;
           const stateMin = stateMinDetailMonth.get(s) || bFirst;
           const stateMax = stateLatestDetailMonth.get(s);
           const bLast = brandLastMonth.get(s);
@@ -1300,8 +1362,13 @@
       }
 
       function aggregateByMonth(rows, metric) {
-        const isYoy = metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
-        const isOptionalMoney = metric === "promo_deductions" || metric === "tax";
+        const isYoy = isYoyMetric(metric);
+        const isOptionalMoney = (
+          metric === "promo_deductions"
+          || metric === "tax"
+          || metric === "mobile_handle"
+          || metric === "retail_handle"
+        );
         const detailMode = isDetailView();
         const byMonth = new Map();
         rows.forEach((r) => {
@@ -1309,6 +1376,7 @@
             byMonth.set(r.month, {
               handle: 0, revenue: 0, holdHandle: 0, holdRevenue: 0,
               mobile_handle: 0, retail_handle: 0,
+              hasMobile: false, hasRetail: false,
               promo_deductions: 0, tax: 0, hasPromo: false, hasTax: false,
               states: new Set()
             });
@@ -1317,8 +1385,14 @@
           if (r.handle !== null) agg.handle += r.handle;
           if (r.revenue !== null) agg.revenue += r.revenue;
           addHoldTotals(agg, r);
-          if (r.mobile_handle !== null) agg.mobile_handle += r.mobile_handle;
-          if (r.retail_handle !== null) agg.retail_handle += r.retail_handle;
+          if (r.mobile_handle !== null) {
+            agg.mobile_handle += r.mobile_handle;
+            agg.hasMobile = true;
+          }
+          if (r.retail_handle !== null) {
+            agg.retail_handle += r.retail_handle;
+            agg.hasRetail = true;
+          }
           if (r.promo_deductions !== null) {
             agg.promo_deductions += r.promo_deductions;
             agg.hasPromo = true;
@@ -1358,7 +1432,14 @@
               if (agg.holdHandle <= 0) return;
               value = (agg.holdRevenue / agg.holdHandle) * 100;
             } else if (isOptionalMoney) {
-              if ((metric === "promo_deductions" && !agg.hasPromo) || (metric === "tax" && !agg.hasTax)) return;
+              if (
+                (metric === "promo_deductions" && !agg.hasPromo)
+                || (metric === "tax" && !agg.hasTax)
+                || (metric === "mobile_handle" && !agg.hasMobile)
+                || (metric === "retail_handle" && !agg.hasRetail)
+              ) {
+                return;
+              }
               value = agg[metric];
             } else {
               value = agg[metric] || 0;
@@ -1418,8 +1499,7 @@
 
       function ensureNonZeroRange(minVal, maxVal, metric) {
         if (minVal !== maxVal) return [minVal, maxVal];
-        const isPctOrBps = metric === "hold" || metric === "handle_share" || metric === "revenue_share"
-          || metric.startsWith("yoy_");
+        const isPctOrBps = metric === "hold" || isShareMetric(metric) || isYoyMetric(metric);
         if (minVal === 0) return [0, isPctOrBps ? 10 : 100];
         const pad = Math.max(Math.abs(minVal) * 0.2, isPctOrBps ? 5 : 50);
         return [minVal < 0 ? minVal - pad : 0, maxVal > 0 ? maxVal + pad : 0];
@@ -1491,19 +1571,41 @@
         drawXLabels(series.map((p) => p.month), barCenterX, H);
       }
 
+      function evaluatePartialStats(totalCount, completeCount) {
+        if (completeCount > 0 && completeCount < totalCount) {
+          return { partialSubset: true, hiddenPartial: totalCount - completeCount, fallbackToPartial: false };
+        }
+        return {
+          partialSubset: false,
+          hiddenPartial: 0,
+          fallbackToPartial: completeCount === 0 && totalCount > 0
+        };
+      }
+
       function filterSeriesCompleteness(rawSeries, applyFilter) {
         if (!applyFilter || includePartialInput.checked) {
           return { series: rawSeries, hiddenPartial: 0, fallbackToPartial: false };
         }
         const completeOnly = rawSeries.filter((pt) => pt.complete);
-        if (completeOnly.length) {
-          return {
-            series: completeOnly,
-            hiddenPartial: rawSeries.length - completeOnly.length,
-            fallbackToPartial: false
-          };
-        }
-        return { series: rawSeries, hiddenPartial: 0, fallbackToPartial: rawSeries.length > 0 };
+        const stats = evaluatePartialStats(rawSeries.length, completeOnly.length);
+        return {
+          series: completeOnly.length ? completeOnly : rawSeries,
+          hiddenPartial: stats.hiddenPartial,
+          fallbackToPartial: stats.fallbackToPartial
+        };
+      }
+
+      function positiveBrandTotals(rawBrands) {
+        let total = 0;
+        const brands = new Map();
+        rawBrands.forEach((netVal, bName) => {
+          const posVal = Math.max(0, netVal);
+          if (posVal > 0) {
+            brands.set(bName, posVal);
+            total += posVal;
+          }
+        });
+        return { brands, total };
       }
 
       function renderBrandShareChart(metric, stateLabel, windowSuffix) {
@@ -1523,23 +1625,15 @@
           }
           const mRec = byMonth.get(r.month);
           mRec.states.add(r.state);
-          const bName = r.brand || "Other / Retail Venue";
+          const bName = r.brand || DEFAULT_BRAND;
           mRec.rawBrands.set(bName, (mRec.rawBrands.get(bName) || 0) + v);
         });
 
         const rawMonths = [];
         Array.from(byMonth.entries())
-          .sort((a, b) => a[0].localeCompare(b[0]))
+          .sort((a, b) => compareAscii(a[0], b[0]))
           .forEach(([month, rec]) => {
-            let total = 0;
-            const brands = new Map();
-            rec.rawBrands.forEach((netVal, bName) => {
-              const posVal = Math.max(0, netVal);
-              if (posVal > 0) {
-                brands.set(bName, posVal);
-                total += posVal;
-              }
-            });
+            const { brands, total } = positiveBrandTotals(rec.rawBrands);
             if (total <= 0) return;
             const count = rec.states.size;
             const expected = multiDetail ? expectedDetailStatesCount(month) : 1;
@@ -1617,8 +1711,8 @@
       }
 
       function computeSliceMetric(slice, mMap, m, metric, marketTotalByMonth) {
-        const isShare = metric === "handle_share" || metric === "revenue_share";
-        const isYoy = metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
+        const isShare = isShareMetric(metric);
+        const isYoy = isYoyMetric(metric);
         const baseShareField = metric === "revenue_share" ? "revenue" : "handle";
         if (isYoy) {
           return computeSameStoreYoY(slice, mMap.get(addMonths(m, -12)) || [], true)[metric];
@@ -1655,18 +1749,17 @@
       function filterCompleteMonthSet(months, isCompleteFn) {
         if (includePartialInput.checked) return { allowed: null, hiddenPartial: 0, fallbackToPartial: false };
         const complete = new Set(months.filter(isCompleteFn));
-        if (complete.size > 0 && complete.size < months.length) {
-          return { allowed: complete, hiddenPartial: months.length - complete.size, fallbackToPartial: false };
-        }
-        if (complete.size === 0 && months.length > 0) {
-          return { allowed: null, hiddenPartial: 0, fallbackToPartial: true };
-        }
-        return { allowed: null, hiddenPartial: 0, fallbackToPartial: false };
+        const stats = evaluatePartialStats(months.length, complete.size);
+        return {
+          allowed: stats.partialSubset ? complete : null,
+          hiddenPartial: stats.hiddenPartial,
+          fallbackToPartial: stats.fallbackToPartial
+        };
       }
 
       function completeStateCountCheck(statesByMonth, allCount, hasMo) {
         return (m) => {
-          const exp = Math.max(1, allCount - (hasMo && m < "2025-12" ? 1 : 0));
+          const exp = expectedMultiStatePanelCount(m, allCount, hasMo);
           return statesByMonth.get(m).size >= Math.max(1, exp - 1);
         };
       }
@@ -1675,17 +1768,24 @@
         const mySeq = ++compareSeq;
         const winM = Number(windowSelect.value) || 1;
         const selSeries = [...compareSelected];
+        const selSet = new Set(selSeries);
         const mode = compareMode;
         const selectedSlug = stateSelect.value;
-        const selectedStateText = stateSelect.options[stateSelect.selectedIndex]?.text || "";
-        const isShare = metric === "handle_share" || metric === "revenue_share";
-        const isYoy = metric === "yoy_handle" || metric === "yoy_revenue" || metric === "yoy_hold_bps";
+        const selectedStateText = selectedOptionText(stateSelect);
+        const isShare = isShareMetric(metric);
+        const isYoy = isYoyMetric(metric);
         const baseShareField = metric === "revenue_share" ? "revenue" : "handle";
 
         let seriesList = [];
         const marketTotalByMonth = new Map();
         let hiddenPartial = 0;
         let fallbackToPartial = false;
+        function pickCompleteMonths(monthMap, predicate) {
+          const res = filterCompleteMonthSet(Array.from(monthMap.keys()).filter(inDateRange), predicate);
+          hiddenPartial = res.hiddenPartial;
+          fallbackToPartial = res.fallbackToPartial;
+          return res.allowed;
+        }
         const winTitle = windowSuffix ? `${windowSuffix} ` : "";
         const scopeTitle = mode === "brands"
           ? ((selectedSlug === "__ALL__" || !DETAIL_STATES.has(selectedSlug))
@@ -1704,6 +1804,7 @@
             const allCount = allStateSet.size || 1;
             const hasMo = allStateSet.has("Missouri");
             const statesByMonth = new Map();
+            const rowsBySelState = new Map();
             winAll.forEach((r) => {
               if (!statesByMonth.has(r.month)) statesByMonth.set(r.month, new Set());
               statesByMonth.get(r.month).add(r.state);
@@ -1711,20 +1812,22 @@
                 const v = r[baseShareField];
                 if (v !== null && v > 0) marketTotalByMonth.set(r.month, (marketTotalByMonth.get(r.month) || 0) + v);
               }
+              if (selSet.has(r.state) && inDateRange(r.month)) {
+                let bucket = rowsBySelState.get(r.state);
+                if (!bucket) {
+                  bucket = [];
+                  rowsBySelState.set(r.state, bucket);
+                }
+                bucket.push(r);
+              }
             });
-            let allowedShareMonths = null;
-            if (isShare) {
-              const candidateMonths = Array.from(statesByMonth.keys()).filter(inDateRange);
-              const res = filterCompleteMonthSet(candidateMonths, completeStateCountCheck(statesByMonth, allCount, hasMo));
-              allowedShareMonths = res.allowed;
-              hiddenPartial = res.hiddenPartial;
-              fallbackToPartial = res.fallbackToPartial;
-            }
+            const allowedShareMonths = isShare
+              ? pickCompleteMonths(statesByMonth, completeStateCountCheck(statesByMonth, allCount, hasMo))
+              : null;
             seriesList = selSeries.map((stName, idx) => {
-              const stRows = winAll.filter((r) => r.state === stName).sort((a, b) => a.month.localeCompare(b.month));
+              const stRows = (rowsBySelState.get(stName) || []).sort((a, b) => compareAscii(a.month, b.month));
               const pts = new Map();
               stRows.forEach((r) => {
-                if (!inDateRange(r.month)) return;
                 if (allowedShareMonths && !allowedShareMonths.has(r.month)) return;
                 let v = r[metric];
                 if (isShare) {
@@ -1751,7 +1854,7 @@
               discStatesInDet.add(r.state);
               if (!discByMonth.has(m)) discByMonth.set(m, new Set());
               discByMonth.get(m).add(r.state);
-              const b = r.brand || "Other / Retail Venue";
+              const b = r.brand || DEFAULT_BRAND;
               if (isShare) {
                 const v = r[baseShareField];
                 if (v !== null && v !== undefined) {
@@ -1773,22 +1876,25 @@
             });
             if (isShare) {
               rawShareByMonth.forEach((bMap, m) => {
-                let tot = 0;
-                bMap.forEach((netVal) => { tot += Math.max(0, netVal); });
-                if (tot > 0) marketTotalByMonth.set(m, tot);
+                const { total } = positiveBrandTotals(bMap);
+                if (total > 0) marketTotalByMonth.set(m, total);
               });
             }
-            let allowedBrandMonths = null;
-            if (needAllDetails) {
-              const candidateMonths = Array.from(discByMonth.keys()).filter(inDateRange);
-              const res = filterCompleteMonthSet(
-                candidateMonths,
-                (m) => discByMonth.get(m).size >= expectedDetailStatesCountFromSet(m, discStatesInDet)
-              );
-              allowedBrandMonths = res.allowed;
-              hiddenPartial = res.hiddenPartial;
-              fallbackToPartial = res.fallbackToPartial;
-            }
+            const allowedBrandMonths = needAllDetails
+              ? pickCompleteMonths(
+                  discByMonth,
+                  (m) => {
+                    if ((discByMonth.get(m)?.size || 0) < expectedDetailStatesCountFromSet(m, discStatesInDet, winM)) {
+                      return false;
+                    }
+                    if (!isYoy) return true;
+                    const prevM = addMonths(m, -12);
+                    return (
+                      (discByMonth.get(prevM)?.size || 0) >= expectedDetailStatesCountFromSet(prevM, discStatesInDet, winM)
+                    );
+                  }
+                )
+              : null;
             seriesList = selSeries.map((brandName, idx) => {
               const mMap = detByMonthBrand.get(brandName) || new Map();
               const pts = new Map();
@@ -1873,16 +1979,16 @@
         const metric = metricSelect.value;
         const winM = Number(windowSelect.value) || 1;
         const windowSuffix = windowLabel(winM);
-        const metricLabel = metricSelect.options[metricSelect.selectedIndex].text;
-        const stateLabel = stateSelect.options[stateSelect.selectedIndex].text;
-        const entityLabel = entitySelect.options[entitySelect.selectedIndex]?.text || "";
+        const metricLabel = selectedOptionText(metricSelect);
+        const stateLabel = selectedOptionText(stateSelect);
+        const entityLabel = selectedOptionText(entitySelect);
 
         if (compareSelected.length > 0) {
           renderCompareChart(metric, metricLabel, windowSuffix);
           return;
         }
         compareSeq += 1;
-        if (metric === "handle_share" || metric === "revenue_share") {
+        if (isShareMetric(metric)) {
           renderBrandShareChart(metric, stateLabel, windowSuffix);
           return;
         }
@@ -1898,7 +2004,7 @@
         if (!multi) {
           chartNote.textContent = detail && stateSelect.value !== "__ALL__"
             ? (entitySelect.value.startsWith("brand:") ? "Normalized brand rollup from state regulator disclosures" : "")
-            : (metric.startsWith("yoy_") ? "Same-month year-over-year comparison" : "");
+            : (isYoyMetric(metric) ? "Same-month year-over-year comparison" : "");
         } else if (hiddenPartial > 0) {
           const scopeNote = detail ? " across disclosing states" : "";
           chartNote.textContent = `Showing ${series.length} full-panel months${scopeNote} (${hiddenPartial} partial month${hiddenPartial === 1 ? "" : "s"} hidden)`;
@@ -1908,7 +2014,7 @@
           const partialVisible = series.filter((pt) => pt.partial).length;
           chartNote.textContent = partialVisible
             ? `${partialVisible} partial-coverage month${partialVisible === 1 ? "" : "s"} shown with dashed outline`
-            : (detail ? "7 disclosing states (LA, MS, NV do not disclose operators)" : "");
+            : (detail ? `${DETAIL_STATE_COUNT} disclosing states (LA, MS, NV do not disclose operators)` : "");
         }
         if (!series.length) {
           renderEmptyChart();
@@ -1927,29 +2033,26 @@
         }
       }
 
-      function activeHasChannel(prefix) {
-        return activeRows.some((r) => r[`${prefix}handle`] !== null || r[`${prefix}revenue`] !== null);
-      }
-
-      function activeHasRetail() {
-        return activeHasChannel("retail_");
-      }
-
-      function activeHasMobile() {
-        return activeHasChannel("mobile_");
-      }
-
       function activeShowChannels() {
-        return !isDetailView() || activeHasRetail() || activeHasMobile();
+        return !isDetailView() || activeAvail.hasRetail || activeAvail.hasMobile;
       }
 
       function getTableColFlags(rows) {
+        let showYoy = false, showGross = false, showPromo = false, showTax = false;
+        for (let i = 0; i < rows.length; i++) {
+          const r = rows[i];
+          if (!showYoy && (r.yoy_handle !== null || r.yoy_hold_bps !== null)) showYoy = true;
+          if (!showGross && r.gross_revenue !== null) showGross = true;
+          if (!showPromo && r.promo_deductions !== null) showPromo = true;
+          if (!showTax && r.tax !== null) showTax = true;
+          if (showYoy && showGross && showPromo && showTax) break;
+        }
         return {
           detail: isDetailView(),
-          showYoy: rows.some((r) => r.yoy_handle !== null || r.yoy_hold_bps !== null),
-          showGross: rows.some((r) => r.gross_revenue !== null),
-          showPromo: rows.some((r) => r.promo_deductions !== null),
-          showTax: rows.some((r) => r.tax !== null),
+          showYoy,
+          showGross,
+          showPromo,
+          showTax,
           showChannels: activeShowChannels()
         };
       }
@@ -1984,16 +2087,10 @@
       }
 
       function applyTableHeaderVisibility(flags) {
-        const clsGroups = [
-          ["detail-col", flags.detail],
-          ["yoy-col", flags.showYoy],
-          ["gross-col", flags.showGross],
-          ["promo-col", flags.showPromo],
-          ["tax-col", flags.showTax],
-          ["channel-col", flags.showChannels]
-        ];
-        clsGroups.forEach(([cls, vis]) => {
-          document.querySelectorAll(`th.${cls}`).forEach((th) => { th.style.display = vis ? "" : "none"; });
+        TH_BY_GROUP.forEach(([key, ths]) => {
+          if (lastColFlags && lastColFlags[key] === flags[key]) return;
+          const vis = flags[key] ? "" : "none";
+          ths.forEach((th) => { th.style.display = vis; });
         });
       }
 
@@ -2012,23 +2109,26 @@
           ? `${winTitle} Regulatory Records`
           : "Monthly Regulatory Records";
 
+        const isAsciiSort = sortCol === "month";
         const sorted = [...rows].sort((a, b) => {
           const av = a[sortCol];
           const bv = b[sortCol];
           if (av === bv) {
-            return b.month.localeCompare(a.month)
+            return compareAscii(b.month, a.month)
               || a.state.localeCompare(b.state)
               || (a.operator || "").localeCompare(b.operator || "");
           }
           if (av === null) return 1;
           if (bv === null) return -1;
-          const cmp = typeof av === "string" ? av.localeCompare(bv) : av - bv;
+          const cmp = isAsciiSort
+            ? compareAscii(av, bv)
+            : (typeof av === "string" ? av.localeCompare(bv) : av - bv);
           return sortAsc ? cmp : -cmp;
         });
 
         lastRenderedRows = sorted;
         lastColFlags = flags;
-        document.querySelectorAll("th[data-col]").forEach((th) => {
+        SORT_THS.forEach((th) => {
           if (th.getAttribute("data-col") === sortCol) {
             th.setAttribute("aria-sort", sortAsc ? "ascending" : "descending");
           } else {
@@ -2133,9 +2233,13 @@
       function applyDefaultDateBounds(forceToEnd = false) {
         const source = windowedActiveRows.length ? windowedActiveRows : activeRows;
         if (!source.length) return;
-        const months = source.map((r) => r.month).sort();
-        let defaultFrom = months[0];
-        let defaultTo = months[months.length - 1];
+        let defaultFrom = source[0].month;
+        let defaultTo = defaultFrom;
+        for (let i = 1; i < source.length; i++) {
+          const m = source[i].month;
+          if (m < defaultFrom) defaultFrom = m;
+          if (m > defaultTo) defaultTo = m;
+        }
         if (isMultiStateView() && !includePartialInput.checked) {
           const completeMonths = completeMonthsList(source);
           if (completeMonths.length) {
@@ -2175,17 +2279,17 @@
         const allDetailOpt = document.createElement("option");
         allDetailOpt.value = "__ALL_DETAILS__";
         allDetailOpt.textContent = slug === "__ALL__"
-          ? "All Disclosed Venues (7 States)"
+          ? `All Disclosed Venues (${DETAIL_STATE_COUNT} States)`
           : "All Disclosed Companies & Venues";
         entitySelect.appendChild(allDetailOpt);
 
-        const stateLabel = stateSelect.options[stateSelect.selectedIndex]?.text || "";
+        const stateLabel = selectedOptionText(stateSelect);
         const orderedBrands = orderedBrandsFromRows(detailRows);
 
         if (orderedBrands.length) {
           const brandGroup = document.createElement("optgroup");
           brandGroup.label = slug === "__ALL__"
-            ? "Operator Brands (7 Disclosing States)"
+            ? `Operator Brands (${DETAIL_STATE_COUNT} Disclosing States)`
             : `${stateLabel} — Operator Brands`;
           orderedBrands.forEach((b) => {
             const o = document.createElement("option");
@@ -2199,11 +2303,10 @@
         const venuePairs = new Map();
         detailRows.forEach((r) => {
           if (!r.operator) return;
-          const key = JSON.stringify([r.state, r.operator]);
-          if (!venuePairs.has(key)) venuePairs.set(key, { state: r.state, operator: r.operator });
+          const pairKey = `${r.state}\x1f${r.operator}`;
+          if (!venuePairs.has(pairKey)) venuePairs.set(pairKey, { state: r.state, operator: r.operator });
         });
-        const sortedVenues = Array.from(venuePairs.entries()).sort((a, b) => {
-          const va = a[1], vb = b[1];
+        const sortedVenues = Array.from(venuePairs.values()).sort((va, vb) => {
           return va.state.localeCompare(vb.state) || va.operator.localeCompare(vb.operator);
         });
         if (sortedVenues.length) {
@@ -2211,9 +2314,9 @@
           venueGroup.label = slug === "__ALL__"
             ? "Companies / Venues by State"
             : `${stateLabel} — Companies / Venues`;
-          sortedVenues.forEach(([key, pair]) => {
+          sortedVenues.forEach((pair) => {
             const o = document.createElement("option");
-            o.value = `op:${key}`;
+            o.value = `op:${JSON.stringify([pair.state, pair.operator])}`;
             o.textContent = slug === "__ALL__" ? `${pair.state} — ${pair.operator}` : pair.operator;
             venueGroup.appendChild(o);
           });
@@ -2228,21 +2331,16 @@
         const ent = entitySelect.value;
         if (ent === "__STATE_TOTAL__") {
           activeRows = activeStateRows;
-          updateDetailCompletenessMeta([]);
         } else if (ent === "__ALL_DETAILS__") {
           activeRows = activeDetailRows;
-          updateDetailCompletenessMeta(activeDetailRows);
         } else if (ent.startsWith("brand:")) {
           const brand = ent.slice(6);
           activeRows = activeDetailRows.filter((r) => r.brand === brand);
-          updateDetailCompletenessMeta(activeRows);
         } else if (ent.startsWith("op:")) {
           const [targetState, targetOp] = JSON.parse(ent.slice(3));
           activeRows = activeDetailRows.filter((r) => r.state === targetState && r.operator === targetOp);
-          updateDetailCompletenessMeta(activeRows);
         } else {
           activeRows = activeStateRows;
-          updateDetailCompletenessMeta([]);
         }
         refreshWindowedRows();
       }
@@ -2254,7 +2352,7 @@
 
         const showComparePartial = compareSelected.length > 0 && (
           (compareMode === "brands" && (slug === "__ALL__" || !DETAIL_STATES.has(slug)))
-          || (compareMode === "states" && (metricSelect.value === "handle_share" || metricSelect.value === "revenue_share"))
+          || (compareMode === "states" && isShareMetric(metricSelect.value))
         );
         partialField.style.display = (multi || showComparePartial) ? "" : "none";
 
@@ -2278,20 +2376,16 @@
           detailCsvLink.style.display = "none";
         }
 
-        const allowMobile = compareSelected.length > 0 || !detail || activeHasMobile();
-        const allowRetail = compareSelected.length > 0 || !detail || activeHasRetail();
+        const allowMobile = compareSelected.length > 0 || !detail || activeAvail.hasMobile;
+        const allowRetail = compareSelected.length > 0 || !detail || activeAvail.hasRetail;
         const allowShare = compareSelected.length > 0 || activeDetailRows.length > 0;
-        const allowPromo = compareSelected.length > 0
-          || windowedActiveRows.some((r) => r.promo_deductions !== null)
-          || activeRows.some((r) => r.promo_deductions !== null);
-        const allowTax = compareSelected.length > 0
-          || windowedActiveRows.some((r) => r.tax !== null)
-          || activeRows.some((r) => r.tax !== null);
+        const allowPromo = compareSelected.length > 0 || activeAvail.hasPromo;
+        const allowTax = compareSelected.length > 0 || activeAvail.hasTax;
 
         Array.from(metricSelect.options).forEach((opt) => {
           if (opt.value === "mobile_handle") opt.disabled = !allowMobile;
           else if (opt.value === "retail_handle") opt.disabled = !allowRetail;
-          else if (opt.value === "handle_share" || opt.value === "revenue_share") opt.disabled = !allowShare;
+          else if (isShareMetric(opt.value)) opt.disabled = !allowShare;
           else if (opt.value === "promo_deductions") opt.disabled = !allowPromo;
           else if (opt.value === "tax") opt.disabled = !allowTax;
         });
@@ -2318,15 +2412,8 @@
       function normalizeUrlCompareSelection(detailRows) {
         if (!compareSelected.length) return;
         if (compareMode === "states") {
-          const valid = new Map();
-          Array.from(stateSelect.options).forEach((o) => {
-            if (o.value && o.value !== "__ALL__") {
-              valid.set(o.value.toLowerCase(), o.text);
-              valid.set(o.text.toLowerCase(), o.text);
-            }
-          });
           compareSelected = Array.from(new Set(
-            compareSelected.map((item) => valid.get(item.toLowerCase())).filter(Boolean)
+            compareSelected.map((item) => STATE_NAME_LOOKUP.get(item.toLowerCase())).filter(Boolean)
           )).slice(0, 5);
         } else {
           const src = detailRows.length ? detailRows : (detailCsvCache.get("data/details/all.csv") || []);
@@ -2350,8 +2437,7 @@
         updateCompareUi();
         let candidates = [];
         if (modeAtCall === "states") {
-          candidates = Array.from(stateSelect.options)
-            .filter((o) => o.value && o.value !== "__ALL__")
+          candidates = STATE_SELECT_OPTIONS
             .map((o) => o.text)
             .sort((a, b) => a.localeCompare(b));
         } else {
@@ -2402,7 +2488,7 @@
       function readInitialUrlState() {
         const params = new URLSearchParams(window.location.search);
         const st = params.get("state");
-        if (st && Array.from(stateSelect.options).some((o) => o.value === st)) {
+        if (st && STATE_SELECT_OPTIONS.some((o) => o.value === st)) {
           stateSelect.value = st;
         }
         lastCommittedSlug = stateSelect.value || "__ALL__";
@@ -2507,8 +2593,9 @@
           }
           populateEntitySelect(slug, activeDetailRows, prevEntity);
           resolveActiveRows();
-          if (compareSelected.length && (pendingUrlState || compareMode === "states")) {
-            if (compareMode === "brands" && !activeDetailRows.length) {
+          if (compareSelected.length) {
+            const needAllBrands = slug === "__ALL__" || !DETAIL_STATES.has(slug);
+            if (compareMode === "brands" && needAllBrands && !detailCsvCache.has("data/details/all.csv")) {
               try {
                 await fetchDetailRows("__ALL__");
               } catch (_e) {
@@ -2517,11 +2604,14 @@
               if (mySeq !== loadSeq) return;
             }
             const normRows = compareMode === "brands"
-              ? (detailCsvCache.get("data/details/all.csv") || activeDetailRows)
+              ? (needAllBrands ? (detailCsvCache.get("data/details/all.csv") || activeDetailRows) : activeDetailRows)
               : activeDetailRows;
             normalizeUrlCompareSelection(normRows);
           }
           syncControlsAndSelection();
+          if (comparePanel.classList.contains("open")) {
+            renderCompareList();
+          }
           if (pendingUrlState && pendingUrlState.metric) {
             const mOpt = Array.from(metricSelect.options).find((o) => o.value === pendingUrlState.metric);
             if (mOpt && !mOpt.disabled) {
@@ -2563,7 +2653,7 @@
         if (open) renderCompareList();
       }
 
-      document.querySelectorAll("th[data-col]").forEach((th) => {
+      SORT_THS.forEach((th) => {
         th.setAttribute("tabindex", "0");
         th.setAttribute("role", "button");
         th.addEventListener("click", () => toggleSort(th));

@@ -2,23 +2,26 @@
 from __future__ import annotations
 
 from datetime import datetime
+import html
 import io
 import re
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from .discover import extract_month_label
 from .http import fetch_bytes, fetch_text
-from .model import dq_warn
-from .parse import PDFPLUMBER_LOCK, _parse_money
+from .model import MONTH_ABBR, dq_warn, safe_float
+from .parse import PDFPLUMBER_LOCK, collapse_ws, parse_dollar
 from .states import STATE_ABBR_TO_SLUG
 
+_T = TypeVar("_T")
 _AGGREGATOR_CACHE: dict[str, dict[str, tuple[float | None, float | None]]] = {}
 _SPORTSHANDLE_HTML_CACHE: dict[tuple[str, Any], str] = {}
 _UNLV_PAGES_CACHE: dict[tuple[str, Any], list[tuple[str, list[Any]]]] = {}
+_INFLIGHT_LOADS: dict[tuple[str, Any], threading.Event] = {}
 _AGGREGATOR_LOCK = threading.Lock()
-_TR_RE = re.compile(r"(?is)<tr[^>]*>(.*?)</tr>")
-_TD_RE = re.compile(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>")
+_TR_RE = re.compile(r"(?s)<tr[^>]*>(.*?)</tr>")
+_TD_RE = re.compile(r"(?s)<t[dh][^>]*>(.*?)</t[dh]>")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -32,13 +35,53 @@ def _source_cache_key(url: str, fetcher: Any) -> tuple[str, Any] | None:
         return None
 
 
+def _cached_source_fetch(
+    cache: dict[tuple[str, Any], _T],
+    url: str,
+    fetcher: Any,
+    loader: Callable[[], _T | None],
+) -> _T | None:
+    cache_key = _source_cache_key(url, fetcher)
+    if cache_key is None:
+        return loader()
+
+    inflight_owner = False
+    event: threading.Event | None = None
+    while True:
+        with _AGGREGATOR_LOCK:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+            event = _INFLIGHT_LOADS.get(cache_key)
+            if event is None:
+                event = threading.Event()
+                _INFLIGHT_LOADS[cache_key] = event
+                inflight_owner = True
+                break
+        event.wait()
+
+    try:
+        loaded = loader()
+        if loaded is None:
+            return None
+        with _AGGREGATOR_LOCK:
+            return cache.setdefault(cache_key, loaded)
+    finally:
+        if inflight_owner:
+            with _AGGREGATOR_LOCK:
+                _INFLIGHT_LOADS.pop(cache_key, None)
+            event.set()
+
+
 _STATE_ABBR: dict[str, str] = {
     slug: abbr.upper() for abbr, slug in STATE_ABBR_TO_SLUG.items()
 }
 
 _STATE_SECTION_RES: dict[str, re.Pattern[str]] = {
     state_lower: re.compile(
-        r"(?is)<h[1-4][^>]*>[^<]*" + re.escape(state_lower) + r"[^<]*</h[1-4]>(.*?)(?=<h[1-4]|\Z)"
+        r"(?s)<h[1-4][^>]*>(?:(?!</h[1-4]>).)*?\b"
+        + re.escape(state_lower)
+        + r"\b(?:(?!</h[1-4]>).)*?</h[1-4]>(.*?)(?=<h[1-4]|\Z)"
     )
     for state_lower in _STATE_ABBR
 }
@@ -46,15 +89,19 @@ _STATE_SECTION_RES: dict[str, re.Pattern[str]] = {
 
 def _normalize_aggregator_month(value: str) -> str | None:
     """Coerce strings like 'May 2026' / 'May-2026' / '2026-05' to 'May YYYY'."""
-    cleaned = " ".join((value or "").split())
+    cleaned = collapse_ws(value)
     if not cleaned:
         return None
-    for fmt in ("%B %Y", "%b %Y", "%b-%Y", "%B-%Y", "%Y-%m", "%m/%Y", "%m-%Y"):
+    label = extract_month_label(cleaned)
+    if label is not None:
+        return label
+    for fmt in ("%m/%Y", "%m-%Y", "%Y-%m"):
         try:
-            return datetime.strptime(cleaned, fmt).strftime("%b %Y")
+            d = datetime.strptime(cleaned, fmt)
+            return f"{MONTH_ABBR[d.month]} {d.year}"
         except ValueError:
             continue
-    return extract_month_label(cleaned)
+    return None
 
 
 def query_aggregator_sportshandle(
@@ -68,24 +115,19 @@ def query_aggregator_sportshandle(
     if section_re is None:
         return {}
     url = "https://sportshandle.com/sports-betting-revenue/"
-    cache_key = _source_cache_key(url, fetch_text)
-    html_lower: str | None = None
-    if cache_key is not None:
-        with _AGGREGATOR_LOCK:
-            html_lower = _SPORTSHANDLE_HTML_CACHE.get(cache_key)
-    if html_lower is None:
+
+    def _load_html() -> str | None:
         try:
             html = fetch_text(url, retries=2, timeout=30)
         except Exception as exc:
             if log:
                 log(f"WARN sportshandle fetch failed: {exc}")
-            return {}
-        if not html:
-            return {}
-        html_lower = html.lower()
-        if cache_key is not None:
-            with _AGGREGATOR_LOCK:
-                html_lower = _SPORTSHANDLE_HTML_CACHE.setdefault(cache_key, html_lower)
+            return None
+        return html.lower() if html else None
+
+    html_lower = _cached_source_fetch(_SPORTSHANDLE_HTML_CACHE, url, fetch_text, _load_html)
+    if html_lower is None:
+        return {}
     match = section_re.search(html_lower)
     if not match:
         return {}
@@ -93,14 +135,14 @@ def query_aggregator_sportshandle(
     rows = _TR_RE.findall(section)
     results: dict[str, tuple[float | None, float | None]] = {}
     for row in rows:
-        cells = [_HTML_TAG_RE.sub("", c).strip() for c in _TD_RE.findall(row)]
+        cells = [collapse_ws(html.unescape(_HTML_TAG_RE.sub(" ", c))) for c in _TD_RE.findall(row)]
         if len(cells) < 3:
             continue
         label = _normalize_aggregator_month(cells[0])
         if not label:
             continue
-        handle = _parse_money(cells[1])
-        revenue = _parse_money(cells[2])
+        handle = parse_dollar(cells[1])
+        revenue = parse_dollar(cells[2])
         if handle is None and revenue is None:
             continue
         results[label] = (handle, revenue)
@@ -120,20 +162,16 @@ def query_aggregator_unlv(
         if log:
             log("WARN pdfplumber not installed; UNLV cross-check unavailable")
         return {}
-    cache_key = _source_cache_key(pdf_url, fetch_bytes)
-    cached_pages: list[tuple[str, list[Any]]] | None = None
-    if cache_key is not None:
-        with _AGGREGATOR_LOCK:
-            cached_pages = _UNLV_PAGES_CACHE.get(cache_key)
-    if cached_pages is None:
+
+    def _load_pages() -> list[tuple[str, list[Any]]] | None:
         try:
             data = fetch_bytes(pdf_url, retries=2, timeout=60)
         except Exception as exc:
             if log:
                 log(f"WARN UNLV PDF fetch failed: {exc}")
-            return {}
+            return None
         if not data:
-            return {}
+            return None
         try:
             extracted: list[tuple[str, list[Any]]] = []
             with PDFPLUMBER_LOCK, pdfplumber.open(io.BytesIO(data)) as pdf:
@@ -141,19 +179,22 @@ def query_aggregator_unlv(
                     text = (page.extract_text() or "").lower()
                     tables = page.extract_tables() or []
                     extracted.append((text, tables))
+            return extracted
         except Exception as exc:
             if log:
                 log(f"WARN UNLV PDF parse failed: {exc}")
-            return {}
-        if cache_key is not None:
-            with _AGGREGATOR_LOCK:
-                cached_pages = _UNLV_PAGES_CACHE.setdefault(cache_key, extracted)
-        else:
-            cached_pages = extracted
+            return None
+
+    cached_pages = _cached_source_fetch(_UNLV_PAGES_CACHE, pdf_url, fetch_bytes, _load_pages)
+    if cached_pages is None:
+        return {}
     state_lower = state.strip().lower()
+    if not state_lower:
+        return {}
+    state_word_re = re.compile(rf"\b{re.escape(state_lower)}\b")
     results: dict[str, tuple[float | None, float | None]] = {}
     for text, tables in cached_pages:
-        if state_lower not in text:
+        if not state_word_re.search(text):
             continue
         for table in tables:
             for row in table:
@@ -164,7 +205,7 @@ def query_aggregator_unlv(
                     continue
                 amounts: list[float] = []
                 for cell in row[1:]:
-                    amount = _parse_money(str(cell or ""))
+                    amount = parse_dollar(cell)
                     if amount is not None:
                         amounts.append(amount)
                 if not amounts:
@@ -191,8 +232,6 @@ def _aggregator_lookup(
             data = _AGGREGATOR_CACHE.get(cache_key)
         if data is None:
             fetched = query_fn(state, log=log)
-            if not fetched:
-                continue
             with _AGGREGATOR_LOCK:
                 data = _AGGREGATOR_CACHE.setdefault(cache_key, fetched)
         if label in data:
@@ -221,11 +260,25 @@ def validate_against_aggregators(
     ref_handle, ref_revenue = ref
     diverged = False
     for metric, actual, expected in (("handle", handle, ref_handle), ("revenue", revenue, ref_revenue)):
-        if expected is not None and actual is not None and expected != 0:
-            delta_pct = abs(actual - expected) / abs(expected) * 100
-            if delta_pct > threshold_pct:
-                dq_warn(log, f"{state} {label}: {metric} ${actual:,.0f} differs from aggregator ${expected:,.0f} by {delta_pct:.1f}%")
+        if actual is None or expected is None:
+            continue
+        actual_f = safe_float(actual)
+        expected_f = safe_float(expected)
+        if actual_f is None:
+            dq_warn(log, f"{state} {label}: non-finite {metric} {actual!r}")
+            diverged = True
+            continue
+        if expected_f is None:
+            continue
+        if expected_f == 0:
+            if actual_f != 0:
+                dq_warn(log, f"{state} {label}: {metric} ${actual_f:,.0f} differs from aggregator $0")
                 diverged = True
+            continue
+        delta_pct = abs(actual_f - expected_f) / abs(expected_f) * 100
+        if delta_pct > threshold_pct:
+            dq_warn(log, f"{state} {label}: {metric} ${actual_f:,.0f} differs from aggregator ${expected_f:,.0f} by {delta_pct:.1f}%")
+            diverged = True
     return not diverged
 
 
@@ -241,9 +294,16 @@ def check_anomaly(
     log: Callable[[str], None] | None = None,
 ) -> bool:
     """Check parsed values against trailing baseline; emit DQ-WARN on outliers."""
+    del revenue
+    if handle is None:
+        return True
+    h_val = safe_float(handle)
+    if h_val is None:
+        dq_warn(log, f"{state} {label}: non-finite handle {handle!r}")
+        return False
     if len(history) < 3:
         return True
-    handles = [h for h, _ in history if h is not None]
+    handles = [hf for h, _ in history if (hf := safe_float(h)) is not None]
     if len(handles) < 3:
         return True
     mean = sum(handles) / len(handles)
@@ -251,16 +311,19 @@ def check_anomaly(
     stdev = variance ** 0.5
     flagged = False
     if stdev > 0:
-        zscore = abs(handle - mean) / stdev
+        zscore = abs(h_val - mean) / stdev
         if zscore > zscore_threshold:
-            dq_warn(log, f"{state} {label}: handle ${handle:,.0f} is {zscore:.1f}σ from trailing mean ${mean:,.0f}")
+            dq_warn(log, f"{state} {label}: handle ${h_val:,.0f} is {zscore:.1f}σ from trailing mean ${mean:,.0f}")
             flagged = True
     last_handle = handles[-1]
-    if last_handle != 0 and handle is not None:
-        mom = abs(handle - last_handle) / abs(last_handle)
+    if last_handle != 0:
+        mom = abs(h_val - last_handle) / abs(last_handle)
         if mom > mom_threshold:
-            dq_warn(log, f"{state} {label}: handle ${handle:,.0f} differs from prior month ${last_handle:,.0f} by {mom * 100:.0f}%")
+            dq_warn(log, f"{state} {label}: handle ${h_val:,.0f} differs from prior month ${last_handle:,.0f} by {mom * 100:.0f}%")
             flagged = True
+    elif h_val != 0:
+        dq_warn(log, f"{state} {label}: handle ${h_val:,.0f} diverges from $0 prior month baseline")
+        flagged = True
     return not flagged
 
 

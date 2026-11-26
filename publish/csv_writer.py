@@ -12,24 +12,34 @@ import tempfile
 from typing import Callable, Iterable, Mapping, Sequence, TextIO
 
 from statewager.model import _DC_SLOTS, CORE_RESULT_FIELDS, StateMonthResult, hold_pct, safe_float, sum_optional
-from statewager.operators import classify_operator_brand, normalize_operator_name
+from statewager.operators import BRAND_ORDER, classify_operator_brand, normalize_operator_name
 from statewager.states import load_state_module
 
-CSV_HEADERS: list[str] = [
-    *CORE_RESULT_FIELDS,
+_OTHER_BRAND = BRAND_ORDER[-1]
+_FISCAL_FIELDS: tuple[str, ...] = (
     "gross_revenue",
     "promo_deductions",
     "tax",
+)
+CSV_HEADERS: list[str] = [
+    *CORE_RESULT_FIELDS,
+    *_FISCAL_FIELDS,
 ]
 DETAIL_CSV_HEADERS: list[str] = [
     *CORE_RESULT_FIELDS[:2],
     "operator",
     "brand",
     *CORE_RESULT_FIELDS[2:],
-    "gross_revenue",
-    "promo_deductions",
-    "tax",
+    *_FISCAL_FIELDS,
 ]
+
+
+def state_has_details(state_or_slug: str, *, fallback: bool = False) -> bool:
+    """Return True when the state's module declares ``HAS_DETAILS = True``."""
+    try:
+        return bool(getattr(load_state_module(state_or_slug), "HAS_DETAILS", fallback))
+    except ValueError:
+        return fallback
 
 
 @dataclass(**_DC_SLOTS)
@@ -97,30 +107,12 @@ def _parse_opt_float(value: str | None) -> float | None:
         return None
 
 
-_NUMERIC_METRIC_FIELDS: tuple[str, ...] = (
-    "handle",
-    "revenue",
-    "hold",
-    "retail_handle",
-    "retail_revenue",
-    "retail_hold",
-    "mobile_handle",
-    "mobile_revenue",
-    "mobile_hold",
-    "gross_revenue",
-    "promo_deductions",
-    "tax",
+_NUMERIC_METRIC_FIELDS: tuple[str, ...] = tuple(
+    field for field in CSV_HEADERS[2:] if field != "source_url"
 )
-_ACC_SUM_FIELDS: tuple[str, ...] = (
-    "handle",
-    "revenue",
-    "retail_handle",
-    "retail_revenue",
-    "mobile_handle",
-    "mobile_revenue",
-    "gross_revenue",
-    "promo_deductions",
-    "tax",
+_HOLD_FIELDS: frozenset[str] = frozenset({"hold", "retail_hold", "mobile_hold"})
+_ACC_SUM_FIELDS: tuple[str, ...] = tuple(
+    field for field in _NUMERIC_METRIC_FIELDS if field not in _HOLD_FIELDS
 )
 
 
@@ -143,7 +135,7 @@ def _format_csv_metric_cells(item: StateMonthResult | PublishedDetailRow) -> lis
         _format_amount(item.mobile_handle),
         _format_amount(item.mobile_revenue),
         _format_pct(item.mobile_hold),
-        item.source_url or "",
+        _clean_csv_text(item.source_url) or "",
         _format_amount(item.gross_revenue),
         _format_amount(item.promo_deductions),
         _format_amount(item.tax),
@@ -156,8 +148,7 @@ def _open_checked_csv_reader(
     required_cols: set[str],
 ) -> csv.DictReader:
     reader = csv.DictReader(fh)
-    fieldnames = set(reader.fieldnames or ())
-    if not reader.fieldnames or not required_cols.issubset(fieldnames):
+    if not reader.fieldnames or not required_cols.issubset(reader.fieldnames):
         raise ValueError(f"Invalid CSV header in {csv_path}: {reader.fieldnames!r}")
     return reader
 
@@ -260,7 +251,7 @@ class _DetailAccumulator:
         self.retail_hold = None
         self.mobile_hold = None
         brand = str(fields["brand"])
-        if self.brand == "Other / Retail Venue" and brand != "Other / Retail Venue":
+        if self.brand == _OTHER_BRAND and brand != _OTHER_BRAND:
             self.brand = brand
         source_url = fields.get("source_url")
         if not self.source_url and source_url:
@@ -281,6 +272,17 @@ def _upsert_detail_group(
         acc.merge_fields(fields)
 
 
+def _resolve_acc_hold(
+    acc_count: int,
+    existing: float | None,
+    handle: float | None,
+    revenue: float | None,
+) -> float | None:
+    if acc_count == 1 and existing is not None:
+        return existing
+    return hold_pct(handle, revenue)
+
+
 def _finalize_detail_group(
     grouped: dict[tuple[str, str, str], _DetailAccumulator],
 ) -> list[PublishedDetailRow]:
@@ -292,20 +294,16 @@ def _finalize_detail_group(
             brand=acc.brand,
             handle=acc.handle,
             revenue=acc.revenue,
-            hold=acc.hold if (acc.count == 1 and acc.hold is not None) else hold_pct(acc.handle, acc.revenue),
+            hold=_resolve_acc_hold(acc.count, acc.hold, acc.handle, acc.revenue),
             retail_handle=acc.retail_handle,
             retail_revenue=acc.retail_revenue,
-            retail_hold=(
-                acc.retail_hold
-                if (acc.count == 1 and acc.retail_hold is not None)
-                else hold_pct(acc.retail_handle, acc.retail_revenue)
+            retail_hold=_resolve_acc_hold(
+                acc.count, acc.retail_hold, acc.retail_handle, acc.retail_revenue,
             ),
             mobile_handle=acc.mobile_handle,
             mobile_revenue=acc.mobile_revenue,
-            mobile_hold=(
-                acc.mobile_hold
-                if (acc.count == 1 and acc.mobile_hold is not None)
-                else hold_pct(acc.mobile_handle, acc.mobile_revenue)
+            mobile_hold=_resolve_acc_hold(
+                acc.count, acc.mobile_hold, acc.mobile_handle, acc.mobile_revenue,
             ),
             source_url=acc.source_url,
             gross_revenue=acc.gross_revenue,
@@ -322,16 +320,17 @@ def extract_published_details(results: Iterable[StateMonthResult]) -> list[Publi
     grouped: dict[tuple[str, str, str], _DetailAccumulator] = {}
     for item in results:
         source_details = item.publish_details if item.publish_details else item.details
+        cleaned_source_url = _clean_csv_text(item.source_url)
         for op in source_details:
             display_name = normalize_operator_name(op.operator, state=item.state)
             if not display_name:
                 continue
             brand = classify_operator_brand(op.operator, state=item.state)
-            if brand == "Other / Retail Venue":
+            if brand == _OTHER_BRAND:
                 brand = classify_operator_brand(display_name, state=item.state)
             fields: dict[str, object] = {name: safe_float(getattr(op, name)) for name in _ACC_SUM_FIELDS}
             fields["brand"] = brand
-            fields["source_url"] = _clean_csv_text(item.source_url)
+            fields["source_url"] = cleaned_source_url
             _upsert_detail_group(grouped, (item.state, item.month, display_name), fields)
     return _finalize_detail_group(grouped)
 
@@ -356,7 +355,7 @@ def read_detail_csv(csv_path: str) -> list[PublishedDetailRow]:
             csv_brand = (raw.get("brand") or "").strip()
             fields["brand"] = (
                 csv_brand
-                if (csv_brand and csv_brand != "Other / Retail Venue")
+                if (csv_brand and csv_brand != _OTHER_BRAND)
                 else classify_operator_brand(operator, state=state)
             )
             fields["source_url"] = metrics["source_url"]
@@ -374,11 +373,28 @@ def merge_detail_results(
     refreshed_months: Iterable[tuple[str, str]] | None = None,
 ) -> list[PublishedDetailRow]:
     """Merge ``fresh`` detail rows onto ``existing``, replacing each refreshed ``(state, month)``."""
-    fresh_list = list(fresh)
+    existing_list = list(existing)
+    prev_op_url: dict[tuple[str, str, str], str] = {}
+    prev_month_url: dict[tuple[str, str], str] = {}
+    for row in existing_list:
+        if row.source_url:
+            prev_op_url.setdefault((row.state, row.month, row.operator), row.source_url)
+            prev_month_url.setdefault((row.state, row.month), row.source_url)
+
+    fresh_list: list[PublishedDetailRow] = []
+    for row in fresh:
+        if row.source_url is None:
+            fallback_url = prev_op_url.get((row.state, row.month, row.operator)) or prev_month_url.get(
+                (row.state, row.month)
+            )
+            if fallback_url is not None:
+                row = replace(row, source_url=fallback_url)
+        fresh_list.append(row)
+
     replaced_months = {(row.state, row.month) for row in fresh_list}
     if refreshed_months is not None:
         replaced_months.update(refreshed_months)
-    kept = [row for row in existing if (row.state, row.month) not in replaced_months]
+    kept = [row for row in existing_list if (row.state, row.month) not in replaced_months]
     return sorted(kept + fresh_list, key=lambda r: (r.state, r.month, r.operator))
 
 
@@ -495,10 +511,7 @@ def write_status_json(
         earliest = ms[0] if ms else ""
         latest = ms[-1] if ms else ""
         det_count = detail_counts.get(display, 0)
-        try:
-            has_details = bool(getattr(load_state_module(slug), "HAS_DETAILS", False))
-        except ValueError:
-            has_details = det_count > 0
+        has_details = state_has_details(slug, fallback=det_count > 0)
         states_payload[slug] = {
             "name": display,
             "earliest_month": earliest,

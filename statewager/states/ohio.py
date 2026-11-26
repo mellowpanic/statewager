@@ -14,6 +14,9 @@ from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_ca
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
+    MONTH_ABBR,
+    MONTH_NAMES,
+    OperatorDetailTuple,
     StateMonthResult,
     build_operator_results,
     build_state_logger,
@@ -23,9 +26,9 @@ from ..model import (
     log_skip,
     resolve_fetch_months,
 )
-from ..parse import find_sheet_fuzzy, is_number, open_xlsx_workbook
+from ..parse import XLSX_MAGIC, clean_lower, find_sheet_fuzzy, is_number, is_xlsx_bytes, open_xlsx_workbook
 
-OhioDetailRow = Tuple[str, float, float, Optional[float], Optional[float], Optional[float], Optional[float]]
+OhioDetailRow = OperatorDetailTuple
 OhioFiscalDetailRow = Tuple[
     str, float, float, Optional[float], Optional[float], Optional[float], Optional[float],
     Optional[float], Optional[float], Optional[float],
@@ -70,7 +73,7 @@ def download_cumulative_workbook(
     return probe_url_variants(
         urls,
         {},
-        signature_check=b"PK",
+        signature_check=XLSX_MAGIC,
         wayback_timestamp=f"{year}12",
         log=log,
         report=report,
@@ -96,13 +99,35 @@ def _parse_month_sheet_with_fiscal(
     retail_handle = None
     retail_revenue = None
     promo_col = 4
-    details: list[OhioDetailRow] = []
     details_fiscal: list[OhioFiscalDetailRow] = []
     section = None
+
+    def _append_operator_row(op_label: str, row_vals: tuple[object, ...], sec: str) -> None:
+        handle = float(row_vals[1])
+        revenue_value = float(row_vals[5])
+        promo_val = float(row_vals[promo_col]) if len(row_vals) > promo_col and is_number(row_vals[promo_col]) else None
+        rh = handle if sec == "retail" else None
+        rr = revenue_value if sec == "retail" else None
+        mh = handle if sec == "online" else None
+        mr = revenue_value if sec == "online" else None
+        details_fiscal.append((op_label, handle, revenue_value, rh, rr, mh, mr, revenue_value, promo_val, None))
+
     for row in sheet.iter_rows(values_only=True):
-        row_text = " ".join(str(cell or "") for cell in row).lower()
-        label = str(row[0] if row else "").strip()
+        if not any(cell is not None for cell in row):
+            continue
+        label = str((row[0] if row else None) or "").strip()
         lower_label = label.lower()
+        if (
+            section
+            and label
+            and not any(kw in lower_label for kw in ("subtotal", "total", "proprietor", "type "))
+            and len(row) > 5
+            and is_number(row[1])
+            and is_number(row[5])
+        ):
+            _append_operator_row(label, row, section)
+            continue
+        row_text = " ".join(str(cell or "") for cell in row).lower()
         if "type a proprietors - online sports gaming" in row_text:
             section = "online"
             continue
@@ -115,7 +140,7 @@ def _parse_month_sheet_with_fiscal(
             or lower_label.startswith("all proprietors / services providers")
         ):
             for idx, cell in enumerate(row):
-                if "promotional" in str(cell or "").lower():
+                if "promotional" in clean_lower(cell):
                     promo_col = idx
                     break
             continue
@@ -140,6 +165,7 @@ def _parse_month_sheet_with_fiscal(
                 else (numeric[3] if len(numeric) >= 6 else None)
             )
             if None not in (online_handle, online_revenue, retail_handle, retail_revenue):
+                details = [entry[:7] for entry in details_fiscal]
                 core = (
                     total_handle,
                     total_revenue,
@@ -150,24 +176,21 @@ def _parse_month_sheet_with_fiscal(
                     details,
                 )
                 return core, total_revenue, total_promo, details_fiscal
-        elif section and label and is_number(row[1] if len(row) > 1 else None):
-            revenue = row[5] if len(row) > 5 else None
-            if is_number(revenue):
-                handle = float(row[1])
-                revenue_value = float(revenue)
-                promo_val = float(row[promo_col]) if len(row) > promo_col and is_number(row[promo_col]) else None
-                rh = handle if section == "retail" else None
-                rr = revenue_value if section == "retail" else None
-                mh = handle if section == "online" else None
-                mr = revenue_value if section == "online" else None
-                details.append((label, handle, revenue_value, rh, rr, mh, mr))
-                details_fiscal.append((label, handle, revenue_value, rh, rr, mh, mr, revenue_value, promo_val, None))
+        elif (
+            section
+            and label
+            and not any(kw in lower_label for kw in ("subtotal", "total", "proprietor", "type "))
+            and len(row) > 5
+            and is_number(row[1])
+            and is_number(row[5])
+        ):
+            _append_operator_row(label, row, section)
     return None
 
 
 def _parse_cumulative_xlsx_with_fiscal(
     data: bytes,
-    target_months: list[tuple[str, str, str, str]],
+    target_months: list[tuple[date, str, str]],
     log: Callable[[str], None] = _DEFAULT_LOG,
 ) -> tuple[dict[str, OhioMonthCore], dict[str, OhioMonthFiscal]]:
     if openpyxl is None:
@@ -177,7 +200,7 @@ def _parse_cumulative_xlsx_with_fiscal(
             return {}, {}
         results: dict[str, OhioMonthCore] = {}
         fiscal_results: dict[str, OhioMonthFiscal] = {}
-        for month_name, _, _, label in target_months:
+        for _mdate, month_name, label in target_months:
             sheet = find_sheet_fuzzy(workbook, month_name)
             if sheet is None:
                 continue
@@ -192,7 +215,7 @@ def _parse_cumulative_xlsx_with_fiscal(
 def _parse_local_files_with_fiscal(
     local_dir: str,
     year: int,
-    target_months: list[tuple[str, str, str, str]],
+    target_months: list[tuple[date, str, str]],
     log: Callable[[str], None] = _DEFAULT_LOG,
 ):
     matched = find_local_file(
@@ -200,7 +223,7 @@ def _parse_local_files_with_fiscal(
         lambda entry: entry.lower().endswith(".xlsx") and str(year) in entry,
         reverse=True,
     )
-    if matched is not None and matched[1].startswith(b"PK"):
+    if matched is not None and is_xlsx_bytes(matched[1]):
         log(f"INFO using local workbook {matched[0]}")
         return _parse_cumulative_xlsx_with_fiscal(matched[1], target_months, log=log)
     return {}, {}
@@ -232,29 +255,28 @@ def fetch(
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
     months = [
-        (
-            mdate.strftime("%B"),
-            mdate.strftime("%Y"),
-            mdate.strftime("%m"),
-            mdate.strftime("%b %Y"),
-        )
+        (mdate, MONTH_NAMES[mdate.month], f"{MONTH_ABBR[mdate.month]} {mdate.year}")
         for mdate in target_dates
     ]
     parsed_by_label: dict[str, OhioMonthCore] = {}
     fiscal_by_label: dict[str, OhioMonthFiscal] = {}
     source_by_year: dict[int, str] = {}
-    for year in sorted({int(yr) for _, yr, _, _ in months}):
+    for year in sorted({mdate.year for mdate, _, _ in months}):
         try:
-            year_months = [entry for entry in months if int(entry[1]) == year]
-            latest_report_number = max(int(month_num) for _, _, month_num, _ in year_months)
-            latest_requested = max(date(int(yr), int(mo), 1) for _, yr, mo, _ in year_months)
+            year_months = [entry for entry in months if entry[0].year == year]
+            latest_requested = max(mdate for mdate, _, _ in year_months)
+            latest_report_number = latest_requested.month
+            recent_ttl = recent_cache_ttl(latest_requested.year, latest_requested.month)
             found_urls: list[str] = []
+            fetch_called = [False]
 
             def _download_oh(
                 y: int = year,
                 lrn: int = latest_report_number,
                 urls: list[str] = found_urls,
+                called: list[bool] = fetch_called,
             ) -> bytes | None:
+                called[0] = True
                 return download_cumulative_workbook(y, lrn, report=report, log=logger, matched_url=urls)
 
             parsed, parsed_fiscal = (
@@ -269,8 +291,8 @@ def fetch(
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {year}",
                     fetch_error_message=f"could not download Ohio cumulative workbook for {year}",
-                    validate=lambda payload: payload.startswith(b"PK"),
-                    cache_ttl_seconds=recent_cache_ttl(latest_requested.year, latest_requested.month),
+                    validate=is_xlsx_bytes,
+                    cache_ttl_seconds=recent_ttl,
                     offline=offline,
                 )
                 if data:
@@ -278,16 +300,17 @@ def fetch(
                 if (
                     data is not None
                     and was_cached
+                    and not fetch_called[0]
                     and not offline
                     and path
                     and len(parsed) < len(year_months)
-                    and (date.today() - latest_requested).days <= 90
+                    and recent_ttl is not None
                 ):
                     refreshed = refresh_cached_if_stale(
                         path,
                         data,
                         fetcher=_download_oh,
-                        validate=lambda payload: payload.startswith(b"PK"),
+                        validate=is_xlsx_bytes,
                         offline=offline,
                         log=logger,
                     )
@@ -302,7 +325,7 @@ def fetch(
             logger(f"WARN failed Ohio workbook processing for {year}: {exc}")
 
     results: list[StateMonthResult] = []
-    for mdate, (_, _, _, label) in zip(target_dates, months):
+    for mdate, _, label in months:
         iso_month = format_iso_month(mdate.year, mdate.month)
         if label not in parsed_by_label:
             log_skip(logger, label, "no parsed value")
