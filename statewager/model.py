@@ -6,13 +6,18 @@ from datetime import date, datetime
 import logging
 import math
 import sys
-from typing import Callable, Iterable, Mapping, Sequence, TypeVar
+from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from dateutil.relativedelta import relativedelta
 
 T = TypeVar("T")
 
 _DC_SLOTS: dict[str, bool] = {"slots": True} if sys.version_info >= (3, 10) else {}
+
+OperatorDetailTuple = Tuple[
+    str, float, float, Optional[float], Optional[float], Optional[float], Optional[float]
+]
+OperatorFiscalTuple = Tuple[Optional[float], Optional[float], Optional[float]]
 
 DQ_WARN_PREFIX = "DQ-WARN"
 
@@ -49,18 +54,9 @@ CORE_RESULT_FIELDS: tuple[str, ...] = (
 )
 
 MONTH_NAME_TO_NUM: dict[str, int] = {
-    "january": 1, "jan": 1,
-    "february": 2, "feb": 2,
-    "march": 3, "mar": 3,
-    "april": 4, "apr": 4,
-    "may": 5,
-    "june": 6, "jun": 6,
-    "july": 7, "jul": 7,
-    "august": 8, "aug": 8,
-    "september": 9, "sept": 9, "sep": 9,
-    "october": 10, "oct": 10,
-    "november": 11, "nov": 11,
-    "december": 12, "dec": 12,
+    **{name.lower(): month for month, name in MONTH_NAMES.items()},
+    **{abbr.lower(): month for month, abbr in MONTH_ABBR.items()},
+    "sept": 9,
 }
 
 
@@ -82,7 +78,7 @@ class OperatorMonthResult:
     tax: float | None = None
 
 
-@dataclass
+@dataclass(**_DC_SLOTS)
 class StateMonthResult:
     """Canonical monthly sports wagering metrics for a single state."""
 
@@ -121,7 +117,15 @@ def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
     if isinstance(value, date):
         return _valid_year_month(value.year, value.month)
     if isinstance(value, tuple) and len(value) == 2:
-        return _valid_year_month(int(value[0]), int(value[1]))
+        year_v, month_v = value
+        if (
+            isinstance(year_v, bool)
+            or isinstance(month_v, bool)
+            or not isinstance(year_v, int)
+            or not isinstance(month_v, int)
+        ):
+            raise ValueError(f"Invalid month tuple: {value!r} (expected integer (year, month))")
+        return _valid_year_month(year_v, month_v)
     if isinstance(value, str):
         text = value.strip()
         parts = text.split("-") if "-" in text else text.split()
@@ -139,11 +143,12 @@ def parse_month_spec(value: str | date | datetime | tuple[int, int]) -> date:
 
 def month_yyyymm(value: object) -> str | None:
     """Return ``'YYYYMM'`` for a valid month specification/label, else None."""
-    if value is None or not isinstance(value, (str, date, datetime, tuple)):
+    if not isinstance(value, (str, date, tuple)):
         return None
     try:
-        return parse_month_spec(value).strftime("%Y%m")  # type: ignore[arg-type]
-    except ValueError:
+        d = parse_month_spec(value)  # type: ignore[arg-type]
+        return f"{d.year:04d}{d.month:02d}"
+    except (ValueError, TypeError):
         return None
 
 
@@ -163,7 +168,7 @@ def resolve_fetch_months(
         if end < start:
             raise ValueError(f"month_end ({end:%Y-%m}) must be on or after month_start ({start:%Y-%m})")
     if launch_date is not None:
-        launch_month = launch_date.replace(day=1)
+        launch_month = date(launch_date.year, launch_date.month, 1)
         if end < launch_month:
             return []
         start = max(start, launch_month)
@@ -183,7 +188,7 @@ def format_iso_month(year: int, month: int) -> str:
 def format_month_label(month_iso_or_date: str | date) -> str:
     """Format an ISO ``YYYY-MM`` string or ``date`` as ``'Mon YYYY'``."""
     d = parse_month_spec(month_iso_or_date)
-    return d.strftime("%b %Y")
+    return f"{MONTH_ABBR[d.month]} {d.year}"
 
 
 def label_to_iso_month(label: str) -> str:
@@ -265,8 +270,6 @@ def month_starts(
         raise ValueError("n_months must be >= 1")
     anchor = date.today().replace(day=1)
     latest = anchor if include_current_month else anchor - relativedelta(months=1)
-    if launch_date is not None and latest < launch_date.replace(day=1):
-        return []
     return resolve_fetch_months(latest - relativedelta(months=n_months - 1), latest, launch_date=launch_date)
 
 
@@ -312,6 +315,8 @@ def sum_optional(*values: float | None) -> float | None:
 
 def fiscal_year_july(year: int, month: int) -> tuple[int, int]:
     """Return the July–June fiscal year ``(fy_start, fy_end)`` containing ``(year, month)``."""
+    if isinstance(month, bool) or not isinstance(month, int) or not (1 <= month <= 12):
+        raise ValueError(f"Month must be in 1..12, got {month!r}")
     return (year, year + 1) if month >= 7 else (year - 1, year)
 
 
@@ -395,8 +400,28 @@ def log_skip(log: Callable[[str], None], label: str, reason: str) -> None:
     log(f"WARN skipped {label}; {reason}")
 
 
-def _reconcile_pair(
+def _derive_split(
     total: float,
+    known: float,
+    *,
+    missing_name: str,
+    metric: str,
+    label: str,
+    tolerance: float,
+    log: Callable[[str], None] | None,
+) -> float | None:
+    derived = total - known
+    if metric == "handle":
+        if derived < -tolerance:
+            _emit_warn(log, f"{label}: derived negative {missing_name} handle ({derived:.2f}); omitting split")
+            return None
+        if derived < 0:
+            return 0.0
+    return derived
+
+
+def _reconcile_pair(
+    total: float | None,
     retail: float | None,
     mobile: float | None,
     *,
@@ -405,10 +430,18 @@ def _reconcile_pair(
     tolerance: float,
     log: Callable[[str], None] | None,
 ) -> tuple[float | None, float | None]:
+    if total is None:
+        return retail, mobile
     if retail is None and mobile is not None:
-        retail = total - mobile
+        retail = _derive_split(
+            total, mobile, missing_name="retail", metric=metric,
+            label=label, tolerance=tolerance, log=log,
+        )
     if mobile is None and retail is not None:
-        mobile = total - retail
+        mobile = _derive_split(
+            total, retail, missing_name="mobile", metric=metric,
+            label=label, tolerance=tolerance, log=log,
+        )
     if retail is not None and mobile is not None:
         delta = (retail + mobile) - total
         if abs(delta) > tolerance:
@@ -429,15 +462,19 @@ def reconcile_components(
     log: Callable[[str], None] | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """Fill missing component values from totals and warn on inconsistent sums."""
-    retail_handle, mobile_handle = _reconcile_pair(
-        total_handle, retail_handle, mobile_handle,
+    rh = safe_float(retail_handle)
+    rr = safe_float(retail_revenue)
+    mh = safe_float(mobile_handle)
+    mr = safe_float(mobile_revenue)
+    rh, mh = _reconcile_pair(
+        safe_float(total_handle), rh, mh,
         metric="handle", label=label, tolerance=tolerance, log=log,
     )
-    retail_revenue, mobile_revenue = _reconcile_pair(
-        total_revenue, retail_revenue, mobile_revenue,
+    rr, mr = _reconcile_pair(
+        safe_float(total_revenue), rr, mr,
         metric="revenue", label=label, tolerance=tolerance, log=log,
     )
-    return retail_handle, retail_revenue, mobile_handle, mobile_revenue
+    return rh, rr, mh, mr
 
 
 def build_operator_results(
@@ -562,21 +599,34 @@ def finalize_state_month(
                 ("handle", total_h, rh, mh),
                 ("revenue", total_r, rr, mr),
             ):
-                if ret_val is None or mob_val is None:
-                    continue
-                if total_val != 0:
-                    delta_pct = abs((ret_val + mob_val) - total_val) / abs(total_val)
-                    if delta_pct > strict_split_pct:
-                        if log:
-                            log(
-                                f"WARN {tag}: retail/mobile {metric_name} reconciliation failed "
+                err_msg: str | None = None
+                if metric_name == "handle":
+                    for split_val in (ret_val, mob_val):
+                        if split_val is not None and (split_val < 0 or split_val > total_val):
+                            diff = abs(split_val - total_val) if split_val > total_val else abs(split_val)
+                            if (total_val != 0 and diff / abs(total_val) > strict_split_pct) or (
+                                total_val == 0 and diff > tolerance
+                            ):
+                                err_msg = (
+                                    f"{tag}: invalid retail/mobile handle split "
+                                    f"({split_val:,.2f} vs total {total_val:,.2f}); blanking splits"
+                                )
+                                break
+                if err_msg is None and ret_val is not None and mob_val is not None:
+                    diff = abs((ret_val + mob_val) - total_val)
+                    if total_val != 0:
+                        delta_pct = diff / abs(total_val)
+                        if delta_pct > strict_split_pct:
+                            err_msg = (
+                                f"{tag}: retail/mobile {metric_name} reconciliation failed "
                                 f"({delta_pct * 100:.2f}% delta vs total); blanking splits"
                             )
-                        rh = rr = mh = mr = None
-                        break
-                elif abs((ret_val + mob_val) - total_val) > tolerance:
-                    if log:
-                        log(f"WARN {tag}: retail/mobile {metric_name} non-zero splits on zero total; blanking splits")
+                    elif diff > tolerance:
+                        err_msg = (
+                            f"{tag}: retail/mobile {metric_name} non-zero splits on zero total; blanking splits"
+                        )
+                if err_msg is not None:
+                    _emit_warn(log, err_msg)
                     rh = rr = mh = mr = None
                     break
     return StateMonthResult(
@@ -599,6 +649,26 @@ def finalize_state_month(
         promo_deductions=safe_float(promo_deductions),
         tax=safe_float(tax),
     )
+
+
+def build_region_extra(
+    regions: Iterable[tuple[str, float, float]],
+    region_order: Sequence[str],
+    key_map: Mapping[str, tuple[str, str]] | None = None,
+) -> dict[str, float | None]:
+    """Map regional ``(name, handle, revenue)`` rows onto ordered extra column headers."""
+    region_map = {name: (handle, revenue) for name, handle, revenue in regions}
+    extra: dict[str, float | None] = {}
+    for region_name in region_order:
+        handle_key, revenue_key = (
+            key_map[region_name]
+            if key_map is not None
+            else (f"{region_name} Handle", f"{region_name} Revenue")
+        )
+        region_handle, region_revenue = region_map.get(region_name, (None, None))
+        extra[handle_key] = region_handle
+        extra[revenue_key] = region_revenue
+    return extra
 
 
 def dq_warn(log: Callable[[str], None] | None, message: str) -> None:
@@ -630,12 +700,14 @@ def find_stale_months(
         except ValueError:
             return (9999, 0)
 
+    sort_keys: dict[str, tuple[int, int]] = {}
     stale: list[tuple[str, str, int]] = []
     for label, peers in month_peers.items():
         if len(peers) < min_peers:
             continue
+        sort_keys[label] = _month_sort_key(label)
         for state in per_state_tab_data:
             if state not in peers:
                 stale.append((state, label, len(peers)))
-    stale.sort(key=lambda triple: (_month_sort_key(triple[1]), triple[0]))
+    stale.sort(key=lambda triple: (sort_keys[triple[1]], triple[0]))
     return stale

@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from datetime import date
 import os
+import re
+import stat
 import tempfile
 import time
 from typing import Callable, TypeVar
+
+from .model import MONTH_ABBR, MONTH_NAMES
 
 T = TypeVar("T")
 
@@ -36,14 +40,20 @@ def find_local_month_file(
     extensions: tuple[str, ...] | str,
 ) -> tuple[str, bytes] | None:
     """Return ``(filename, bytes)`` for a local file matching year, full/short month name, and extension."""
-    month_date = date(year, month, 1)
-    full_month = month_date.strftime("%B").lower()
-    short_month = month_date.strftime("%b").lower()
-    year_str = str(year)
+    if not (1 <= month <= 12):
+        raise ValueError(f"month must be in 1..12, got {month}")
+    short_month = MONTH_ABBR[month].lower()
+    full_month = MONTH_NAMES[month].lower()
+    alts = [re.escape(full_month), re.escape(short_month)]
+    if month == 9:
+        alts.append("sept")
+    year_re = re.compile(rf"(?<!\d){year}(?!\d)")
+    month_re = re.compile(rf"(?<![a-z])(?:{'|'.join(alts)})(?![a-z])")
+    exts = tuple(e.lower() for e in ((extensions,) if isinstance(extensions, str) else extensions))
 
     def _matches(entry: str) -> bool:
         low = entry.lower()
-        return low.endswith(extensions) and year_str in low and (full_month in low or short_month in low)
+        return low.endswith(exts) and year_re.search(low) is not None and month_re.search(low) is not None
 
     return find_local_file(local_dir, _matches)
 
@@ -58,7 +68,7 @@ def cache_path(cache_dir: str | None, filename: str) -> str | None:
     target = os.path.abspath(os.path.join(base, filename))
     real_base = os.path.realpath(base)
     real_target = os.path.realpath(target)
-    if target == base or os.path.commonpath([real_base, real_target]) != real_base:
+    if target == base or real_target == real_base or os.path.commonpath([real_base, real_target]) != real_base:
         raise ValueError(f"Cache path escapes cache_dir: {filename!r}")
     return target
 
@@ -75,22 +85,39 @@ def recent_fy_cache_ttl(fy_end: int, *, grace_days: int = 90, ttl_seconds: float
 
 def cache_age_seconds(path: str | None) -> float | None:
     """Return file age in seconds when ``path`` is a non-empty regular file, else None."""
-    if not path or not os.path.isfile(path):
+    if not path:
         return None
     try:
-        if os.path.getsize(path) <= 0:
-            return None
-        return max(0.0, time.time() - os.path.getmtime(path))
+        st = os.stat(path)
     except OSError:
         return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+        return None
+    return max(0.0, time.time() - st.st_mtime)
+
+
+def _read_cache_with_age(path: str | None) -> tuple[bytes | None, float | None]:
+    if not path:
+        return None, None
+    try:
+        with open(path, "rb") as file_handle:
+            st = os.fstat(file_handle.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return None, None
+            data = file_handle.read()
+    except (FileNotFoundError, IsADirectoryError):
+        return None, None
+    age = max(0.0, time.time() - st.st_mtime) if st.st_size > 0 else None
+    return data, age
 
 
 def load_cache(path: str | None) -> bytes | None:
     """Load cached bytes if the file exists, else return None."""
-    if path and os.path.isfile(path):
-        with open(path, "rb") as file_handle:
-            return file_handle.read()
-    return None
+    try:
+        data, _age = _read_cache_with_age(path)
+    except OSError:
+        return None
+    return data
 
 
 def save_cache(path: str | None, data: bytes) -> None:
@@ -120,10 +147,33 @@ def save_cache(path: str | None, data: bytes) -> None:
         raise
 
 
+def try_save_cache(
+    path: str | None,
+    data: bytes,
+    *,
+    log: Callable[[str], None] | None = None,
+    message_prefix: str = "WARN could not write cache",
+) -> bool:
+    """Persist ``data`` via :func:`save_cache`, logging and returning False on OS errors."""
+    if not path:
+        return False
+    try:
+        save_cache(path, data)
+        return True
+    except OSError as exc:
+        if log:
+            log(f"{message_prefix} {path}: {exc}")
+        return False
+
+
 def ensure_cache_dir(cache_dir: str | None) -> None:
     """Create the cache directory when caching is enabled."""
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
+
+
+def _is_valid_payload(data: bytes, validate: Callable[[bytes], bool] | None) -> bool:
+    return bool(data) and (validate is None or bool(validate(data)))
 
 
 def _fetch_and_validate(
@@ -140,7 +190,7 @@ def _fetch_and_validate(
         if log:
             log(f"WARN {fail_message}: {exc}")
         return None
-    if fresh is not None and (not fresh or (validate is not None and not validate(fresh))):
+    if fresh is not None and not _is_valid_payload(fresh, validate):
         if log:
             log(f"WARN {invalid_message}")
         return None
@@ -169,19 +219,18 @@ def load_cached_or_fetch(
     stale_backup: bytes | None = None
     if cache_file:
         try:
-            loaded = load_cache(cache_file)
+            loaded, age = _read_cache_with_age(cache_file)
         except Exception as exc:
             if log:
                 log(f"WARN could not read cache {cache_file}: {exc}")
         else:
             if loaded is not None:
-                if not loaded or (validate is not None and not validate(loaded)):
+                if not _is_valid_payload(loaded, validate):
                     if log:
                         log(f"WARN invalid cached payload for {os.path.basename(cache_file)}; ignoring")
                 else:
                     data = loaded
             if data is not None and cache_ttl_seconds is not None and not offline:
-                age = cache_age_seconds(cache_file)
                 if age is not None and age > cache_ttl_seconds:
                     stale_backup = data
                     data = None
@@ -206,15 +255,11 @@ def load_cached_or_fetch(
         )
         if fresh is not None:
             if cache_file:
-                try:
-                    save_cache(cache_file, fresh)
-                except Exception as exc:
-                    if log:
-                        log(f"WARN could not write cache {cache_file}: {exc}")
+                try_save_cache(cache_file, fresh, log=log)
             if fetch_success_message and log:
                 log(fetch_success_message)
             data = fresh
-        elif stale_backup is not None and cache_file:
+        elif stale_backup is not None:
             data = stale_backup
             if log:
                 log(f"INFO refetch failed; using stale cache {os.path.basename(cache_file)}")
@@ -245,7 +290,13 @@ def refresh_cached_if_stale(
         fail_message=f"stale cache refresh failed for {name}",
         invalid_message=f"stale cache refresh returned invalid payload for {name}",
     )
-    if fresh is None or fresh == current_data:
+    if fresh is None:
         return None
-    save_cache(cache_file, fresh)
+    if fresh == current_data:
+        try:
+            os.utime(cache_file, None)
+        except OSError:
+            pass
+        return None
+    try_save_cache(cache_file, fresh, log=log)
     return fresh

@@ -1,7 +1,7 @@
 """Pennsylvania sports wagering regulatory fetcher and parser (PGCB)."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from html import unescape
 import os
 import re
@@ -16,10 +16,13 @@ except ImportError:
 from dateutil.relativedelta import relativedelta
 
 from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_fy_cache_ttl, refresh_cached_if_stale
-from ..discover import AnchorParser, DiscoveryReport, crawl_anchors
+from ..discover import DiscoveryReport, crawl_anchors, parse_anchors
 from ..http import fetch_bytes, fetch_text, fetch_with_wayback_fallback
 from ..model import (
     MONTH_ABBR,
+    MONTH_NAMES,
+    OperatorDetailTuple,
+    OperatorFiscalTuple,
     StateMonthResult,
     build_operator_results,
     build_state_logger,
@@ -31,11 +34,11 @@ from ..model import (
     resolve_fetch_months,
     sum_optional,
 )
-from ..parse import clean_lower, is_number, open_xlsx_workbook
+from ..parse import XLSX_MAGIC, clean_lower, is_number, is_xlsx_bytes, open_xlsx_workbook
 
-PaDetailRow = Tuple[str, float, float, Optional[float], Optional[float], Optional[float], Optional[float]]
+PaDetailRow = OperatorDetailTuple
 PaMonthCore = Tuple[float, float, Optional[float], Optional[float], Optional[float], Optional[float], List[PaDetailRow]]
-PaFiscalTuple = Tuple[Optional[float], Optional[float], Optional[float]]
+PaFiscalTuple = OperatorFiscalTuple
 
 STATE_NAME = "Pennsylvania"
 LAUNCH_DATE: date | None = None
@@ -51,7 +54,7 @@ _FY_OPTION_RE = re.compile(
     r'<option[^>]*value=["\'](\d+)["\'][^>]*>\s*FY\s*(20\d{2})\s*/\s*(20\d{2})\s*</option>',
     re.IGNORECASE,
 )
-_FY_TEXT_RE = re.compile(r"fy[ _-]?(\d{2})[ _-]?(\d{2})")
+_FY_TEXT_RE = re.compile(r"fy[ _-]?(?:20)?(\d{2})[ _-]?(?:20)?(\d{2})(?!\d)")
 
 _DEFAULT_LOG = build_state_logger("PA")
 
@@ -59,9 +62,9 @@ _DEFAULT_LOG = build_state_logger("PA")
 def _absolute_url(href: str) -> str:
     if not href:
         return ""
-    if href.startswith("http"):
+    if href.startswith(("http://", "https://")):
         return href
-    return urljoin(PGCB_BASE + "/", href.lstrip("/"))
+    return urljoin(REVENUE_PAGE, href)
 
 
 def parse_filter_options(html: str) -> dict[tuple[int, int], int]:
@@ -82,7 +85,8 @@ def crawl_revenue_index(
     filter_ids = dict(FILTER_IDS)
     try:
         index_html = fetch_text(REVENUE_PAGE, timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES)
-    except Exception:
+    except Exception as exc:
+        log(f"WARN could not fetch anchor index {REVENUE_PAGE}: {exc}")
         index_html = None
     if index_html:
         for fy_key, fid in parse_filter_options(index_html).items():
@@ -100,22 +104,20 @@ def crawl_revenue_index(
             report.add_index(page_url, anchor_count=len(links))
         for link in links:
             href = unescape(link.get("href", "").strip())
-            if not href or href in seen_hrefs:
+            if not href:
                 continue
-            seen_hrefs.add(href)
+            abs_href = _absolute_url(href)
+            if abs_href in seen_hrefs:
+                continue
+            seen_hrefs.add(abs_href)
             aggregated.append({
-                "href": _absolute_url(href),
+                "href": abs_href,
                 "title": link.get("title", ""),
                 "text": link.get("text", ""),
             })
 
     if index_html:
-        parser = AnchorParser()
-        parser.feed(index_html)
-        parser.close()
-        _collect(parser.links, REVENUE_PAGE)
-    else:
-        _collect(crawl_anchors(REVENUE_PAGE, log=log), REVENUE_PAGE)
+        _collect(parse_anchors(index_html, url=REVENUE_PAGE, log=log), REVENUE_PAGE)
     for (_fy_start, _fy_end), filter_id in sorted(filter_ids.items(), reverse=True):
         url = f"{REVENUE_PAGE}?field_gaming_revenue_fiscal_year_target_id={filter_id}"
         _collect(crawl_anchors(url, log=log), url)
@@ -125,8 +127,8 @@ def crawl_revenue_index(
 def _is_fy_summary_anchor(
     href: str, title: str, text: str,
 ) -> tuple[int, int] | None:
-    lower_href = href.lower()
-    if not lower_href.endswith((".xlsx", ".pdf")):
+    lower_path = href.split("?", 1)[0].split("#", 1)[0].lower()
+    if not lower_path.endswith(".xlsx"):
         return None
     combined = " ".join(part for part in (href, title, text) if part).lower()
     fy_match = _FY_TEXT_RE.search(combined)
@@ -151,17 +153,21 @@ def discover_fy_link(
     if anchors is None:
         anchors = crawl_revenue_index(report=report, log=log, target_fys={(fy_start, fy_end)})
 
+    fallback_sport_href: str | None = None
     for anchor in anchors:
-        fy_pair = _is_fy_summary_anchor(anchor["href"], anchor["title"], anchor["text"])
+        href = anchor["href"]
+        fy_pair = _is_fy_summary_anchor(href, anchor["title"], anchor["text"])
         if fy_pair is not None:
-            combined = " ".join((anchor["href"], anchor["title"], anchor["text"])).lower()
-            if fy_pair == (fy_start, fy_end) or fy_token_lower in combined:
-                return anchor["href"]
-
-    for anchor in anchors:
-        lower_href = anchor["href"].lower()
-        if lower_href.endswith(".xlsx") and fy_token_lower in lower_href and "sport" in lower_href:
-            return anchor["href"]
+            if fy_pair == (fy_start, fy_end) or any(
+                fy_token_lower in field.lower() for field in (href, anchor["title"], anchor["text"])
+            ):
+                return href
+        elif fallback_sport_href is None:
+            lower_href = href.lower()
+            if lower_href.endswith(".xlsx") and fy_token_lower in lower_href and "sport" in lower_href:
+                fallback_sport_href = href
+    if fallback_sport_href is not None:
+        return fallback_sport_href
 
     today = date.today().replace(day=1)
     min_pub = date(fy_start, 7, 1)
@@ -190,7 +196,7 @@ def discover_fy_link(
                 except Exception as exc:
                     log(f"WARN could not probe {guessed}: {exc}")
                     continue
-                if data and data.startswith(b"PK"):
+                if is_xlsx_bytes(data):
                     return guessed
         published -= relativedelta(months=1)
     return None
@@ -213,16 +219,14 @@ def download_fy_workbook(
         return None
     timestamp = f"{fy_end}06"
     data = fetch_with_wayback_fallback(
-        link, timestamp_yyyymm=timestamp, signature_check=b"PK", log=log,
+        link, timestamp_yyyymm=timestamp, signature_check=XLSX_MAGIC, log=log,
     )
-    if data and data.startswith(b"PK"):
-        log(f"INFO downloaded {link}")
-        if report is not None:
-            report.add_match(f"FY{fy_start % 100:02d}-{fy_end % 100:02d}", link)
-        return data
-    if data:
-        log(f"WARN FY{fy_start % 100:02d}-{fy_end % 100:02d} URL did not return XLSX content: {link}")
-    return None
+    if data is None:
+        return None
+    log(f"INFO downloaded {link}")
+    if report is not None:
+        report.add_match(f"FY{fy_start % 100:02d}-{fy_end % 100:02d}", link)
+    return data
 
 
 def extract_section_metrics(
@@ -255,7 +259,14 @@ def extract_section_metrics(
 
 
 _MONTH_HEADER_PATTERNS: tuple[tuple[int, str, re.Pattern[str]], ...] = tuple(
-    (month_index, abbr, re.compile(rf"\b{abbr}[a-z]*\b", re.IGNORECASE))
+    (
+        month_index,
+        abbr,
+        re.compile(
+            rf"\b(?:{MONTH_NAMES[month_index]}|{'Sept|' if month_index == 9 else ''}{abbr})\b",
+            re.IGNORECASE,
+        ),
+    )
     for month_index, abbr in MONTH_ABBR.items()
 )
 
@@ -346,16 +357,25 @@ _SKIP_BLOCK_LABELS: frozenset[str] = frozenset({
 })
 
 
+def _block_end(rows: list[tuple[object, ...]], start_index: int) -> int:
+    """Find the exclusive end index of a PGCB summary or operator block."""
+    for idx in range(start_index + 4, len(rows)):
+        row_label = clean_lower(rows[idx][0] if rows[idx] else "")
+        if row_label == "grand total":
+            return idx
+        if idx + 1 < len(rows) and clean_lower(rows[idx + 1][0] if rows[idx + 1] else "") == "total sports wagering":
+            return idx
+    return len(rows)
+
+
 def _iter_operator_blocks(rows: list[tuple[object, ...]]) -> Iterator[tuple[int, str]]:
-    """Yield ``(start_index, operator_label)`` for each 16-row PGCB operator block."""
+    """Yield ``(start_index, operator_label)`` for each PGCB operator block."""
     index = 0
-    while index < len(rows):
-        label = str(rows[index][0] if rows[index] else "").strip()
+    while index + 3 < len(rows):
+        label = str((rows[index][0] if rows[index] else None) or "").strip()
         if not label or label.upper() in _SKIP_BLOCK_LABELS:
             index += 1
             continue
-        if index + 15 >= len(rows):
-            break
         if (
             clean_lower(rows[index + 1][0] if rows[index + 1] else "") != "total sports wagering"
             or clean_lower(rows[index + 2][0] if rows[index + 2] else "") != "handle*"
@@ -364,7 +384,7 @@ def _iter_operator_blocks(rows: list[tuple[object, ...]]) -> Iterator[tuple[int,
             index += 1
             continue
         yield index, label
-        index += 16
+        index = _block_end(rows, index)
 
 
 def parse_detail_metrics(
@@ -373,25 +393,40 @@ def parse_detail_metrics(
     fy_end: int,
     *,
     col_to_label: dict[int, str] | None = None,
+    _op_blocks: list[tuple[int, str]] | None = None,
 ) -> dict[str, list[PaDetailRow]]:
     if col_to_label is None:
         col_to_label = parse_month_columns(rows, fy_start, fy_end)
     if not col_to_label:
         return {}
     details: dict[str, list[PaDetailRow]] = {label: [] for label in col_to_label.values()}
-    for index, label in _iter_operator_blocks(rows):
-        retail_section = clean_lower(rows[index + 8][0] if rows[index + 8] else "")
-        retail_metric = clean_lower(rows[index + 9][0] if rows[index + 9] else "")
-        retail_revenue_metric = clean_lower(rows[index + 10][0] if rows[index + 10] else "")
-        mobile_section = clean_lower(rows[index + 13][0] if rows[index + 13] else "")
-        mobile_metric = clean_lower(rows[index + 14][0] if rows[index + 14] else "")
-        mobile_revenue_metric = clean_lower(rows[index + 15][0] if rows[index + 15] else "")
+    for index, label in (_op_blocks if _op_blocks is not None else _iter_operator_blocks(rows)):
+        end = _block_end(rows, index)
         handle_row = rows[index + 2]
         revenue_row = rows[index + 3]
-        retail_handle_row = rows[index + 9] if retail_section == "retail sports wagering" and retail_metric == "handle*" else None
-        retail_revenue_row = rows[index + 10] if retail_revenue_metric in {"gross revenue (taxable)", "revenue"} else None
-        mobile_handle_row = rows[index + 14] if mobile_section == "online sports wagering" and mobile_metric == "handle*" else None
-        mobile_revenue_row = rows[index + 15] if mobile_revenue_metric in {"gross revenue (taxable)", "revenue"} else None
+        retail_handle_row = None
+        retail_revenue_row = None
+        mobile_handle_row = None
+        mobile_revenue_row = None
+        subsection: str | None = None
+        for row in rows[index + 4:end]:
+            row_label = clean_lower(row[0] if row else "")
+            if not row_label:
+                continue
+            if row_label == "retail sports wagering":
+                subsection = "retail"
+            elif row_label == "online sports wagering":
+                subsection = "online"
+            elif subsection == "retail":
+                if retail_handle_row is None and row_label == "handle*":
+                    retail_handle_row = row
+                elif retail_revenue_row is None and row_label in {"gross revenue (taxable)", "revenue"}:
+                    retail_revenue_row = row
+            elif subsection == "online":
+                if mobile_handle_row is None and row_label == "handle*":
+                    mobile_handle_row = row
+                elif mobile_revenue_row is None and row_label in {"gross revenue (taxable)", "revenue"}:
+                    mobile_revenue_row = row
         for column, month_label in col_to_label.items():
             handle = _cell(handle_row, column)
             revenue = _cell(revenue_row, column)
@@ -448,11 +483,11 @@ def _extract_fiscal_block(
     promo_row = None
     state_tax_row = None
     lsa_row = None
-    for row in rows[start_index + 1:start_index + 10]:
+    for offset, row in enumerate(rows[start_index + 1:_block_end(rows, start_index)], start=1):
         label = clean_lower(row[0] if row else "")
         if not label:
             continue
-        if label in ("retail sports wagering", "online sports wagering"):
+        if (offset > 1 and label == "total sports wagering") or label in ("retail sports wagering", "online sports wagering"):
             break
         if rev_row is None and label == "revenue":
             rev_row = row
@@ -494,12 +529,14 @@ def parse_sheet_fiscal(
 def parse_detail_fiscal(
     rows: list[tuple[object, ...]],
     col_to_label: dict[int, str],
+    *,
+    _op_blocks: list[tuple[int, str]] | None = None,
 ) -> dict[tuple[str, str], PaFiscalTuple]:
     """Extract per-(month_label, operator) fiscal metrics ``(gross_revenue, promo_deductions, tax)``."""
     if not col_to_label:
         return {}
     fiscal_by_op: dict[tuple[str, str], PaFiscalTuple] = {}
-    for index, label in _iter_operator_blocks(rows):
+    for index, label in (_op_blocks if _op_blocks is not None else _iter_operator_blocks(rows)):
         block_fiscal = _extract_fiscal_block(rows, index, col_to_label)
         for month_label, vals in block_fiscal.items():
             fiscal_by_op[(month_label, label)] = vals
@@ -524,7 +561,20 @@ def _parse_fy_xlsx_core(
             return {}, {}, {}
         first_sheet_rows = [tuple(row) for row in workbook[workbook.sheetnames[0]].iter_rows(values_only=True)]
         col_to_label = parse_month_columns(first_sheet_rows, fy_start, fy_end)
-        total_metrics = parse_sheet_totals(first_sheet_rows, fy_start, fy_end, col_to_label=col_to_label)
+        total_metrics: dict[str, tuple[float, float]] = {}
+        sheet_fiscal: dict[str, PaFiscalTuple] = {}
+        if col_to_label:
+            for index, row in enumerate(first_sheet_rows):
+                if clean_lower(row[0] if row else "") != "grand total":
+                    continue
+                if not total_metrics:
+                    total_metrics = extract_section_metrics(
+                        first_sheet_rows, index, col_to_label, ("revenue", "gross revenue (taxable)"),
+                    )
+                if not sheet_fiscal:
+                    sheet_fiscal = _extract_fiscal_block(first_sheet_rows, index, col_to_label)
+                if total_metrics and sheet_fiscal:
+                    break
         retail_metrics, mobile_metrics = (
             parse_section_totals(
                 first_sheet_rows,
@@ -545,14 +595,16 @@ def _parse_fy_xlsx_core(
                     [tuple(row) for row in sheet.iter_rows(values_only=True)], fy_start, fy_end,
                 )
                 (retail_metrics if section == "retail" else mobile_metrics).update(parsed)
-        detail_metrics = parse_detail_metrics(first_sheet_rows, fy_start, fy_end, col_to_label=col_to_label)
+        op_blocks = list(_iter_operator_blocks(first_sheet_rows))
+        detail_metrics = parse_detail_metrics(
+            first_sheet_rows, fy_start, fy_end, col_to_label=col_to_label, _op_blocks=op_blocks,
+        )
         detail_retail_metrics, detail_mobile_metrics = aggregate_detail_totals(detail_metrics)
         if detail_retail_metrics:
-            retail_metrics = detail_retail_metrics
+            retail_metrics.update(detail_retail_metrics)
         if detail_mobile_metrics:
-            mobile_metrics = detail_mobile_metrics
-        sheet_fiscal = parse_sheet_fiscal(first_sheet_rows, col_to_label)
-        detail_fiscal = parse_detail_fiscal(first_sheet_rows, col_to_label)
+            mobile_metrics.update(detail_mobile_metrics)
+        detail_fiscal = parse_detail_fiscal(first_sheet_rows, col_to_label, _op_blocks=op_blocks)
         results: dict[str, PaMonthCore] = {}
         for label, (handle, revenue) in total_metrics.items():
             retail = retail_metrics.get(label)
@@ -593,7 +645,7 @@ def fetch(
         raise RuntimeError("openpyxl is required to fetch Pennsylvania sports wagering data")
     logger = log or _DEFAULT_LOG
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
-    months = [(mdate.month, mdate.year, mdate.strftime("%b %Y")) for mdate in target_dates]
+    months = [(mdate.month, mdate.year, f"{MONTH_ABBR[mdate.month]} {mdate.year}") for mdate in target_dates]
     all_data: dict[str, PaMonthCore] = {}
     all_sheet_fiscal: dict[str, PaFiscalTuple] = {}
     all_detail_fiscal: dict[tuple[str, str], PaFiscalTuple] = {}
@@ -611,12 +663,6 @@ def fetch(
     if report is not None and not offline:
         _ensure_anchors()
 
-    def _download_fy(fs: int = 0, fe: int = 0) -> bytes | None:
-        return download_fy_workbook(fs, fe, anchors=_ensure_anchors(), report=report, log=logger)
-
-    def _is_xlsx_payload(payload: bytes) -> bool:
-        return payload.startswith(b"PK")
-
     for fy_start, fy_end in needed_fys:
         try:
             data = parse_local_file(local_dir, fy_start, fy_end) if local_dir else None
@@ -624,17 +670,22 @@ def fetch(
                 logger(f"INFO loaded local FY workbook FY{fy_start % 100:02d}-{fy_end % 100:02d}")
             path: str | None = None
             was_cached = False
-            fetcher_fn = lambda fs=fy_start, fe=fy_end: _download_fy(fs, fe)
+            fetch_called = [False]
+
+            def _download_fy(fs: int = fy_start, fe: int = fy_end, called: list[bool] = fetch_called) -> bytes | None:
+                called[0] = True
+                return download_fy_workbook(fs, fe, anchors=_ensure_anchors(), report=report, log=logger)
+
             if data is None:
                 path = cache_path(cache_dir, f"pennsylvania_fy_{fy_start}_{fy_end}.xlsx")
                 was_cached = bool(path and os.path.isfile(path))
                 data = load_cached_or_fetch(
                     cache_file=path,
-                    fetcher=fetcher_fn,
+                    fetcher=_download_fy,
                     log=logger,
                     cache_hit_message=f"INFO using cached FY workbook FY{fy_start % 100:02d}-{fy_end % 100:02d}",
                     fetch_error_message=f"could not download Pennsylvania FY workbook FY{fy_start % 100:02d}-{fy_end % 100:02d}",
-                    validate=_is_xlsx_payload,
+                    validate=is_xlsx_bytes,
                     cache_ttl_seconds=recent_fy_cache_ttl(fy_end),
                     offline=offline,
                 )
@@ -647,6 +698,7 @@ def fetch(
             fy_labels = [label for month, year, label in months if fiscal_year_july(year, month) == (fy_start, fy_end)]
             if (
                 was_cached
+                and not fetch_called[0]
                 and not offline
                 and path is not None
                 and any(lbl not in fy_parsed or fy_parsed[lbl][0] <= 0 for lbl in fy_labels)
@@ -654,8 +706,8 @@ def fetch(
                 refreshed = refresh_cached_if_stale(
                     path,
                     data,
-                    fetcher=fetcher_fn,
-                    validate=_is_xlsx_payload,
+                    fetcher=_download_fy,
+                    validate=is_xlsx_bytes,
                     offline=offline,
                     log=logger,
                 )

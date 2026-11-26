@@ -9,6 +9,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -17,28 +20,39 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12']
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Ensure poppler-utils is installed
-        run: |
-          if ! command -v pdftotext >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends poppler-utils
-          fi
-
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
       - name: Install dev dependencies and run pytest
         run: |
           pip install -e ".[dev]"
           pytest -v
+
+      - name: Verify docs/index.html is in sync with publish.site
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          from publish.site import render_index_html
+          status = json.loads(pathlib.Path("docs/data/status.json").read_text(encoding="utf-8"))
+          states = [(slug, meta["name"]) for slug, meta in status["states"].items() if "name" in meta]
+          expected = render_index_html(states)
+          actual = pathlib.Path("docs/index.html").read_text(encoding="utf-8")
+          assert actual == expected, "docs/index.html is out of sync with publish.site.render_index_html"
+          PY
 
       - name: Validate viewer JS and status manifest
         run: |

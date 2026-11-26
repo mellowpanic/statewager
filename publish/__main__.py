@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date
 import logging
 import os
@@ -41,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--states",
         nargs="+",
         default=list(ALL_STATES),
-        help="State slugs to publish (default: all 10 states).",
+        help=f"State slugs to publish (default: all {len(ALL_STATES)} states).",
     )
     parser.add_argument(
         "--months",
@@ -130,21 +131,23 @@ def publish_all(
     if not modules:
         raise ValueError("No states selected")
 
-    expected_by_slug = {
-        slug: bool(resolve_fetch_months(month_start, month_end, launch_date=getattr(mod, "LAUNCH_DATE", None)))
+    target_dates_by_slug = {
+        slug: resolve_fetch_months(month_start, month_end, launch_date=getattr(mod, "LAUNCH_DATE", None))
         for slug, mod in modules
     }
+    expected_by_slug = {slug: bool(dates) for slug, dates in target_dates_by_slug.items()}
     fetch_bounds_by_slug: dict[str, tuple[str | date, str | date | None]] = {
         slug: (month_start, month_end) for slug, _ in modules
     }
+    existing_state_cache: dict[str, list[StateMonthResult]] = {}
     if merge_existing and recheck_months is not None and recheck_months >= 1:
-        for slug, mod in modules:
-            target_dates = resolve_fetch_months(
-                month_start, month_end, launch_date=getattr(mod, "LAUNCH_DATE", None),
-            )
+        for slug, _mod in modules:
+            target_dates = target_dates_by_slug[slug]
             if not target_dates:
                 continue
-            existing_months = {r.month for r in read_state_csv(os.path.join(data_dir, f"{slug}.csv"))}
+            cached_rows = read_state_csv(os.path.join(data_dir, f"{slug}.csv"))
+            existing_state_cache[slug] = cached_rows
+            existing_months = {r.month for r in cached_rows}
             needed = sorted(
                 set(target_dates[-recheck_months:])
                 | {d for d in target_dates if d.strftime("%Y-%m") not in existing_months}
@@ -153,7 +156,7 @@ def publish_all(
                 fetch_bounds_by_slug[slug] = (needed[0], needed[-1])
     silent_log = (lambda _msg: None) if quiet else None
 
-    def _fetch_one(item: tuple[str, object]) -> tuple[list[StateMonthResult], Exception | None]:
+    def _fetch_one(item: tuple[str, ModuleType]) -> tuple[list[StateMonthResult], Exception | None]:
         slug, mod = item
         f_start, f_end = fetch_bounds_by_slug[slug]
         try:
@@ -173,14 +176,14 @@ def publish_all(
             pub_log.warning("%s: refresh failed (%r); keeping existing rows", slug, exc)
             return ([], exc)
 
-    worker_count = min(max(1, jobs), len(modules)) if modules else 1
+    worker_count = min(max(1, jobs), len(modules))
     if worker_count > 1:
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             fetched_lists = list(pool.map(_fetch_one, modules))
     else:
         fetched_lists = [_fetch_one(item) for item in modules]
 
-    if modules and all(exc is not None for _res, exc in fetched_lists):
+    if all(exc is not None for _res, exc in fetched_lists):
         first_exc = fetched_lists[0][1]
         raise RuntimeError(f"All {len(modules)} state refreshes failed") from first_exc
     if any(expected_by_slug.values()) and all(not res for res, _exc in fetched_lists):
@@ -190,28 +193,37 @@ def publish_all(
         csv_path = os.path.join(data_dir, f"{slug}.csv")
         detail_csv_path = os.path.join(details_dir, f"{slug}.csv")
         has_details = bool(getattr(mod, "HAS_DETAILS", False))
-        if exc is not None:
-            by_state[slug] = read_state_csv(csv_path)
+        existing_rows = existing_state_cache.get(slug)
+        keep_existing = exc is not None or (
+            not merge_existing and not results and expected_by_slug[slug] and os.path.isfile(csv_path)
+        )
+        if keep_existing:
+            if exc is None:
+                pub_log.warning("%s: refresh returned 0 rows under --no-merge; keeping existing rows", slug)
+            by_state[slug] = existing_rows if existing_rows is not None else read_state_csv(csv_path)
             if has_details:
                 details_by_state[slug] = read_detail_csv(detail_csv_path)
             continue
 
         if merge_existing:
-            merged = merge_state_results(read_state_csv(csv_path), results)
-        elif not results and expected_by_slug[slug] and os.path.isfile(csv_path):
-            pub_log.warning("%s: refresh returned 0 rows under --no-merge; keeping existing rows", slug)
-            merged = read_state_csv(csv_path)
-            by_state[slug] = merged
-            if has_details:
-                details_by_state[slug] = read_detail_csv(detail_csv_path)
-            continue
+            prev_rows = existing_rows if existing_rows is not None else read_state_csv(csv_path)
+            merged = merge_state_results(prev_rows, results)
         else:
             merged = sorted(results, key=lambda r: r.month)
         write_state_csv(data_dir, slug, merged)
         by_state[slug] = merged
 
         if has_details:
-            fresh_details = extract_published_details(results)
+            detail_source_results = results
+            if merge_existing:
+                merged_urls = {(r.state, r.month): r.source_url for r in merged if r.source_url is not None}
+                detail_source_results = [
+                    replace(r, source_url=merged_urls[(r.state, r.month)])
+                    if r.source_url is None and (r.state, r.month) in merged_urls
+                    else r
+                    for r in results
+                ]
+            fresh_details = extract_published_details(detail_source_results)
             if merge_existing:
                 merged_details = merge_detail_results(
                     read_detail_csv(detail_csv_path),
@@ -294,7 +306,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if end_date > current_month:
         parser.error(f"--end-month ({end_date:%Y-%m}) cannot be in the future")
 
-    cache_dir = (args.cache_dir or "").strip() or None
     try:
         _verify_docs_dir_writable(args.docs_dir)
     except OSError as exc:
@@ -304,7 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         states=args.states,
         month_start=start_date,
         month_end=end_date,
-        cache_dir=cache_dir,
+        cache_dir=args.cache_dir,
         docs_dir=args.docs_dir,
         offline=args.offline,
         quiet=args.quiet,

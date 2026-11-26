@@ -5,6 +5,7 @@ import functools
 import re
 
 from .parse import clean_lower, collapse_ws, strip_superscripts
+from .states import STATE_ABBR_TO_SLUG
 
 BRAND_ORDER: tuple[str, ...] = (
     "DraftKings",
@@ -59,13 +60,16 @@ _UPPER_ACRONYMS: frozenset[str] = frozenset({
     "DRF",
 })
 
+_KS_CROSSING_RE = re.compile(r"^ks crossing\s*-\s*", re.IGNORECASE)
+_DOT_ABBREVS: frozenset[str] = frozenset({"inc", "ltd", "corp"})
+_DOT_ENTITY_ABBREVS: frozenset[str] = _DOT_ABBREVS | {"llc", "llp", "lp"}
+_PUNCT_TRANS = str.maketrans({"\u2018": "'", "\u2019": "'", "\u2013": "-", "\u2014": "-"})
+_MULTI_HYPHEN_PART_RE = re.compile(r"^[a-z0-9']{2,}(?:-[a-z0-9']{2,})+$", re.IGNORECASE)
+
 _SPECIAL_WORDS: dict[str, str] = {
     "inc": "Inc.",
-    "inc.": "Inc.",
     "ltd": "Ltd.",
-    "ltd.": "Ltd.",
     "corp": "Corp.",
-    "corp.": "Corp.",
     "draftkings": "DraftKings",
     "fanduel": "FanDuel",
     "betmgm": "BetMGM",
@@ -127,72 +131,104 @@ def _cap_word(word: str) -> str:
     return word[0].upper() + word[1:].lower()
 
 
-def _normalize_single_part(core: str, *, allow_connector_lower: bool) -> str:
+def _normalize_single_part(
+    core: str,
+    *,
+    allow_connector_lower: bool,
+    allow_in_connector: bool = False,
+) -> str:
     low = core.lower()
     if low in _SPECIAL_WORDS:
         return _SPECIAL_WORDS[low]
-    if low.upper() in _UPPER_ACRONYMS:
-        return low.upper()
+    if allow_connector_lower and low in _LOWER_CONNECTORS and (low != "in" or allow_in_connector):
+        return low
+    upper = core.upper()
+    if upper in _UPPER_ACRONYMS:
+        return upper
     for sep in ("/", "-"):
         if sep in core:
             return sep.join(
                 _normalize_single_part(sub, allow_connector_lower=idx > 0)
                 for idx, sub in enumerate(core.split(sep))
             )
-    if allow_connector_lower and low in _LOWER_CONNECTORS:
-        return low
     return _cap_word(core)
 
 
-def _normalize_token(token: str, *, allow_connector_lower: bool) -> str:
+def _normalize_token(
+    token: str,
+    *,
+    allow_connector_lower: bool,
+    allow_in_connector: bool = False,
+) -> str:
     if token == "-":
         return "-"
     match = _WRAP_TOKEN_RE.match(token)
     if not match or not match.group(2):
         return token
     prefix, core, suffix = match.groups()
-    if core.lower() in {"inc", "inc.", "ltd", "ltd.", "corp", "corp."} and suffix == ".":
-        suffix = ""
-        core = core + "."
+    if core.lower() in _DOT_ENTITY_ABBREVS and suffix.startswith("."):
+        suffix = suffix[1:]
     normalized = _normalize_single_part(
         core,
         allow_connector_lower=allow_connector_lower and "(" not in prefix,
+        allow_in_connector=allow_in_connector and not suffix,
     )
     return f"{prefix}{normalized}{suffix}"
 
 
+def _expand_hyphen_tokens(text: str) -> str:
+    spaced = _SEPARATOR_HYPHEN_RE.sub(" - ", text)
+    tokens: list[str] = []
+    for tok in spaced.split():
+        if "-" in tok and tok != "-":
+            match = _WRAP_TOKEN_RE.match(tok)
+            if match and match.group(2):
+                prefix, core, suffix = match.groups()
+                if (
+                    core.lower() not in _SPECIAL_WORDS
+                    and _MULTI_HYPHEN_PART_RE.match(core)
+                ):
+                    parts = core.split("-")
+                    parts[0] = f"{prefix}{parts[0]}"
+                    parts[-1] = f"{parts[-1]}{suffix}"
+                    tokens.extend(parts[0:1])
+                    for part in parts[1:]:
+                        tokens.extend(["-", part])
+                    continue
+        tokens.append(tok)
+    return " ".join(tokens)
+
+
 @functools.lru_cache(maxsize=1024)
 def _normalize_operator_cached(raw: str) -> str:
-    cleaned = collapse_ws(strip_superscripts(raw))
+    cleaned = collapse_ws(strip_superscripts(raw).translate(_PUNCT_TRANS))
     if not cleaned:
         return ""
-    cleaned = re.sub(r"^ks crossing\s*-\s*", "Kansas Crossing - ", cleaned, count=1, flags=re.IGNORECASE)
+    cleaned = _KS_CROSSING_RE.sub("Kansas Crossing - ", cleaned, count=1)
 
-    spaced = _SEPARATOR_HYPHEN_RE.sub(" - ", cleaned)
+    spaced = _expand_hyphen_tokens(cleaned)
     lookup_key = spaced.lower()
     if lookup_key in _CANONICAL_OVERRIDES:
         return _CANONICAL_OVERRIDES[lookup_key]
 
-    tokens = spaced.split(" ")
+    parts = spaced.split()
     out: list[str] = []
     at_segment_start = True
-    for tok in tokens:
-        if not tok:
-            continue
+    for idx, tok in enumerate(parts):
         if tok == "-":
             out.append("-")
             at_segment_start = True
             continue
-        norm = _normalize_token(tok, allow_connector_lower=not at_segment_start)
+        next_tok = parts[idx + 1] if idx + 1 < len(parts) else "-"
+        norm = _normalize_token(
+            tok,
+            allow_connector_lower=not at_segment_start,
+            allow_in_connector=next_tok != "-",
+        )
         out.append(norm)
         at_segment_start = False
 
-    result = " ".join(out)
-    # Fix punctuation variants produced when "Inc."/"LLC." carries trailing dot before comma/end
-    result = result.replace("LLC.,", "LLC,").rstrip()
-    if result.endswith("LLC."):
-        result = result[:-1]
-    return result
+    return " ".join(out).rstrip()
 
 
 def normalize_operator_name(raw: str, *, state: str | None = None) -> str:
@@ -287,23 +323,31 @@ _DIRECT_BRAND_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _normalize_state_arg(state: str | None) -> str | None:
+    if not state:
+        return None
+    cleaned = clean_lower(state)
+    return STATE_ABBR_TO_SLUG.get(cleaned, cleaned).title()
+
+
 @functools.lru_cache(maxsize=1024)
 def classify_operator_brand(raw: str, *, state: str | None = None) -> str:
     """Map an operator/licensee string to its canonical cross-state sportsbook brand."""
-    low = clean_lower(strip_superscripts(raw))
+    low = clean_lower(strip_superscripts(raw).translate(_PUNCT_TRANS))
     if not low:
         return "Other / Retail Venue"
 
+    norm_state = _normalize_state_arg(state)
     # Iowa separates retail casino books from online operator LLCs; keep retail rows unattributed.
-    if state == "Iowa" and "(retail)" in low:
+    if norm_state == "Iowa" and "(retail)" in low:
         return "Other / Retail Venue"
 
     for needle, brand in _DIRECT_BRAND_PATTERNS:
         if needle in low:
             return brand
 
-    if state and state in _STATE_PROPERTY_BRANDS:
-        for needle, brand in _STATE_PROPERTY_BRANDS[state]:
+    if state_patterns := (_STATE_PROPERTY_BRANDS.get(norm_state) if norm_state else None):
+        for needle, brand in state_patterns:
             if needle in low:
                 return brand
 

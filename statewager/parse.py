@@ -12,14 +12,34 @@ import subprocess
 import tempfile
 import threading
 from typing import Callable, Iterator
+import zipfile
 
 from .model import hold_pct, round_or_blank, safe_float
 
 _LABEL_NORM_RE = re.compile(r"[^a-z0-9 ]+")
 _MONEY_STRIP_RE = re.compile(r"[\$,\s]+")
 _SUPERSCRIPT_RE = re.compile(r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+")
-_PLACEHOLDERS = frozenset({"", "-", "—", "–", "n/a", "na", "none", "null"})
+_PLACEHOLDERS = frozenset({"", "+", "-", "—", "–", "n/a", "na", "none", "null"})
 PDFPLUMBER_LOCK = threading.Lock()
+XLSX_MAGIC = b"PK"
+XLS_BIFF_MAGIC = b"\xd0\xcf\x11\xe0"
+XLS_SIGNATURES = (XLSX_MAGIC, XLS_BIFF_MAGIC)
+PDF_MAGIC = b"%PDF"
+
+
+def is_xlsx_bytes(data: bytes | None) -> bool:
+    """Return True when ``data`` starts with the OOXML ZIP header."""
+    return bool(data) and data.startswith(XLSX_MAGIC)
+
+
+def is_xls_bytes(data: bytes | None) -> bool:
+    """Return True when ``data`` starts with an XLSX or BIFF XLS header."""
+    return bool(data) and data.startswith(XLS_SIGNATURES)
+
+
+def is_pdf_bytes(data: bytes | None) -> bool:
+    """Return True when ``data`` starts with the ``%PDF`` header."""
+    return bool(data) and data.startswith(PDF_MAGIC)
 
 
 def collapse_ws(value: object) -> str:
@@ -42,6 +62,28 @@ def _which(*names: str) -> str | None:
     return next((path for name in names if (path := shutil.which(name))), None)
 
 
+_MAX_XLSX_ENTRIES = 2000
+_MAX_XLSX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+_MAX_XLSX_COMPRESSION_RATIO = 200
+
+
+def _validate_xlsx_zip(data: bytes) -> None:
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        infos = zf.infolist()
+        if len(infos) > _MAX_XLSX_ENTRIES:
+            raise ValueError(f"XLSX archive has too many entries ({len(infos)} > {_MAX_XLSX_ENTRIES})")
+        total_uncompressed = sum(max(0, info.file_size) for info in infos)
+        if total_uncompressed > _MAX_XLSX_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"XLSX uncompressed size {total_uncompressed} exceeds limit {_MAX_XLSX_UNCOMPRESSED_BYTES}"
+            )
+        total_compressed = sum(max(0, info.compress_size) for info in infos)
+        if total_uncompressed > 10 * 1024 * 1024 and (
+            total_compressed == 0 or (total_uncompressed / total_compressed) > _MAX_XLSX_COMPRESSION_RATIO
+        ):
+            raise ValueError("XLSX archive exceeds compression ratio safety threshold")
+
+
 @contextmanager
 def open_xlsx_workbook(
     data: bytes | None,
@@ -57,6 +99,7 @@ def open_xlsx_workbook(
     if openpyxl_mod is None:
         import openpyxl as openpyxl_mod
     try:
+        _validate_xlsx_zip(data)
         workbook = openpyxl_mod.load_workbook(io.BytesIO(data), data_only=True, read_only=True)  # type: ignore[attr-defined]
     except Exception as exc:
         if log:
@@ -90,7 +133,7 @@ def _parse_numeric_token(s: object, *, strip_percent: bool = False) -> float | N
         text = text.replace("%", "")
     elif "%" in text:
         return None
-    if text.lower() in _PLACEHOLDERS or text in {"+", "-"}:
+    if text.lower() in _PLACEHOLDERS:
         return None
     negative = False
     if text.startswith("(") and text.endswith(")"):
@@ -122,8 +165,7 @@ def parse_dollar(s: object) -> float | None:
     return _parse_numeric_token(s)
 
 
-def _parse_money(text: object) -> float | None:
-    return _parse_numeric_token(text)
+_parse_money = parse_dollar
 
 
 def is_number(value: object) -> bool:
@@ -180,12 +222,22 @@ def build_main_row(
     ]
 
 
+def _validate_page_range(first_page: int | None, last_page: int | None) -> None:
+    if first_page is not None and (isinstance(first_page, bool) or first_page < 1):
+        raise ValueError(f"first_page must be >= 1, got {first_page!r}")
+    if last_page is not None and (isinstance(last_page, bool) or last_page < 1):
+        raise ValueError(f"last_page must be >= 1, got {last_page!r}")
+    if first_page is not None and last_page is not None and last_page < first_page:
+        raise ValueError(f"last_page ({last_page}) must be >= first_page ({first_page})")
+
+
 def extract_pdf_text_with_ocr(
     data: bytes,
     *,
     first_page: int = 1,
     last_page: int | None = None,
     dpi: int = 300,
+    max_pages: int = 100,
     log: Callable[[str], None] | None = None,
 ) -> str | None:
     """Last-resort OCR for image-based PDFs.
@@ -194,6 +246,7 @@ def extract_pdf_text_with_ocr(
     (with a single WARN) when any dependency is missing so the caller can
     proceed without OCR rather than crash.
     """
+    _validate_page_range(first_page, last_page)
     if _which("tesseract") is None:
         if log:
             log("WARN tesseract not installed; OCR fallback unavailable (apt install tesseract-ocr)")
@@ -206,10 +259,11 @@ def extract_pdf_text_with_ocr(
             log("WARN pytesseract / pdf2image not installed; OCR fallback unavailable")
         return None
     try:
-        kwargs: dict[str, object] = {"dpi": dpi, "first_page": first_page}
-        if last_page is not None:
-            kwargs["last_page"] = last_page
-        images = convert_from_bytes(data, **kwargs)
+        capped_last = first_page + max(1, max_pages) - 1
+        effective_last = min(last_page, capped_last) if last_page is not None else capped_last
+        images = convert_from_bytes(
+            data, dpi=dpi, first_page=first_page, last_page=effective_last,
+        )
         return "\n\f\n".join(pytesseract.image_to_string(img) for img in images)
     except Exception as exc:
         if log:
@@ -233,25 +287,29 @@ def extract_pdf_text(
     - When pdfplumber returns empty or fails, falls back to pdftotext.
     - Returns None if both methods fail or are unavailable.
     """
-    try:
-        import pdfplumber as _pdfplumber
-    except ImportError:
-        _pdfplumber = None
-
-    if not raw and use_pdfplumber and _pdfplumber is not None:
+    _validate_page_range(first_page, last_page)
+    if not raw and use_pdfplumber:
         try:
-            with PDFPLUMBER_LOCK, _pdfplumber.open(io.BytesIO(data)) as pdf:
-                pages = pdf.pages
-                if first_page is not None or last_page is not None:
-                    start = (first_page or 1) - 1
-                    end = last_page if last_page is not None else len(pages)
-                    pages = pages[start:end]
-                text = "\n".join(page.extract_text() or "" for page in pages)
-                if text.strip():
-                    return text
-        except Exception as exc:
-            if log:
-                log(f"WARN pdfplumber failed: {exc}")
+            import pdfplumber as _pdfplumber
+        except ImportError:
+            _pdfplumber = None
+        if _pdfplumber is not None:
+            try:
+                with PDFPLUMBER_LOCK, _pdfplumber.open(io.BytesIO(data)) as pdf:
+                    pages = pdf.pages
+                    if first_page is not None or last_page is not None:
+                        start = (first_page - 1) if first_page is not None else 0
+                        end = last_page if last_page is not None else len(pages)
+                        pages = pages[start:end]
+                    text = "\n".join(
+                        (page.extract_text(layout=True) if layout else page.extract_text()) or ""
+                        for page in pages
+                    )
+                    if text.strip():
+                        return text
+            except Exception as exc:
+                if log:
+                    log(f"WARN pdfplumber failed: {exc}")
 
     pdftotext_bin = _which("pdftotext")
     if pdftotext_bin is None:
@@ -262,8 +320,8 @@ def extract_pdf_text(
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
-            fh.write(data)
             tmp_path = fh.name
+            fh.write(data)
         args = [pdftotext_bin]
         if raw:
             args.append("-raw")
@@ -303,9 +361,9 @@ def ensure_xlsx(
     """
     if not data:
         return None
-    if data.startswith(b"PK"):
+    if data.startswith(XLSX_MAGIC):
         return data
-    if not data.startswith(b"\xd0\xcf\x11\xe0"):
+    if not data.startswith(XLS_BIFF_MAGIC):
         return None
     bin_name = _which("libreoffice", "soffice")
     if bin_name is None:
@@ -363,15 +421,17 @@ def find_sheet_fuzzy(
     contains. Falls back to default_index if provided.
     """
     sheet_names = workbook.sheetnames
+    sheet_set = set(sheet_names)
+    lowered = [(name, name.lower()) for name in sheet_names]
     for candidate in candidates:
-        if candidate in sheet_names:
+        if candidate in sheet_set:
             return workbook[candidate]
         lower = candidate.lower()
-        for name in sheet_names:
-            if name.lower() == lower:
+        for name, name_low in lowered:
+            if name_low == lower:
                 return workbook[name]
-        for name in sheet_names:
-            if lower in name.lower():
+        for name, name_low in lowered:
+            if lower in name_low:
                 return workbook[name]
     if default_index is not None and 0 <= default_index < len(sheet_names):
         return workbook[sheet_names[default_index]]

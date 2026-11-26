@@ -13,6 +13,7 @@ from ..cache import cache_path, find_local_file, load_cached_or_fetch, recent_ca
 from ..discover import DiscoveryReport
 from ..http import probe_url_variants
 from ..model import (
+    MONTH_ABBR,
     StateMonthResult,
     build_operator_results,
     build_state_logger,
@@ -23,7 +24,7 @@ from ..model import (
     resolve_fetch_months,
     validate_result,
 )
-from ..parse import is_number, open_xlsx_workbook
+from ..parse import XLSX_MAGIC, clean_lower, is_number, is_xlsx_bytes, open_xlsx_workbook
 
 STATE_NAME = "Indiana"
 LAUNCH_DATE: date | None = None
@@ -44,16 +45,25 @@ def normalize_sheet_title(title: str) -> str:
     return "".join(ch for ch in title.lower().strip() if ch.isalnum() or ch.isspace()).strip()
 
 
-def _find_handle_agr_cols(row: tuple[object, ...]) -> tuple[int | None, int | None]:
+def _find_handle_agr_tax_cols(
+    row: tuple[object, ...],
+) -> tuple[int | None, int | None, int | None, int | None]:
     handle_col: int | None = None
     agr_col: int | None = None
+    tax_handle_col: int | None = None
+    tax_col: int | None = None
     for index, cell in enumerate(row):
-        text = str(cell or "").strip().lower()
+        text = clean_lower(cell)
         if handle_col is None and text == "handle":
             handle_col = index
         if agr_col is None and "taxable agr" in text:
             agr_col = index
-    return handle_col, agr_col
+        if index > 0:
+            if tax_handle_col is None and text == "handle":
+                tax_handle_col = index
+            if tax_col is None and "tax" in text and "taxable" not in text:
+                tax_col = index
+    return handle_col, agr_col, tax_handle_col, tax_col
 
 
 def parse_summary_totals(workbook) -> tuple[float, float] | None:
@@ -70,9 +80,13 @@ def parse_summary_totals(workbook) -> tuple[float, float] | None:
             if not any(cell is not None for cell in row):
                 continue
             if handle_col is None or agr_col is None:
-                handle_col, agr_col = _find_handle_agr_cols(row)
+                cand_handle, cand_agr, _, _ = _find_handle_agr_tax_cols(row)
+                if handle_col is None and cand_handle is not None:
+                    handle_col = cand_handle
+                if agr_col is None and cand_agr is not None:
+                    agr_col = cand_agr
                 continue
-            label = str(row[0] if row else "").strip().lower()
+            label = clean_lower(row[0] if row else "")
             if label != "total":
                 continue
             handle = row[handle_col] if handle_col < len(row) else None
@@ -84,12 +98,13 @@ def parse_summary_totals(workbook) -> tuple[float, float] | None:
 
 def _find_tax_summary_sheet(workbook):
     def is_location_totals_sheet(sheet) -> bool:
+        title_low = clean_lower(sheet.title)
         normalized_title = normalize_sheet_title(sheet.title.strip())
-        if "sw tax summary" in sheet.title.strip().lower() or normalized_title in {"sheet7", "7 sw tax summary"}:
+        if "sw tax summary" in title_low or normalized_title in {"sheet7", "7 sw tax summary"}:
             return True
         for row in sheet.iter_rows(min_row=1, max_row=6, values_only=True):
             for cell in row:
-                if "summary of sports wagering tax" in str(cell or "").strip().lower():
+                if "summary of sports wagering tax" in clean_lower(cell):
                     return True
         return False
 
@@ -112,30 +127,21 @@ def _parse_tax_summary_sheet(
     tax_col: int | None = None
     for row in sheet.iter_rows(values_only=True):
         matched_header = False
-        if handle_col is None or agr_col is None:
-            h_idx, a_idx = _find_handle_agr_cols(row)
-            if h_idx is not None and a_idx is not None:
+        need_ha = handle_col is None or agr_col is None
+        need_tax = tax_col is None
+        if need_ha or need_tax:
+            h_idx, a_idx, th_idx, t_idx = _find_handle_agr_tax_cols(row)
+            if need_ha and h_idx is not None and a_idx is not None:
                 handle_col = h_idx
                 agr_col = a_idx
                 matched_header = True
-        if tax_col is None:
-            th_idx: int | None = None
-            t_idx: int | None = None
-            for index, cell in enumerate(row):
-                if index == 0:
-                    continue
-                text = str(cell or "").strip().lower()
-                if th_idx is None and text == "handle":
-                    th_idx = index
-                if t_idx is None and "tax" in text and "taxable" not in text:
-                    t_idx = index
-            if th_idx is not None and t_idx is not None:
+            if need_tax and th_idx is not None and t_idx is not None:
                 tax_col = t_idx
                 matched_header = True
         if matched_header:
             continue
 
-        label = str(row[0] if row else "").strip()
+        label = str((row[0] if row else None) or "").strip()
         if not label or label.startswith("*"):
             continue
         if label.upper() == "TOTAL":
@@ -177,7 +183,7 @@ def parse_tax_summary(workbook) -> tuple[float | None, dict[str, float]]:
 
 
 def is_retail_detail_label(label: str) -> bool:
-    lower = label.strip().lower()
+    lower = clean_lower(label)
     return lower == "retail" or lower.startswith("wc ") or "winner" in lower
 
 
@@ -193,7 +199,7 @@ def _parse_detail_sheet_blocks(
         (
             ws
             for ws in workbook.worksheets
-            if "sw details" in ws.title.strip().lower()
+            if "sw details" in clean_lower(ws.title)
             or normalize_sheet_title(ws.title.strip()) in {"sheet8", "8 sw details"}
         ),
         None,
@@ -203,13 +209,12 @@ def _parse_detail_sheet_blocks(
     blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]] = {}
     rows = [tuple(r) for r in detail_sheet.iter_rows(values_only=True)]
     for row_index, row in enumerate(rows):
-        values = list(row)
         for offset in (0, 5, 10):
-            if offset + 3 >= len(values):
+            if offset + 3 >= len(row):
                 continue
-            header = str(values[offset] or "").strip()
-            metric = str(values[offset + 1] or "").strip().lower()
-            revenue_header = str(values[offset + 3] or "").strip().lower()
+            header = str(row[offset] or "").strip()
+            metric = clean_lower(row[offset + 1])
+            revenue_header = clean_lower(row[offset + 3])
             if not header or metric != "handle" or revenue_header != "gross receipts":
                 continue
             location_name = header
@@ -222,7 +227,7 @@ def _parse_detail_sheet_blocks(
                 if not label:
                     break
                 lower = label.lower()
-                next_metric = str((detail_row[offset + 1] if offset + 1 < len(detail_row) else "") or "").strip().lower()
+                next_metric = clean_lower(detail_row[offset + 1] if offset + 1 < len(detail_row) else "")
                 if next_metric == "handle":
                     break
                 handle = detail_row[offset + 1] if offset + 1 < len(detail_row) else None
@@ -262,7 +267,7 @@ def _breakdown_from_blocks(
 
 
 def _format_skin_operator_name(location_name: str, skin_label: str) -> str:
-    low = skin_label.strip().lower()
+    low = clean_lower(skin_label)
     if "bet365" in low:
         return f"{location_name} - bet365"
     if "betrivers" in low:
@@ -342,6 +347,9 @@ def _build_publish_detail_rows_with_fiscal(
     locations: dict[str, tuple[float, float]],
     blocks: dict[str, tuple[float, float, list[tuple[str, float, float]], float]],
     loc_taxes: dict[str, float],
+    *,
+    breakdown: dict[str, tuple[float, float, float, float]] | None = None,
+    loc_gross_map: dict[str, float] | None = None,
 ) -> list[tuple[object, ...]]:
     publish_rows: list[tuple[object, ...]] = []
     for location_name, (loc_h, loc_r) in locations.items():
@@ -351,12 +359,19 @@ def _build_publish_detail_rows_with_fiscal(
             publish_rows.append((location_name, loc_h, loc_r, None, None, None, None, None, None, loc_tax))
             continue
         ret_h, ret_raw_r, skins, adjustments = block
-        loc_gross = ret_raw_r + sum(sr for _, _, sr in skins)
+        loc_gross = (
+            loc_gross_map[location_name]
+            if loc_gross_map is not None and location_name in loc_gross_map
+            else ret_raw_r + sum(sr for _, _, sr in skins)
+        )
         active_skins = [(lbl, sh, sr) for lbl, sh, sr in skins if sh != 0 or sr != 0]
         if len(active_skins) < 2:
-            mob_h = sum(sh for _, sh, _ in skins)
-            mob_raw_r = sum(sr for _, _, sr in skins)
-            adj_ret_r, adj_mob_r = allocate_adjustments(ret_raw_r, mob_raw_r, adjustments)
+            if breakdown is not None and location_name in breakdown:
+                _, adj_ret_r, mob_h, adj_mob_r = breakdown[location_name]
+            else:
+                mob_h = sum(sh for _, sh, _ in skins)
+                mob_raw_r = sum(sr for _, _, sr in skins)
+                adj_ret_r, adj_mob_r = allocate_adjustments(ret_raw_r, mob_raw_r, adjustments)
             publish_rows.append(
                 (location_name, loc_h, loc_r, ret_h, adj_ret_r, mob_h, adj_mob_r, loc_gross, None, loc_tax)
             )
@@ -430,7 +445,9 @@ def _parse_workbook_with_skins(
                 detail_rows.append((location_name, location_handle, location_revenue, None, None, None, None))
                 continue
             detail_rows.append((location_name, location_handle, location_revenue, *split))
-        publish_rows = _build_publish_detail_rows_with_fiscal(locations, blocks, loc_taxes)
+        publish_rows = _build_publish_detail_rows_with_fiscal(
+            locations, blocks, loc_taxes, breakdown=breakdown, loc_gross_map=loc_gross,
+        )
         return (
             handle,
             revenue,
@@ -473,9 +490,9 @@ def fetch(
     target_dates = resolve_fetch_months(month_start, month_end, launch_date=LAUNCH_DATE)
     results: list[StateMonthResult] = []
     for mdate in target_dates:
-        yyyy = mdate.strftime("%Y")
-        mm = mdate.strftime("%m")
-        label = mdate.strftime("%b %Y")
+        yyyy = f"{mdate.year}"
+        mm = f"{mdate.month:02d}"
+        label = f"{MONTH_ABBR[mdate.month]} {mdate.year}"
         iso_month = format_iso_month(mdate.year, mdate.month)
         source_url = URL_VARIANT_TEMPLATES[0].format(yyyy=yyyy, mm=mm)
         matched: list[str] = []
@@ -491,7 +508,7 @@ def fetch(
                     fetcher=lambda y=yyyy, m=mm: probe_url_variants(
                         URL_VARIANT_TEMPLATES,
                         {"yyyy": y, "mm": m},
-                        signature_check=b"PK",
+                        signature_check=XLSX_MAGIC,
                         wayback_timestamp=f"{y}{m}",
                         log=logger,
                         report=report,
@@ -501,6 +518,7 @@ def fetch(
                     log=logger,
                     cache_hit_message=f"INFO using cached file for {label}",
                     fetch_error_message=f"could not download Indiana workbook for {label}",
+                    validate=is_xlsx_bytes,
                     cache_ttl_seconds=recent_cache_ttl(mdate.year, mdate.month),
                     offline=offline,
                 )
@@ -544,7 +562,6 @@ def fetch(
                     log=logger,
                 )
                 if location_validated is None:
-                    logger(f"WARN skipped detail row for {label} {location_name}; invalid handle/revenue")
                     continue
                 valid_h, valid_r = location_validated
                 valid_locations.append(
